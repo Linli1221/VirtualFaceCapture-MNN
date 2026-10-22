@@ -4,6 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.HeadPoseData
+import com.example.commondata.UpperBodyPoseFrame
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -74,6 +75,9 @@ class TrackingServer(
         /** presenceScore 高于该阈值才认为本帧真的检测到人脸（与 SDK 判定一致）。 */
         private const val FACE_PRESENCE_THRESHOLD = 0.5f
 
+        /** 上半身快照超过该时长未更新就按 ubOk=false 发（协议 §4.2）。 */
+        private const val UPPER_BODY_STALE_MS = 1500L
+
         /** 缓冲放行线程的最长休眠时间：没有待发帧时也定期醒来检查退出/断线。 */
         private const val PLAYOUT_IDLE_WAIT_MS = 50L
 
@@ -93,6 +97,14 @@ class TrackingServer(
     /** hello 里上报的建议输出帧率。 */
     @Volatile
     var targetFps: Int = 60
+
+    /**
+     * 上半身采集是否启用（决定 hello.upperBody 与 track 是否带 ub* 字段，协议 §4.1 / §4.2）。
+     *
+     * 关闭时 track 里一个上半身字段都不出现；打开后即使暂无结果也发 `ubOk:false`。
+     */
+    @Volatile
+    var upperBodyEnabled: Boolean = false
 
     /** 最近一秒实际发出的 track 帧率。 */
     @Volatile
@@ -162,6 +174,13 @@ class TrackingServer(
     /** 上一次广播出去的校准状态，用来只在边界处发 calib（协议 §4.3）。 */
     @Volatile
     private var lastCalibActive: Boolean = false
+
+    /** 最新一帧上半身结果（[submitUpperBodySnapshot] 覆盖式写入，[submitTrack] 读取）。 */
+    @Volatile
+    private var upperBodySnapshot: UpperBodyPoseFrame? = null
+
+    /** 已启用上半身但还没收到任何帧时的占位帧（tracking=false、ubT=0、坐标全 0）。 */
+    private val emptyUpperBodyFrame = UpperBodyPoseFrame.empty(0L)
 
     /** @return 是否成功监听；失败原因见 [lastError]。 */
     fun start(): Boolean {
@@ -264,6 +283,27 @@ class TrackingServer(
     // ------------------------------------------------------------- 数据入口
 
     /**
+     * 开启 / 关闭上半身数据（协议 §4.1 / §4.2）。
+     *
+     * 关闭时顺手丢掉快照，避免重新打开后先把关闭前的旧姿态发出去。
+     */
+    fun setUpperBodyEnabled(enabled: Boolean) {
+        if (upperBodyEnabled == enabled) return
+        upperBodyEnabled = enabled
+        if (!enabled) upperBodySnapshot = null
+    }
+
+    /**
+     * 保存最新一帧上半身关键点（约 15 Hz 调用）。
+     *
+     * 只做一次引用赋值，不在调用线程做任何序列化 / 计算。
+     */
+    fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame) {
+        if (!upperBodyEnabled) return
+        upperBodySnapshot = frame
+    }
+
+    /**
      * 面捕管线每处理完一帧调用一次（协议 §4.2）。
      *
      * [headPose] 必须是**已减去首帧标定基线**的相对姿态（pose 字段，单位度）。
@@ -292,6 +332,19 @@ class TrackingServer(
         if (wsClients.isEmpty()) return
 
         val face = presenceScore >= FACE_PRESENCE_THRESHOLD
+
+        // 上半身是可选增量（协议 §4.2）：未启用时一个 ub* 字段都不出现；
+        // 启用后即使本帧没结果（从未收到 / 超过 1500 ms 未更新 / tracking=false）也发
+        // ubOk:false，ub / body 全 0，保证结构稳定，客户端可安全回默认姿态。
+        val upperBodyFrame = if (upperBodyEnabled) {
+            upperBodySnapshot ?: emptyUpperBodyFrame
+        } else {
+            null
+        }
+        val upperBodyOk = upperBodyFrame != null &&
+            upperBodyFrame.tracking &&
+            now - upperBodyFrame.timestampMs <= UPPER_BODY_STALE_MS
+
         val message = TrackingProtocol.buildTrack(
             seq = seq,
             timestampMs = now,
@@ -303,6 +356,8 @@ class TrackingServer(
             score = presenceScore,
             fps = fps,
             calibrating = calibrating,
+            upperBody = upperBodyFrame,
+            upperBodyOk = upperBodyOk,
         )
         dispatch(message)
     }
@@ -563,6 +618,7 @@ class TrackingServer(
                 app = appName,
                 decimation = decimation,
                 targetFps = targetFps,
+                upperBody = upperBodyEnabled,
                 timestampMs = System.currentTimeMillis(),
             )
         )

@@ -151,10 +151,12 @@ yuvLandmarkFrame ─────┤                              ├──► �
 | `app/` | **Android 采集端**：相机、面捕管线、调试 HUD、追踪数据 WebSocket 服务 |
 | `windows-client/` | **Windows 渲染端**：Electron + Cubism Web，连手机 WS 渲染 Live2D |
 | `docs/tracking-protocol.md` | **两端之间唯一的契约**：VFC Tracking Protocol v1 |
+| `docs/upper-body.md` | 上半身关键点采集的设计与接口契约（模块 API / 数据流 / 验收） |
 | `:MediapipeFaceLandmark` | **核心推理模块**：MNN + `.mnn` 模型 + 原生 C++ 流水线 + NEON 优化 |
 | `:OpenSeeFaceProcess` | 仿 OpenSeeFace 的后处理：平滑、头姿、BlendShape 解算 |
 | `:CommonData` | 共享数据类型（`Point3D` / `HeadPose` / `ARKitBlendShapes` …） |
 | `:facecapture-sdk` | 对外发布的 AAR 门面，封装上面 3 个模块 |
+| `:MediapipeUpperBody` | **可选的上半身关键点模块**：官方 MediaPipe Tasks `PoseLandmarker`，13 个上半身点，默认关 |
 | `Live2D/` | **已停止构建**。旧版手机端 Cubism SDK 封装（CMake + JNI），仅作历史参考保留 |
 | `ThirdParty/MNN/` | 仅提供头文件 |
 | `tools/verify/` | 端到端验证脚本（mock 手机端 + 无头 Chrome 截图 + 映射单测） |
@@ -220,6 +222,14 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 放进 `windows-client/models/<名字>/<任意>.model3.json` 即可，**目录会被自动发现**，
 下拉框里按目录名显示。仓库自带 4 个：`ATRI` / `sensei` / `Yuuka` / `zzzz`。
 
+上半身（可选功能）另需 MediaPipe Pose 模型，用仓库脚本一键下载到
+`MediapipeUpperBody/src/main/assets/`：
+
+```bash
+./tools/fetch-pose-model.sh          # macOS / Linux
+pwsh -File tools/fetch-pose-model.ps1   # Windows
+```
+
 ---
 
 ## 🎮 操作指南
@@ -231,11 +241,12 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 | **开始 / 停止面捕** | 启停相机 + 推理管线 |
 | **重置基线** | 把当前帧记为「中性脸」（头姿 / 表情零点），等价于 OpenSeeFace 的首帧标定；电脑端也能发 `command: recalibrate` 远程触发 |
 | **网络输出** | 打开对话框：启动 / 停止追踪服务、复制 `ws://` 地址、查看客户端数与输出帧率、当前帧缓冲时长、打开 `/status` 状态页 |
-| **Camera: 前置 / 后置 / 外接** | 枚举并切换摄像头，切换后自动重做基线；选择会记住 |
+| **Camera: 前置 / 后置 / 外接 / 超广角** | 枚举并切换摄像头，包括逻辑多摄后面隐藏的物理镜头（后置超广角 / 长焦）；切换后自动重做基线，选择会记住；竖屏 / 横屏都能用 |
 | **Backend: Vulkan / CPU** | 运行时切换 MNN 推理后端（会重建 session，画面中断一帧左右） |
 | **关键点: GPU 并行** | 在 单路 / GPU×2 / GPU×3 之间循环：多开几路 GPU 引擎抢同一个帧队列，把 GPU 喂饱（会短暂重启管线） |
 | **眨眼曲线 / 眨眼速度** | 是否把眨眼整形为更自然的 230 ms 曲线，以及曲线速度 |
 | **眼睛灵敏度** | 眼部 EAR 阈值灵敏度（0.5x ～ 2.0x），下方实时显示生效的 `closed / open` 阈值 |
+| **上半身: 开 / 关** | 启动 / 停止 MediaPipe Pose 上半身采集（需要先放模型，见「模型从哪来」）；开启后预览画面叠加骨架、HUD 显示 body fps / 点数 / 躯干角；与面捕开始 / 停止联动 |
 | **显示调试 / 关键点** | 顶栏调试 HUD（fps、帧耗时、pitch/yaw/roll + 条形图、ARKit 数值）与相机画面上的关键点 / 检测框叠加 |
 
 ### Windows 客户端
@@ -250,7 +261,8 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 | **鼠标穿透** | 点击穿过窗口点到下面的程序；**穿透后用 `Ctrl + Alt + T` 取消**（全局热键） |
 | **一键校准 + 手动微调** | 手机摄像头没正对你（斜着架 / 放在屏幕旁边 / 换了座位）时，保持坐姿 3 秒把当前头姿记为中性，再用 左右 / 上下 / 歪头 滑块微调；偏移自动保存，重开客户端仍生效 |
 | **手机重做基线** | 让手机重做中性脸基线（表情 + 头姿），并把电脑端的自适应量程归零；完成后本机姿态偏移自动清零，避免双重校准 |
-| **隐藏 UI / 调试** | `H` 隐藏全部面板（只剩角色），`D` 展开实时参数网格 |
+| **隐藏 UI / 调试** | `H` 隐藏全部面板（只剩角色），`D` 展开实时参数网格（含上半身：ub age / 躯干角 / 手臂参数） |
+| **上半身调试骨架** | 打开调试面板后自动显示浮层骨架（13 点 / 15 条边）；也可以直接开 `?skeleton=1`；低可见度点与丢失状态灰显，不影响鼠标穿透 |
 
 断线会自动重连（0.5 s → 1 s → 2 s → 5 s 封顶），状态栏会显示当前阶段；
 断开时形象回到默认姿态，不会定格在最后一帧的鬼脸上。
@@ -270,8 +282,8 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
 | `GET /` | PC → 手机 | 内嵌信息页，确认服务在线 |
 | `GET /status` | PC → 手机 | JSON 状态：`running / tracking / clients / fps / device / protocol / version / seq` |
 | `WS /ws` | 双向 | 追踪数据长连接（端口固定 8765） |
-| `hello` | 手机 → PC | 连接建立时一次：协议名 / 版本 / 设备 / 帧率 / 抽帧系数 |
-| `track` | 手机 → PC | 每帧：`seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating` |
+| `hello` | 手机 → PC | 连接建立时一次：协议名 / 版本 / 设备 / 帧率 / 抽帧系数；开启上半身时带 `upperBody: true` |
+| `track` | 手机 → PC | 每帧：`seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating`；开启上半身后**可选**带 `ubOk` / `ub[52]` / `ubT` / `body[2]`（纯增量，老客户端忽略） |
 | `calib` | 手机 → PC | 进入 / 离开首帧标定窗口 |
 | `ping` / `pong` | 双向 | 保活与 RTT 测量（客户端 5 s 一次，手机 30 s 主动 ping） |
 | `command` / `ack` | PC → 手机 | 目前只有 `recalibrate`（等价于手机上的「重置基线」） |
@@ -286,6 +298,44 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
 > 系统调度、Wi-Fi 突发抖动，形象动起来不会被「一卡一卡」的输入带偏；代价是端到端延迟固定
 > 多 0.5 s。需要最低延迟时把它改成 `0` 即关闭缓冲（退化为「算完就发」）。
 > 手机端「网络输出」对话框里会显示当前帧缓冲时长。
+
+---
+
+## 🧍 上半身关键点（可选，MediaPipe Pose）
+
+面捕默认只驱动头与表情。这个可选功能在**同一路相机画面**上再跑一个
+[MediaPipe Pose](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker)（官方
+`com.google.mediapipe:tasks-vision` 的 `PoseLandmarker`，LIVE_STREAM），取出 13 个上半身点
+（鼻子 / 双眼 / 双耳 / 双肩 / 双肘 / 双腕 / 双胯）与**相对基线的躯干角**，
+让形象能跟着肩膀倾斜、转身、抬手：
+
+- **默认关**：不打开时相机线程零额外开销，也不加载 MediaPipe Tasks 运行时；
+  打开后按 66 ms（≈15 fps）抽帧推理，GPU 优先、失败自动回退 CPU。
+- **线上一帧只多约 0.6 KB**：`track` 里追加 `ubOk` / `ub`（13×4）/ `ubT` / `body`
+  （[`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)），60 fps 下约 36 KB/s。
+- **PC 自动消费**：躯干驱动 `ParamBodyAngleX/Y/Z`、手臂驱动 `ParamArmLA/RA`；
+  模型没有这些参数时**自动跳过**（仓库自带 4 个模型只有 `ParamBodyAngleX/Y/Z`，
+  所以手臂动作在它们身上看不到，属预期降级）。
+- **丢失平滑回默认**：`ubOk=false` 或 1.5 s 没更新时，参数按帧向 0 衰减回模型自己的 idle motion。
+- **预览 / 调试可见**：手机预览叠加 13 点骨架；PC 调试面板有上半身参数组，
+  `D` 面板 + `?skeleton=1` 可看浮层骨架。
+
+启用步骤：
+
+```bash
+# 1) 下载模型（约 5.5 MB，不进 Git）
+./tools/fetch-pose-model.sh          # Windows: pwsh -File tools/fetch-pose-model.ps1
+# 2) 重新构建安装 App，打开「开始面捕」→ 点「上半身: 开」
+./gradlew :app:assembleDebug
+```
+
+也可以把 `pose_landmarker_lite.task` / `pose_landmarker_full.task` 直接
+`adb push` 到 `/data/data/com.example.virtualfacecapture/files/models/`（免重新打包）。
+没有模型时按钮只提示「缺少模型」，功能保持关闭，不影响面捕与推流。
+
+设计与接口契约（新增模块 API / YUV 抽头 / 线程模型 / 验收清单）见
+[`docs/upper-body.md`](docs/upper-body.md)；模块自己的说明见
+[`MediapipeUpperBody/README.md`](MediapipeUpperBody/README.md)。
 
 ---
 
@@ -504,8 +554,16 @@ engine.pushFrame(image, rotationDegrees)
   直接基于 478 关键点几何关系解算，省一次推理。
 - **可发布的 AAR**：`:facecapture-sdk` 模块已经配置好 `maven-publish`，
   可一键打包成独立的面捕 SDK。
-- **多摄像头**：运行时枚举并切换前置 / 后置 / 外接摄像头，按设备重算旋转、
-  垂直 FOV 与预览镜像，切换后自动重新标定中性脸。
+- **可选的上半身采集**：`:MediapipeUpperBody` 用官方 MediaPipe Tasks `PoseLandmarker`
+  在相机同一路 YUV 上抽 15 fps 推理，只把 13 个上半身点 + 相对躯干角增量塞进原协议；
+  默认关、模型缺失自动降级，与面捕管线完全解耦。
+- **多摄像头（含物理超广角）**：运行时枚举并切换前置 / 后置 / 外接摄像头；
+  API 28+ 还会把逻辑多摄隐藏的物理镜头（后置超广角 / 长焦）作为独立可选项暴露出来
+  （`OutputConfiguration.setPhysicalCameraId`），按设备重算旋转、垂直 FOV 与预览镜像，
+  切换后自动重新标定中性脸。
+- **横竖屏无缝切换**：`screenOrientation="sensor"` + `configChanges`，旋转时 Activity
+  不重建，相机 session / 面捕管线 / 预览都不中断；帧按 `display.rotation` 自动转正，
+  控制面板与摄像头列表按可用高度自适应。
 - **推流不拖累推理**：每个 WS 客户端只有「最新一帧」覆盖槽，慢网络只会丢帧，
   不会把手机的推理线程堵住。
 - **两端可独立验证**：手机端有协议的 JVM 单元测试；电脑端有
@@ -535,7 +593,9 @@ VirtualFaceCapture-MNN/
 ├── OpenSeeFaceProcess/          # 仿 OpenSeeFace 后处理
 ├── CommonData/                  # 共享数据类
 ├── facecapture-sdk/             # 对外发布的 AAR 门面
+├── MediapipeUpperBody/          # 可选：上半身关键点（MediaPipe Tasks PoseLandmarker）
 ├── docs/tracking-protocol.md    # 两端通信协议（唯一契约）
+├── docs/upper-body.md           # 上半身采集的设计与接口契约
 ├── tools/verify/                # 端到端验证脚本
 ├── Live2D/                      # 旧版手机端渲染（已停止构建，仅参考）
 └── ThirdParty/MNN/              # 仅提供 MNN 头文件

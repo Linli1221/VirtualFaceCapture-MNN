@@ -1,6 +1,9 @@
 package com.example.virtualfacecapture.tracking
 
 import com.example.commondata.ARKitBlendShapes
+import com.example.commondata.BodyPoint
+import com.example.commondata.UpperBodyLandmarkIndex
+import com.example.commondata.UpperBodyPoseFrame
 
 /**
  * VFC Tracking Protocol v1 —— 报文的序列化 / 解析部分。
@@ -26,6 +29,9 @@ object TrackingProtocol {
 
     /** ARKit-52 的长度。 */
     const val BS_COUNT = 52
+
+    /** 上半身协议点数（13，必须与 [UpperBodyLandmarkIndex.COUNT] 一致）。 */
+    const val UB_COUNT = UpperBodyLandmarkIndex.COUNT
 
     /** 信息页。 */
     const val PATH_INFO = "/"
@@ -104,6 +110,39 @@ object TrackingProtocol {
         return builder.toString()
     }
 
+    /**
+     * 上半身数值清洗：先判断有限性再裁剪。
+     *
+     * 不能用 `coerceIn` 直接兜底 —— 它会把 ±Infinity 截到边界值（+Inf -> max），
+     * 而协议要求 NaN / Infinity 一律写 0。
+     */
+    private fun sanitized(value: Float, min: Float, max: Float): Float =
+        if (value.isFinite()) value.coerceIn(min, max) else 0f
+
+    /**
+     * 写一个上半身关键点的 `x,y,z,visibility`（协议 §5.3）。
+     *
+     * 范围按协议裁剪：x/y ∈ [0,1]、z ∈ [-5,5]、visibility ∈ [0,1]；
+     * NaN / Infinity 一律写 0，保证 JSON 合法、客户端不会 parse 失败。
+     */
+    private fun appendUpperBodyPoint(builder: StringBuilder, point: BodyPoint) {
+        appendDecimal4(builder, sanitized(point.x, 0f, 1f))
+        builder.append(',')
+        appendDecimal4(builder, sanitized(point.y, 0f, 1f))
+        builder.append(',')
+        appendDecimal4(builder, sanitized(point.z, -5f, 5f))
+        builder.append(',')
+        appendDecimal4(builder, sanitized(point.visibility, 0f, 1f))
+    }
+
+    /** `ub` 结构保持稳定的占位：[UB_COUNT] × 4 个 0（`ubOk=false` 时使用）。 */
+    private fun appendUpperBodyZeros(builder: StringBuilder) {
+        for (index in 0 until UB_COUNT * 4) {
+            if (index > 0) builder.append(',')
+            builder.append('0')
+        }
+    }
+
     // ------------------------------------------------------------------ 转义
 
     /** 最小 JSON 字符串转义（设备名 / 原因里可能有引号、反斜杠、控制字符）。 */
@@ -154,12 +193,16 @@ object TrackingProtocol {
 
     /**
      * §4.1 hello：连接建立后立即发送一次。
+     *
+     * @param upperBody 手机端上半身采集是否启用；true 时追加可选字段 `"upperBody":true`，
+     *   关闭时不出现该字段（老客户端忽略未知字段）。
      */
     fun buildHello(
         device: String,
         app: String,
         decimation: Int = DEFAULT_DECIMATION,
         targetFps: Int = 60,
+        upperBody: Boolean = false,
         timestampMs: Long = System.currentTimeMillis(),
     ): String {
         val builder = StringBuilder(160)
@@ -170,6 +213,8 @@ object TrackingProtocol {
         builder.jsonString("app", app)
         builder.jsonLong("decimation", decimation.coerceAtLeast(1).toLong())
         builder.jsonLong("targetFps", targetFps.coerceIn(1, 240).toLong())
+        // §4.1 可选字段：只在手机端开启上半身采集时下发 true；关闭时字段不出现（保持报文精简）。
+        if (upperBody) builder.jsonBool("upperBody", true)
         builder.jsonLong("t", timestampMs)
         builder.append('}')
         return builder.toString()
@@ -179,6 +224,9 @@ object TrackingProtocol {
      * §4.2 track：每帧一条。bs 必须是 §5.1 的 52 项顺序，pose 为 [pitch, yaw, roll]（度）。
      *
      * @param face 本帧是否检测到人脸；false 时调用方应沿用上一帧的 bs / pose。
+     * @param upperBody 可选上半身帧；null = 未开启，报文里**不出现** ubOk / ub / ubT / body。
+     * @param upperBodyOk 本帧上半身结果是否可用；false 时仍发 ubOk:false、ub 与 body 全 0
+     *   （结构稳定，客户端据 ubOk 回默认姿态）。
      */
     fun buildTrack(
         seq: Long,
@@ -189,8 +237,11 @@ object TrackingProtocol {
         score: Float,
         fps: Float,
         calibrating: Boolean,
+        upperBody: UpperBodyPoseFrame? = null,
+        upperBodyOk: Boolean = upperBody != null && upperBody.isUsable(),
     ): String {
-        val builder = StringBuilder(640)
+        // 开启上半身时多 52 个数，预留大一点的容量，避免 StringBuilder 中途扩容
+        val builder = StringBuilder(if (upperBody != null) 1024 else 640)
         builder.jsonString("type", "track", first = true)
         builder.jsonLong("seq", seq)
         builder.jsonLong("t", timestampMs)
@@ -211,6 +262,29 @@ object TrackingProtocol {
         builder.jsonFloat("score", score.coerceIn(0f, 1f))
         builder.jsonFloat("fps", fps.coerceIn(0f, 1000f))
         builder.jsonBool("calibrating", calibrating)
+        // §4.2 可选上半身字段：只有开启时才出现（未开启时老客户端完全感知不到）。
+        // ubOk=false 时仍保持结构稳定：ub = 52 个 0、body = [0,0]，客户端据 ubOk 回默认姿态。
+        if (upperBody != null) {
+            val ok = upperBodyOk && upperBody.tracking
+            builder.jsonBool("ubOk", ok)
+            builder.jsonKey("ub").append('[')
+            if (ok) {
+                for (index in 0 until UB_COUNT) {
+                    if (index > 0) builder.append(',')
+                    appendUpperBodyPoint(builder, upperBody.point(index))
+                }
+            } else {
+                appendUpperBodyZeros(builder)
+            }
+            builder.append(']')
+            // 无结果时保留最后一次采集时间（0 = 启用后还没收到过帧），供客户端判重 / 插值
+            builder.jsonLong("ubT", upperBody.timestampMs.coerceAtLeast(0L))
+            builder.jsonKey("body").append('[')
+            appendDecimal4(builder, if (ok) sanitized(upperBody.torso.roll, -180f, 180f) else 0f)
+            builder.append(',')
+            appendDecimal4(builder, if (ok) sanitized(upperBody.torso.yaw, -180f, 180f) else 0f)
+            builder.append(']')
+        }
         builder.append('}')
         return builder.toString()
     }
@@ -227,6 +301,8 @@ object TrackingProtocol {
         score: Float,
         fps: Float,
         calibrating: Boolean,
+        upperBody: UpperBodyPoseFrame? = null,
+        upperBodyOk: Boolean = upperBody != null && upperBody.isUsable(),
     ): String = buildTrack(
         seq = seq,
         timestampMs = timestampMs,
@@ -236,6 +312,8 @@ object TrackingProtocol {
         score = score,
         fps = fps,
         calibrating = calibrating,
+        upperBody = upperBody,
+        upperBodyOk = upperBodyOk,
     )
 
     /** §4.3 calib：进入 / 离开校准窗口各一次。 */

@@ -5,10 +5,35 @@
  *   node tools/selftest.js
  *
  * 覆盖协议 §8.1 / §8.2（含自适应归一化首帧行为、reset 可复现性）、
+ * 上半身关键点（协议 §4.2 / §5.3：解析、躯干/手臂映射、丢失平滑、调试骨架用的骨架表）、
  * 输入帧率低于渲染帧率 / 输入间隔不稳定时的插值（renderer/interp.js）与 server.js 的静态服务。
  */
 import assert from "node:assert/strict";
-import { createMapper, mapBshapes, mapTrackToParams, AdaptiveAngleNormalizer, BS_INDEX, BS_COUNT, PARAM_IDS } from "../renderer/mapping.js";
+import {
+  AdaptiveAngleNormalizer,
+  BODY_ANGLE_LIMIT,
+  BODY_ARM_MIN_VISIBILITY,
+  BODY_BONES,
+  BODY_COUNT,
+  BODY_DECAY_PER_FRAME,
+  BODY_FLOATS,
+  BODY_LANDMARK_ORDER,
+  BODY_PARAM_IDS,
+  BODY_STALE_MS,
+  BS_INDEX,
+  BS_COUNT,
+  PARAM_IDS,
+  combineBodyAngleX,
+  createMapper,
+  mapBshapes,
+  mapBody,
+  mapTrackToParams,
+  parseUpperBody,
+  readUpperBodyTrack,
+  smoothBodyParams,
+} from "../renderer/mapping.js";
+import { Live2DStage } from "../renderer/live2d.js";
+import { buildUpperBody } from "./mock-body.js";
 import {
   PoseOffsetCollector,
   applyPoseOffset,
@@ -622,6 +647,457 @@ try {
 } finally {
   server.close();
 }
+
+console.log("[selftest] mapping.js · 上半身关键点（协议 §4.2 / §5.3）");
+
+// 协议顺序下标（与 CommonData.UpperBodyLandmarkIndex.ORDER 逐项一致）
+const P = BODY_LANDMARK_ORDER;
+
+/** 构造协议 ub（13×4）：默认直立站姿、双臂自然下垂（腕在肩正下方）。 */
+function makeUb({
+  shoulderL = [0.35, 0.4],
+  shoulderR = [0.65, 0.4],
+  wristL = [0.35, 0.78],
+  wristR = [0.65, 0.78],
+  visibility = 0.9,
+  visibilityL = null,
+  visibilityR = null,
+} = {}) {
+  const ub = new Array(BODY_FLOATS).fill(0);
+  const set = (index, x, y, z, v) => {
+    const base = index * 4;
+    ub[base] = x;
+    ub[base + 1] = y;
+    ub[base + 2] = z;
+    ub[base + 3] = v;
+  };
+  const vL = visibilityL == null ? visibility : visibilityL;
+  const vR = visibilityR == null ? visibility : visibilityR;
+  set(P.nose, 0.5, 0.16, 0, visibility);
+  set(P.eye_left, 0.46, 0.15, 0, visibility);
+  set(P.eye_right, 0.54, 0.15, 0, visibility);
+  set(P.ear_left, 0.42, 0.17, 0, visibility);
+  set(P.ear_right, 0.58, 0.17, 0, visibility);
+  set(P.shoulder_left, shoulderL[0], shoulderL[1], 0, vL);
+  set(P.shoulder_right, shoulderR[0], shoulderR[1], 0, vR);
+  // 肘取肩腕中点：只影响可见度，不影响肩→腕角度
+  set(P.elbow_left, (shoulderL[0] + wristL[0]) / 2, (shoulderL[1] + wristL[1]) / 2, 0, vL);
+  set(P.elbow_right, (shoulderR[0] + wristR[0]) / 2, (shoulderR[1] + wristR[1]) / 2, 0, vR);
+  set(P.wrist_left, wristL[0], wristL[1], 0, vL);
+  set(P.wrist_right, wristR[0], wristR[1], 0, vR);
+  set(P.hip_left, 0.39, 0.86, 0, visibility);
+  set(P.hip_right, 0.61, 0.86, 0, visibility);
+  return ub;
+}
+
+await test("BODY_LANDMARK_ORDER 与协议顺序（CommonData.UpperBodyLandmarkIndex.ORDER）逐项一致", () => {
+  assert.deepEqual(Object.keys(BODY_LANDMARK_ORDER), [
+    "nose",
+    "eye_left",
+    "eye_right",
+    "ear_left",
+    "ear_right",
+    "shoulder_left",
+    "shoulder_right",
+    "elbow_left",
+    "elbow_right",
+    "wrist_left",
+    "wrist_right",
+    "hip_left",
+    "hip_right",
+  ]);
+  assert.deepEqual(Object.values(BODY_LANDMARK_ORDER), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  assert.equal(BODY_COUNT, 13);
+  assert.equal(BODY_FLOATS, 52);
+});
+
+await test("BODY_BONES 与 CommonData.UpperBodySkeleton.BONES 一致（15 条边，协议下标）", () => {
+  assert.equal(BODY_BONES.length, 15);
+  assert.deepEqual(
+    BODY_BONES.map((edge) => [...edge]),
+    [
+      [0, 1],
+      [0, 2],
+      [1, 3],
+      [2, 4],
+      [1, 2],
+      [0, 5],
+      [0, 6],
+      [5, 6],
+      [5, 7],
+      [7, 9],
+      [6, 8],
+      [8, 10],
+      [5, 11],
+      [6, 12],
+      [11, 12],
+    ],
+  );
+  for (const [a, b] of BODY_BONES) {
+    assert.ok(a >= 0 && a < BODY_COUNT, "骨架边下标越界：" + a);
+    assert.ok(b >= 0 && b < BODY_COUNT, "骨架边下标越界：" + b);
+  }
+});
+
+await test("parseUpperBody：52 项 → 13 个 {x,y,z,v}，z / v 原样保留", () => {
+  const points = parseUpperBody(makeUb());
+  assert.equal(points.length, 13);
+  near(points[P.shoulder_left].x, 0.35);
+  near(points[P.shoulder_left].y, 0.4);
+  assert.equal(points[P.nose].z, 0);
+  near(points[P.wrist_right].v, 0.9);
+  // 返回新对象，改结果不会写回输入
+  points[P.nose].x = 0.9;
+  assert.equal(makeUb()[P.nose * 4], 0.5);
+});
+
+await test("parseUpperBody：长度不对 → null（51 / 53 / 空 / 非数组 / DataView）", () => {
+  for (const bad of [
+    null,
+    undefined,
+    [],
+    new Array(BODY_FLOATS - 1).fill(0),
+    new Array(BODY_FLOATS + 1).fill(0),
+    "52",
+    52,
+    {},
+    new Float32Array(40),
+    new DataView(new ArrayBuffer(208)),
+  ]) {
+    assert.equal(parseUpperBody(bad), null, "应当返回 null：" + String(bad));
+  }
+  // TypedArray 的合法长度要能解析
+  assert.equal(parseUpperBody(new Float32Array(makeUb())).length, 13);
+});
+
+await test("parseUpperBody：NaN / Infinity → 0，visibility clamp 到 [0,1]", () => {
+  const broken = makeUb();
+  broken[P.nose * 4] = Number.NaN;
+  broken[P.nose * 4 + 1] = Number.POSITIVE_INFINITY;
+  broken[P.nose * 4 + 2] = Number.NEGATIVE_INFINITY;
+  broken[P.nose * 4 + 3] = 5;
+  broken[P.wrist_left * 4 + 3] = -3;
+  const points = parseUpperBody(broken);
+  assert.equal(points[P.nose].x, 0);
+  assert.equal(points[P.nose].y, 0);
+  assert.equal(points[P.nose].z, 0);
+  assert.equal(points[P.nose].v, 1);
+  assert.equal(points[P.wrist_left].v, 0);
+});
+
+await test("mapBody：中性肩线 + 双臂下垂 → 所有参数 0", () => {
+  const mapped = mapBody([0, 0], makeUb());
+  near(mapped.params.ParamBodyAngleX, 0);
+  near(mapped.params.ParamBodyAngleY, 0);
+  near(mapped.params.ParamBodyAngleZ, 0);
+  near(mapped.params.ParamArmLA, 0);
+  near(mapped.params.ParamArmRA, 0);
+  near(mapped.metrics.armAngleL, 0);
+  near(mapped.metrics.armAngleR, 0);
+  near(mapped.metrics.shoulderWidth, 0.3);
+  near(mapped.metrics.confidence, 0.9);
+});
+
+await test("mapBody：左臂抬起 → ParamArmLA 增大，ParamArmRA 不动", () => {
+  const raised = mapBody([0, 0], makeUb({ wristL: [0.2, 0.05] }));
+  // 肩→腕 = (-0.15, -0.35)：与竖直向下夹角 ≈ 156.8°（举过头顶）→ armUp 满量程
+  near(raised.metrics.armAngleL, (Math.atan2(0.15, -0.35) * 180) / Math.PI, 1e-9);
+  near(raised.params.ParamArmLA, 30);
+  near(raised.params.ParamArmRA, 0);
+
+  // 平举 90° → armUp = 90/150 = 0.6 → 18
+  const horizontal = mapBody([0, 0], makeUb({ wristL: [0.05, 0.4] }));
+  near(horizontal.metrics.armAngleL, 90);
+  near(horizontal.params.ParamArmLA, 18);
+  near(horizontal.params.ParamArmRA, 0);
+});
+
+await test("mapBody：右肩下沉（roll > 0）→ ParamBodyAngleZ 为正，反之为负", () => {
+  const sink = mapBody([10, 0], makeUb({ shoulderR: [0.65, 0.41] }));
+  assert.ok(sink.params.ParamBodyAngleZ > 0);
+  near(sink.params.ParamBodyAngleZ, 5);
+  near(sink.params.ParamBodyAngleY, -2);
+  const raise = mapBody([-10, 0], null);
+  assert.ok(raise.params.ParamBodyAngleZ < 0);
+  near(raise.params.ParamBodyAngleZ, -5);
+});
+
+await test("mapBody：yaw → ParamBodyAngleX = -yaw*0.3（与头部同向）", () => {
+  near(mapBody([0, 20], null).params.ParamBodyAngleX, -6);
+  near(mapBody([0, -20], null).params.ParamBodyAngleX, 6);
+  near(mapBody([0, 20], makeUb()).params.ParamBodyAngleX, -6);
+});
+
+await test("mapBody：参数 clamp 到 ±30（roll 300 / yaw 200 / 角度 > 150°）", () => {
+  const extreme = mapBody([300, 200], null).params;
+  near(extreme.ParamBodyAngleZ, BODY_ANGLE_LIMIT);
+  near(extreme.ParamBodyAngleY, -BODY_ANGLE_LIMIT);
+  near(extreme.ParamBodyAngleX, -BODY_ANGLE_LIMIT);
+  const lifted = mapBody([0, 0], makeUb({ wristL: [0.35, 0.0] })); // 180°，远超 150° 满量程
+  near(lifted.params.ParamArmLA, 30);
+});
+
+await test("mapBody：该侧肩/肘/腕可见度 < 0.3 → 手臂参数不输出（让客户端回默认）", () => {
+  const low = mapBody([0, 0], makeUb({ visibilityL: 0.1, wristL: [0.2, 0.05] }));
+  assert.equal("ParamArmLA" in low.params, false);
+  assert.ok("ParamArmRA" in low.params);
+  near(low.params.ParamArmRA, 0);
+  // confidence = 肩/肘/腕可见度最小值
+  near(low.metrics.confidence, 0.1);
+  // 阈值正好 0.3 时仍输出（>= 判定）
+  const edge = mapBody([0, 0], makeUb({ visibilityL: BODY_ARM_MIN_VISIBILITY }));
+  assert.ok("ParamArmLA" in edge.params);
+});
+
+await test("mapBody：坏数据不抛异常（ub 长度错 / 全 NaN / body 非数字）", () => {
+  for (const bad of [null, undefined, [], [1, 2, 3], new Array(BODY_FLOATS).fill(Number.NaN), "junk"]) {
+    const mapped = mapBody([0, 0], bad);
+    assert.ok(Number.isFinite(mapped.params.ParamBodyAngleZ));
+    assert.equal("ParamArmLA" in mapped.params, false);
+  }
+  const nanAngles = mapBody([Number.NaN, undefined], null);
+  near(nanAngles.params.ParamBodyAngleX, 0);
+  near(nanAngles.params.ParamBodyAngleY, 0);
+  near(nanAngles.params.ParamBodyAngleZ, 0);
+});
+
+await test("mapBody：兼容 docs §3.6 的 mapBody(ub, body) 参数顺序", () => {
+  const docOrder = mapBody(makeUb({ wristL: [0.05, 0.4] }), [3, -7]);
+  const taskOrder = mapBody([3, -7], makeUb({ wristL: [0.05, 0.4] }));
+  near(docOrder.params.ParamBodyAngleX, taskOrder.params.ParamBodyAngleX);
+  near(docOrder.params.ParamBodyAngleY, taskOrder.params.ParamBodyAngleY);
+  near(docOrder.params.ParamBodyAngleZ, taskOrder.params.ParamBodyAngleZ);
+  near(docOrder.params.ParamArmLA, taskOrder.params.ParamArmLA);
+  near(docOrder.metrics.confidence, taskOrder.metrics.confidence);
+});
+
+await test("mapBody：也接受 parseUpperBody() 解析后的 13 点（省一次解析）", () => {
+  const ub = makeUb({ wristL: [0.05, 0.4] });
+  const viaFlat = mapBody([0, 0], ub);
+  const viaPoints = mapBody([0, 0], parseUpperBody(ub));
+  near(viaPoints.params.ParamArmLA, viaFlat.params.ParamArmLA);
+  near(viaPoints.metrics.armAngleL, viaFlat.metrics.armAngleL);
+});
+
+await test("readUpperBodyTrack：正常帧 / ubOk=false / 缺字段 / ubT 过期 / 新 ubT 恢复", () => {
+  const ub = makeUb();
+  const first = readUpperBodyTrack({ type: "track", ub, ubOk: true, ubT: 1000, body: [3, -5] }, 0, null);
+  assert.equal(first.ok, true);
+  assert.equal(first.present, true);
+  assert.equal(first.stale, false);
+  near(first.ageMs, 0);
+  near(first.torso[0], 3);
+  near(first.torso[1], -5);
+
+  // 同一个 ubT 一直重复（手机还在发面捕，但上半身停了）→ age 累积，1.5s 后过期
+  const stale = readUpperBodyTrack({ ub, ubOk: true, ubT: 1000, body: [3, -5] }, BODY_STALE_MS + 100, first);
+  assert.equal(stale.ok, false);
+  assert.equal(stale.stale, true);
+  near(stale.ageMs, BODY_STALE_MS + 100);
+
+  // 新的 ubT 到达 → 立刻恢复
+  const fresh = readUpperBodyTrack({ ub, ubOk: true, ubT: 2000, body: [0, 0] }, BODY_STALE_MS + 200, stale);
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.stale, false);
+  near(fresh.ageMs, 0);
+
+  // ubOk=false（手机端明确说这一帧没有结果）→ 有 ub 也不可用，torso 回到 0
+  const notOk = readUpperBodyTrack({ ub, ubOk: false, ubT: 3000, body: [9, 9] }, BODY_STALE_MS + 300, fresh);
+  assert.equal(notOk.ok, false);
+  assert.equal(notOk.present, true);
+  near(notOk.torso[0], 9); // body 字段仍然被解析（调试用），但 ok=false 不会驱动
+
+  // 老手机：整组字段缺失 → present=false，points 保留上一帧（调试骨架画最后一帧）
+  const missing = readUpperBodyTrack({ type: "track", bs: [], pose: [0, 0, 0] }, BODY_STALE_MS + 400, fresh);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.present, false);
+  assert.equal(missing.points.length, BODY_COUNT);
+  // 缺少新帧 → age 从上一帧的到达时间继续累积（fresh 在 1700 到达，这里 now=1900）
+  near(missing.ageMs, 200);
+
+  // ub 长度不对 → present=true，但 ok=false
+  const broken = readUpperBodyTrack({ ub: [0, 1, 2], ubOk: true, ubT: 4000, body: [1, 2] }, 2100, missing);
+  assert.equal(broken.present, true);
+  assert.equal(broken.ok, false);
+});
+
+await test("readUpperBodyTrack：没有 ubT 时按到达时间当作新鲜（stale 只依赖本地 age）", () => {
+  const fresh = readUpperBodyTrack({ ub: makeUb(), ubOk: true }, 500, null);
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.t, null);
+  const later = readUpperBodyTrack({ ub: makeUb(), ubOk: true }, 900, fresh);
+  assert.equal(later.ok, true);
+  near(later.ageMs, 0); // 每帧重新到达 → 一直新鲜
+});
+
+await test("smoothBodyParams：丢失后每帧向 0 前进 15%，衰减到 0 后交回 idle motion", () => {
+  near(smoothBodyParams({ ParamArmLA: 30 }, null).ParamArmLA, 30 * (1 - BODY_DECAY_PER_FRAME));
+  near(
+    smoothBodyParams({ ParamBodyAngleZ: 10 }, null, { decay: BODY_DECAY_PER_FRAME }).ParamBodyAngleZ,
+    8.5,
+  );
+  let current = { ParamArmLA: 30 };
+  for (let i = 0; i < 100; i++) current = smoothBodyParams(current, null);
+  assert.equal("ParamArmLA" in current, false);
+  // 从没被驱动过的参数不输出（老手机 / 关闭上半身时行为与以前完全一致）
+  assert.deepEqual(smoothBodyParams({}, null), {});
+  // 有目标 → 直接取目标
+  near(smoothBodyParams({ ParamArmLA: 3 }, { ParamArmLA: 12 }).ParamArmLA, 12);
+  // snap：截图 / 自测要确定性，一步到位
+  near(smoothBodyParams({ ParamArmLA: 30 }, { ParamArmLA: 7 }, { snap: true }).ParamArmLA, 7);
+  assert.deepEqual(smoothBodyParams({ ParamArmLA: 30 }, null, { snap: true }), {});
+});
+
+await test("combineBodyAngleX：头部 + 躯干相加后 clamp 到 ±30（不互相覆盖）", () => {
+  near(combineBodyAngleX(10, 25), BODY_ANGLE_LIMIT);
+  near(combineBodyAngleX(-10, -25), -BODY_ANGLE_LIMIT);
+  near(combineBodyAngleX(4, -7), -3);
+  near(combineBodyAngleX(undefined, 5), 5);
+  near(combineBodyAngleX(Number.NaN, 5), 5);
+  near(combineBodyAngleX(0, Number.POSITIVE_INFINITY), 0);
+});
+
+console.log("[selftest] live2d.js · 上半身参数叠加（模型没有的参数跳过，属预期降级）");
+
+/** 造一个不依赖 DOM/WebGL 的 stage：只测参数叠加逻辑。 */
+function makeBodyStage(bodyOnlyIds) {
+  const stage = new Live2DStage({ interpolate: false, smoothing: 1 });
+  stage.paramIds = [...PARAM_IDS, ...bodyOnlyIds];
+  stage.bodyOnlyParamIds = bodyOnlyIds.slice();
+  stage.bodySupport = Object.fromEntries(
+    [...PARAM_IDS, ...BODY_PARAM_IDS].map((id) => [id, stage.paramIds.includes(id)]),
+  );
+  return stage;
+}
+
+await test("Live2DStage：ParamBodyAngleX 与头部相加后 clamp（不互相覆盖）", () => {
+  const stage = makeBodyStage(["ParamBodyAngleY", "ParamBodyAngleZ"]);
+  stage.setTargetParams({ ParamBodyAngleX: 12 });
+  stage.setBodyParams({ ParamBodyAngleX: 9 });
+  near(stage._computeFrameValues(1000, true).ParamBodyAngleX, 21);
+
+  stage.setTargetParams({ ParamBodyAngleX: 25 });
+  stage.setBodyParams({ ParamBodyAngleX: 12 });
+  near(stage._computeFrameValues(2000, true).ParamBodyAngleX, BODY_ANGLE_LIMIT);
+});
+
+await test("Live2DStage：模型没有 ParamArmLA 时绝不写；有参数时写入，释放后交回 idle", () => {
+  const noArms = makeBodyStage([]);
+  noArms.setTargetParams({ ParamBodyAngleX: 0 });
+  noArms.setBodyParams({ ParamBodyAngleX: 3, ParamArmLA: 20 });
+  const withoutArms = noArms._computeFrameValues(1000, true);
+  assert.equal("ParamArmLA" in withoutArms, false);
+  near(withoutArms.ParamBodyAngleX, 3);
+
+  const withArms = makeBodyStage(["ParamArmLA"]);
+  withArms.setTargetParams({ ParamBodyAngleX: 0 });
+  withArms.setBodyParams({ ParamBodyAngleX: 3, ParamArmLA: 20 });
+  near(withArms._computeFrameValues(1000, true).ParamArmLA, 20);
+
+  withArms.setBodyParams({}); // 低可见度 / 丢失 → 不再驱动
+  assert.equal("ParamArmLA" in withArms._computeFrameValues(2000, true), false);
+});
+
+await test("Live2DStage：上半身参数按 ~0.16s 低通（不直接跳变），immediate 落位", () => {
+  const stage = makeBodyStage(["ParamArmLA"]);
+  stage.setTargetParams({});
+  stage.setBodyParams({ ParamArmLA: 10 });
+  near(stage._computeFrameValues(1000, false).ParamArmLA, 10); // 首帧没有历史 → 直接落位
+  stage.setBodyParams({ ParamArmLA: 20 });
+  const eased = stage._computeFrameValues(1000 + 1000 / 60, false).ParamArmLA;
+  const expected = 10 + (20 - 10) * (1 - Math.exp(-(1000 / 60) / 160));
+  near(eased, expected, 1e-9);
+  assert.ok(eased > 10 && eased < 20, "两帧之间应缓动，而不是直接跳到 20");
+  stage.setBodyParams({ ParamArmLA: 20 });
+  near(stage._computeFrameValues(2000, true).ParamArmLA, 20); // 截图 / 单步：立即落位
+});
+
+console.log("[selftest] tools/mock-body.js · mock 手机端的上半身合成数据");
+
+await test("buildUpperBody：协议合法的 52 项 + [roll,yaw]，坐标/可见度都在范围内", () => {
+  const sample = buildUpperBody(1.234);
+  assert.equal(sample.ub.length, BODY_FLOATS);
+  assert.equal(sample.ubOk, true);
+  assert.equal(sample.body.length, 2);
+  for (const value of sample.ub) {
+    assert.ok(Number.isFinite(value), "ub 必须是有限数");
+    assert.ok(value >= 0 && value <= 1, "x/y/visibility 应在 [0,1]：" + value);
+  }
+  const points = parseUpperBody(sample.ub);
+  assert.ok(points, "mock ub 必须能解析成 13 点");
+  assert.equal(points.length, BODY_COUNT);
+});
+
+await test("buildUpperBody：双手交替抬起 → 左/右臂角度周期性变化（mock 能驱动映射）", () => {
+  const rest = buildUpperBody(0);
+  const raisedLeft = buildUpperBody(1.3); // armPeriodSec=5.2 的 1/4 周期
+  const restMapped = mapBody(rest.body, rest.ub);
+  const raisedMapped = mapBody(raisedLeft.body, raisedLeft.ub);
+  assert.ok(raisedMapped.params.ParamArmLA > restMapped.params.ParamArmLA + 20, "左臂应明显抬起");
+  // 抬起时右手基本还在下面（相位错开 π/2）
+  assert.ok(raisedMapped.params.ParamArmRA < raisedMapped.params.ParamArmLA);
+});
+
+await test("buildUpperBody：周期内会出现 ubOk=false + 全 0（验证客户端平滑回默认）", () => {
+  const dropped = buildUpperBody(8.8); // dropPeriodSec=9、dropLengthSec=0.7 → 8.8s 处于丢失窗口
+  assert.equal(dropped.ubOk, false);
+  assert.ok(dropped.ub.every((value) => value === 0));
+  assert.deepEqual(dropped.body, [0, 0]);
+  // 关掉丢失窗口 + 静止姿态（neutral 场景）：稳定输出、没有随机性
+  const neutral = buildUpperBody(3.7, { rollAmpDeg: 0, yawAmpDeg: 0, armLiftDeg: 0, dropPeriodSec: 0 });
+  assert.equal(neutral.ubOk, true);
+  near(neutral.body[0], 0);
+  near(neutral.body[1], 0);
+  // 手臂静止 12° → 12/150*30 ≈ 2.4（坐标按协议保留 4 位小数，允许一点舍入误差）
+  near(mapBody(neutral.body, neutral.ub).params.ParamArmLA, 2.4, 0.01);
+});
+
+await test("上半身链路（mock → readUpperBodyTrack → mapBody → smoothBodyParams）：参数跟随数据，丢失后 1s 内释放", () => {
+  let prev = null;
+  let current = {};
+  let maxArmLA = 0;
+  let maxAbsZ = 0;
+  for (let i = 0; i < 240; i++) {
+    const nowMs = i * (1000 / 60);
+    const sample = buildUpperBody(nowMs / 1000);
+    const next = readUpperBodyTrack(
+      { ub: sample.ub, ubOk: sample.ubOk, ubT: nowMs, body: sample.body },
+      nowMs,
+      prev,
+    );
+    const mapped = next.ok ? mapBody(next.torso, next.points) : null;
+    current = smoothBodyParams(prev?.current ?? current, mapped ? mapped.params : null);
+    for (const id of Object.keys(current)) {
+      assert.ok(BODY_PARAM_IDS.includes(id), "输出不应包含未知参数：" + id);
+    }
+    maxArmLA = Math.max(maxArmLA, current.ParamArmLA ?? 0);
+    maxAbsZ = Math.max(maxAbsZ, Math.abs(current.ParamBodyAngleZ ?? 0));
+    prev = { ...next, current };
+  }
+  assert.ok(maxArmLA > 20, "手臂参数应被 mock 数据驱动（max " + maxArmLA + "）");
+  assert.ok(maxAbsZ > 1, "躯干侧倾应被 mock 数据驱动（max " + maxAbsZ + "）");
+
+  // 手机端上半身结果丢失（ubOk=false 连续 60 帧 ≈ 1s）：参数单调衰减并最终释放
+  let frame = 240;
+  let lastArm = current.ParamArmLA ?? 0;
+  for (let i = 0; i < 60; i++) {
+    const nowMs = frame * (1000 / 60);
+    const next = readUpperBodyTrack(
+      { ub: new Array(BODY_FLOATS).fill(0), ubOk: false, ubT: frame, body: [0, 0] },
+      nowMs,
+      prev,
+    );
+    const mapped = next.ok ? mapBody(next.torso, next.points) : null;
+    current = smoothBodyParams(prev.current, mapped ? mapped.params : null);
+    if (typeof current.ParamArmLA === "number") {
+      assert.ok(current.ParamArmLA <= lastArm, "丢失后手臂参数应单调衰减");
+      lastArm = current.ParamArmLA;
+    }
+    prev = { ...next, current };
+    frame += 1;
+  }
+  assert.equal("ParamArmLA" in current, false, "1s 后应把手臂参数交还给 idle motion");
+});
 
 const failed = results.filter((r) => !r.ok);
 console.log("");

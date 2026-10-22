@@ -402,6 +402,34 @@ class PipelineFaceTracker(private val context: Context) {
     /** Use direct YUV processing (recommended; avoids Kotlin-side YUV->RGB conversion). */
     var useDirectYuvMode: Boolean = true
 
+    /**
+     * 相机 YUV 帧 tap（上层做**附加**推理用，例如上半身关键点，见 docs/upper-body.md §3.3）。
+     *
+     * 线程与生命周期约定：
+     *  - 回调跑在**相机线程**上、同步执行，[YuvFrameData] 里的 ByteBuffer 直接指向
+     *    Camera2 `Image` 的 plane —— `image.close()` 之后立刻失效，所以回调里必须
+     *    **同步消费完**（拷成 Bitmap / 数组），不能存下来异步读；
+     *  - 回调耗时直接吃相机线程的帧预算，别在这里做整帧推理；
+     *  - 任何异常都在本类内被捕获并记日志，**绝不允许影响面捕热路径**；
+     *  - [stop] 会把它置 null（避免释放后还回调），需要在重新 start 后由上层重新挂上。
+     *
+     * 关闭该功能时保持为 null：相机回调里只多一次判空，零额外开销。
+     */
+    @Volatile
+    var onYuvFrameForBody: ((YuvFrameData) -> Unit)? = null
+
+    /**
+     * [onYuvFrameForBody] 的抽帧间隔（毫秒）：默认 66ms ≈ 15fps，**0 = 每帧都回调**。
+     *
+     * 运行中改这个值即可生效（相机线程下一帧就会看到新值），无需重启管线。
+     */
+    @Volatile
+    var bodyTapIntervalMs: Long = 66L
+
+    /** 上一次调用 [onYuvFrameForBody] 的时间戳（相机线程读、start() 时归零）。 */
+    @Volatile
+    private var lastBodyTapMs: Long = 0L
+
     private var yuvFrameChannel: Channel<YuvFrameDataInternal> = newYuvChannel(DETECTION_CHANNEL_CAPACITY)
     private var yuvLandmarkFrameChannel: Channel<YuvFrameDataInternal> = newYuvChannel(LANDMARK_CHANNEL_CAPACITY)
 
@@ -471,6 +499,9 @@ class PipelineFaceTracker(private val context: Context) {
         // Drop any stale face box from a previous session.
         synchronized(faceBoxLock) { lastFaceBox = null }
 
+        // 新的采集会话：上半身 tap 立刻触发第一帧，不用先等一个抽帧间隔。
+        lastBodyTapMs = 0L
+
         val channelDesc = if (activeChannelCount > 1) {
             "GPU x $activeChannelCount (parallel, queue=$landmarkQueueCapacity)"
         } else {
@@ -515,6 +546,23 @@ class PipelineFaceTracker(private val context: Context) {
                 val data = YuvFrameDataInternal(frameId = frameId++, yuvData = yuvData)
                 yuvFrameChannel.trySend(data)
                 yuvLandmarkFrameChannel.trySend(data.copy())
+
+                // 上半身等附加推理的抽帧 tap：面捕的两条通道先喂完再调用，保证面捕优先；
+                // 回调里自己会同步消费 ByteBuffer，异常必须在这里兜住 —— 相机线程一旦
+                // 被抛出去，面捕也会跟着停。
+                val bodyTap = onYuvFrameForBody
+                if (bodyTap != null) {
+                    val nowMs = System.currentTimeMillis()
+                    val intervalMs = bodyTapIntervalMs
+                    if (intervalMs <= 0L || nowMs - lastBodyTapMs >= intervalMs) {
+                        lastBodyTapMs = nowMs
+                        try {
+                            bodyTap(yuvData)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "Upper-body YUV tap failed", t)
+                        }
+                    }
+                }
             }
         } else {
             camera2Manager.useDirectYuvMode = false
@@ -576,6 +624,10 @@ class PipelineFaceTracker(private val context: Context) {
         outputChannel.close()
         yuvFrameChannel.close()
         yuvLandmarkFrameChannel.close()
+
+        // 相机已停，摘掉上半身等附加推理的 tap：避免上层被释放后仍有回调持有引用。
+        // 重新 start() 后由上层按需重新挂上（MainActivity 在 onCameraChanged 里补挂）。
+        onYuvFrameForBody = null
     }
 
     fun release() {
@@ -593,13 +645,20 @@ class PipelineFaceTracker(private val context: Context) {
     // Camera selection / switching
     // ============================================================================
 
-    /** List every camera exposed by the platform (front / back / external). */
+    /**
+     * List every camera exposed by the platform (front / back / external) plus
+     * the physical sensors hidden behind logical multi-cameras (API 28+), such
+     * as the rear ultra-wide lens.
+     */
     fun getAvailableCameras(): List<CameraDeviceInfo> = camera2Manager.getAvailableCameras()
 
     /** Camera selected by the current / most recent session, or null before start. */
     fun getCurrentCamera(): CameraDeviceInfo? = camera2Manager.selectedCameraInfo
 
-    /** Camera id requested for the next start, or null for automatic front-first. */
+    /**
+     * Camera key requested for the next start, or null for automatic front-first.
+     * `"0"` = logical camera, `"0#2"` = physical sensor of logical camera `0`.
+     */
     fun getPreferredCameraId(): String? = camera2Manager.getPreferredCameraId()
 
     /** Select the camera used by the next [start]; takes effect on the next start. */
@@ -613,21 +672,28 @@ class PipelineFaceTracker(private val context: Context) {
      * The pipeline is stopped and restarted so Camera2 releases the previous
      * device before opening the new one. The pose / expression baseline is
      * reset afterwards because FOV and sensor geometry usually differ between
-     * cameras (especially front ↔ back ↔ external).
+     * cameras (especially front ↔ back ↔ external / ultra-wide).
      *
-     * @return true if the camera id exists and the switch was applied.
+     * @param cameraId a [CameraDeviceInfo.key] (`"0"` for a logical camera,
+     *                 `"0#2"` for a physical sensor).
+     * @return true if the camera key exists and the switch was applied.
      */
     fun switchCamera(cameraId: String): Boolean {
-        val target = camera2Manager.getAvailableCameras().firstOrNull { it.id == cameraId }
+        val target = camera2Manager.getAvailableCameras().firstOrNull { it.key == cameraId }
         if (target == null) {
-            Log.e(TAG, "Cannot switch camera: id $cameraId is not available")
+            Log.e(TAG, "Cannot switch camera: key $cameraId is not available")
             return false
         }
 
         val wasRunning = isRunning.get()
-        val alreadyActive = wasRunning && camera2Manager.selectedCameraInfo?.id == target.id
-        Log.i(TAG, "Switching camera to ${target.label} (id=${target.id}), running=$wasRunning, alreadyActive=$alreadyActive")
-        camera2Manager.setPreferredCamera(target.id)
+        val alreadyActive = wasRunning &&
+            camera2Manager.selectedCameraInfo?.key == target.key
+        Log.i(
+            TAG,
+            "Switching camera to ${target.label} (key=${target.key}), " +
+                "running=$wasRunning, alreadyActive=$alreadyActive",
+        )
+        camera2Manager.setPreferredCamera(target.key)
 
         if (alreadyActive) {
             // Same camera selected again — keep the session, just refresh the UI.

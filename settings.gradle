@@ -26,3 +26,5 @@ include ':MediapipeFaceLandmark'
 include ':OpenSeeFaceProcess'
 include ':CommonData'
 include ':facecapture-sdk'
+// 上半身关键点采集（官方 MediaPipe Tasks PoseLandmarker，可选模块）
+include ':MediapipeUpperBody'

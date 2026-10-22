@@ -376,3 +376,73 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
   若机型 720p 只支持 30fps，会打印 `⚠ 720p ... caps it at 30.0 fps`，此时要么换支持
   720p60 的摄像头，要么把 `MAX_PIXEL_COUNT` 降到相机能跑 60fps 的尺寸（会落到策略 ②）。
 
+---
+
+## 9. 摄像头：物理超广角 + 横竖屏
+
+### 目标
+
+- 后置超广角（以及长焦）也能像普通摄像头一样在 App 内选择、切换。
+- 手机横过来（架在支架上）时，预览 / 面捕 / 输出照常工作，旋转不打断采集。
+
+### 问题
+
+- `CameraManager.cameraIdList` 只返回「逻辑相机」。很多机型把后置超广角藏在逻辑后置
+  相机后面，`cameraIdList` 里没有它，`openCamera(id)` 也打不开。
+- 旋转屏幕默认会重建 Activity：`onPause` 释放相机，新 Activity 里面捕管线是停的，
+  用户必须重新点「开始面捕」。
+
+### 实现
+
+| 位置 | 改动 |
+|---|---|
+| `Camera2Manager.getAvailableCameras()` | API 28+ 读取逻辑相机的 `physicalCameraIds`，把不在 `cameraIdList` 里、且支持 YUV 输出的物理镜头作为额外条目返回；`CameraDeviceInfo.key = "logical#physical"`；按 35mm 等效焦距打「超广角 / 长焦」标签并排序 |
+| `Camera2Manager.setPreferredCamera()` | 接受 `"logical#physical"` 组合键（兼容旧偏好 `"0"` 这类纯逻辑 id）；物理镜头不可用时退回同一逻辑相机 |
+| `Camera2Manager.openCamera()` | 逻辑相机负责 `openCamera` / 3A / 请求构建；尺寸、sensor 方向、FOV 改用物理镜头的 characteristics |
+| `Camera2Manager.createCaptureSession()` | 物理镜头用 `OutputConfiguration.setPhysicalCameraId()` + `SessionConfiguration`（API 28+）；API 29+ 先 `isSessionConfigurationSupported()` 预检；被 HAL 拒绝时自动退回逻辑相机 |
+| `app/AndroidManifest.xml` | `screenOrientation="sensor"` + `configChanges="orientation|screenSize|..."`：竖屏 / 左右横屏都允许，旋转不重建 Activity |
+| `MainActivity` | 控制面板最大高度按 `LocalConfiguration.screenHeightDp` 计算（横屏默认收起），摄像头选择列表高度自适应；选择按 `key` 记忆 |
+
+### 代价与验证
+
+- 物理镜头只保证「能出流」，不保证 720p60：超广角 sensor 往往只有 30fps，以
+  `Camera delivered` 为准；若 720p 物理流被 HAL 拒绝，日志会打印
+  `HAL rejects physical stream ...` 并自动回退到逻辑相机。
+- 横屏旋转时帧尺寸在 1280×720 / 720×1280 之间切换，预览与关键点按新尺寸重建位图，属预期。
+- 验证日志：`Camera selected: Back 超广角 (id=0 · physical 2), sensor=90°, fov=...`；
+  旋转屏幕时 logcat 不应再出现新的 `MainActivity onCreate`（Activity 不重建）。
+
+---
+
+## 10. 可选：上半身关键点（MediaPipe Pose）的开销
+
+### 目标
+
+在不影响面捕 60 fps 的前提下，额外提供 13 个上半身点 + 相对躯干角；**默认关**，
+关掉时对相机线程 / 推理 / 显存零影响。
+
+### 实现要点
+
+| 位置 | 改动 |
+|---|---|
+| `facecapture-sdk/.../PipelineFaceTracker.kt` | 相机 YUV 回调里新增 `onYuvFrameForBody` tap：先喂完面捕两条 channel，再按 `bodyTapIntervalMs`（默认 66 ms ≈ 15 fps）同步调用；整段 `try/catch`，异常绝不影响面捕；`stop()` 置 null |
+| `app/.../UpperBodyPoseController.kt` | 相机线程上把 `YuvFrameData`（duplicate ByteBuffer，不拷贝像素）包成 `Yuv420Frame` 交给检测器；`upperBody = false` 时 tap 为 null，回调里只多一次判空 |
+| `:MediapipeUpperBody` | 采样 + 旋转 + 镜像缩放到长边 256 的 ARGB（约 5 万像素，1~4 ms），`PoseLandmarker` LIVE_STREAM 异步推理，单飞（上一帧没回来就丢帧，计入 dropped）；GPU 优先，创建失败自动回退 CPU |
+| 协议 | 开启后每帧 `track` 多 `ubOk`/`ub(52)`/`ubT`/`body`，约 +0.6 KB/帧（60 fps ≈ +36 KB/s） |
+
+### 代价
+
+- 相机线程：每 66 ms 多 1~4 ms 的 YUV→Bitmap 转换（约 6% 预算）；面捕 channel 仍然先喂。
+- 推理：15 fps Pose 推理与面捕的 face landmarker 并行；GPU 满载时才回退 CPU（帧率会掉到 5~10）。
+- 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 256 长边 Bitmap（约 200 KB，交给 GC）。
+- 关掉时：tap 为 null，没有 Bitmap、没有额外推理，面捕路径与之前完全一致。
+
+### 验证日志
+
+- 开关打开：`UpperBodyPose` / `UpperBodyPoseDetector` tag 打印初始化后端、模型路径、回退原因；
+- HUD：`上半身: 运行中 · x fps / 点数 n/13 · 质量 q · 躯干 roll/yaw`；
+- 面捕 `Body fps`（相机侧）不应因开启上半身下降超过 1~2 fps，若明显下降说明 GPU 被抢；
+- 关闭后相机线程不应再出现 `UpperBodyPose` 的逐帧日志。
+
+> 本节数字是设计预算（75% 相机线程 60 fps 下），**未在本仓库环境真机量化**；
+> 无 JDK / Android SDK 的环境只能做静态审查 + PC 侧 Node 单测。

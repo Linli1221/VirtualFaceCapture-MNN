@@ -1,7 +1,8 @@
 # VFC Tracking Protocol v1
 
-> 手机端只做**面部捕捉**，通过局域网把**每帧追踪数据**（ARKit-52 BlendShape + 头部姿态）发给
-> Windows 客户端，由客户端渲染 Live2D 虚拟形象。
+> 手机端做**面部捕捉**（可选叠加**上半身关键点**），通过局域网把**每帧追踪数据**
+> （ARKit-52 BlendShape + 头部姿态 + 可选上半身 13 点 / 躯干角）发给 Windows 客户端，
+> 由客户端渲染 Live2D 虚拟形象。
 >
 > 本文是手机端（Android）与 Windows 客户端之间的**唯一契约**。两端实现都必须严格按本文的字段名、
 > 索引顺序和符号约定来写；改动协议必须同时在本文与两端代码里升级 `version`。
@@ -24,8 +25,9 @@
 - **服务端 = 手机**，**客户端 = Windows**。手机不需要知道客户端地址；客户端主动连手机。
 - 传输层：**WebSocket + 文本帧 + JSON（UTF-8）**。没有二进制帧，便于抓包排障。
 - 端口：**8765**（固定，手机与客户端同一局域网即可）。
-- 只传**语义数据**（表情权重 + 角度），不传图像/视频。一帧约 **0.4~0.7 KB**，
-  30 Hz 约 15~20 KB/s，60 Hz 约 30~40 KB/s，手机端零编码开销。
+- 只传**语义数据**（表情权重 + 角度；可选上半身关键点），不传图像/视频。未开启上半身时
+  一帧约 **0.4~0.7 KB**，30 Hz 约 15~20 KB/s，60 Hz 约 30~40 KB/s；开启上半身后约
+  **1.1 KB / 60 fps ≈ 66 KB/s**（见 §9），手机端零编码开销。
 
 ---
 
@@ -48,7 +50,7 @@
 | `type` | 频率 | 作用 |
 |---------|------|------|
 | `hello` | 每个连接建立后 **1 次** | 协议版本、设备信息、建议帧率 |
-| `track` | 每处理完一帧 1 次（≤ 60 Hz） | 该帧的表情权重 + 头部姿态 |
+| `track` | 每处理完一帧 1 次（≤ 60 Hz） | 该帧的表情权重 + 头部姿态（+ 可选上半身关键点，见 §4.2） |
 | `calib` | 校准开始时 1 次，结束时 1 次 | 校准窗口状态（可选，`track.calibrating` 已带同样信息） |
 | `pong` | 收到 `ping` 时 | 心跳应答 |
 | `ack`  | 收到 `command` 时 | 命令确认 |
@@ -62,6 +64,9 @@
 | `command` | `{"name":"recalibrate"}` 让手机重做中性脸基线校准 |
 
 **未知字段必须忽略，未知 `type` 必须忽略**（向前兼容）。缺失的 `track` 可选字段按默认值处理。
+
+> `hello.upperBody` 与 `track` 的 `ubOk` / `ub` / `ubT` / `body` 是 v1 的**纯增量可选字段**：
+> 手机端未开启上半身采集时完全不下发，老客户端按「未知字段忽略」即可（§10），不需要升 `version`。
 
 ---
 
@@ -80,6 +85,7 @@
   "app": "VirtualFaceCapture/1.0.3",
   "decimation": 1,
   "targetFps": 60,
+  "upperBody": true,
   "t": 1730000000000
 }
 ```
@@ -92,7 +98,13 @@
 | `app` | string | App 名 + versionName |
 | `decimation` | int | 每处理 N 帧发 1 帧（1 = 全量；手机端为省电/省带宽时可 >1） |
 | `targetFps` | int | 手机当前的目标输出帧率 |
+| `upperBody` | bool | **可选**：手机端上半身采集已启用。仅开启时下发 `true`，关闭时字段不出现（不是 `false`） |
 | `t` | int | 手机本地 Unix 毫秒时间戳 |
+
+> `upperBody` 只是**建连那一刻**的能力声明，**不代表每帧都有结果**；每帧是否有效看
+> `track.ubOk`（§4.2）。连接期间打开 / 关闭上半身不会重发 `hello`，客户端以
+> `track` 里是否出现 `ub` 作为最终依据：出现就开始画（`ubOk` 决定是否驱动），
+> 消失就平滑回默认姿态。
 
 ### 4.2 `track`
 
@@ -108,7 +120,11 @@
   "face": true,
   "score": 0.98,
   "fps": 59.1,
-  "calibrating": false
+  "calibrating": false,
+  "ubOk": true,
+  "ub": [0.5123,0.3311,-0.021,0.99, 0.4871,0.3302,-0.019,0.98, ...],
+  "ubT": 1730000000100,
+  "body": [2.5, -4.1]
 }
 ```
 
@@ -122,8 +138,25 @@
 | `score` | float | — | 人脸存在置信度 [0,1] |
 | `fps` | float | — | 手机端处理帧率，仅展示 |
 | `calibrating` | bool | — | 是否仍在首帧标定窗口内 |
+| `ubOk` | bool | — | 本帧是否有可用的上半身结果。**开启上半身时每帧都出现**；`false` = 丢失 / 过期，客户端平滑回默认姿态 |
+| `ub` | float[52] | — | 13 点 × `[x, y, z, visibility]`，顺序见 §5.3。`ubOk=false` 时仍是 52 个 `0`（结构稳定） |
+| `ubT` | int | — | 该**关键点帧**的手机采集时间（ms）。`0` = 已启用但还没收到过有效帧 |
+| `body` | float[2] | — | 相对基线的躯干角 `[roll, yaw]`（度），符号见 §5.3；`ubOk=false` 时为 `[0,0]` |
 
 数值建议保留 **4 位小数**（`0.1235`），够用且省带宽。
+
+**上半身字段的约定**（可选，但只有「开 / 关」两种形态）：
+
+- **未开启上半身**：`ubOk` / `ub` / `ubT` / `body` **一个都不出现**，报文与 v1 原有形态完全一致。
+- **已开启**：`ubOk` 每帧都出现。本帧有结果 → `true`；丢失 / 超过 **1500 ms** 没更新 /
+  `tracking=false` → `false`，此时 `ub` 仍发 52 个 `0`、`body` 发 `[0,0]`。
+  客户端收到 `ubOk=false` 应在约 0.3 s 内把手臂 / 身体参数平滑回 0，不要冻结在最后一帧。
+- `ubT` 是**关键点帧**的时间，不是 `track` 帧的 `t`：上半身推理约 15 Hz，而 `track` 最高 60 Hz，
+  连续几条 `track` 可能复用同一份关键点（`ubT` 相同 = 没有新结果，不要重复做平滑 / 插值）。
+- `ubT` 和 `t` 都是**同一台手机**的时钟，客户端可以用 `t - ubT` 判断这条 `track` 复用的
+  关键点有多旧（正常 ≤ 66 ms）；**不要**把 `ubT` 和 PC 本机时钟直接相减（两端时钟不同步，§7.8）。
+  是否过期仍以 `ubOk` 为准——服务端已经用手机时钟做过 1500 ms 判定。
+- `body` 已减基线：手机端重新打开上半身开关 / 重置基线后归零，客户端应同步把身体参数淡回中位。
 
 ### 4.3 `calib`
 
@@ -192,6 +225,54 @@
 > 这套符号是**手机坐标系下的人脸朝向**，与 Live2D 的 `ParamAngleX/Y/Z` 不是同一个方向约定，
 > 不能直接赋值。参考映射见 §8.1（与 Android 旧版渲染器逐行等价）。
 
+### 5.3 `ub`：上半身 13 点索引与坐标语义
+
+`ub` 是 **13 个点 × 4 个值 = 52 个 float**，严格按下面的顺序展平
+（`ub[i*4+0] = x`、`ub[i*4+1] = y`、`ub[i*4+2] = z`、`ub[i*4+3] = visibility`）：
+
+| 协议 idx | 名称 | MediaPipe Pose 原始 idx | 说明 |
+|---:|---|---:|---|
+| 0 | nose | 0 | 鼻子 |
+| 1 | eye_left | 2 | 被拍者左眼 |
+| 2 | eye_right | 5 | 被拍者右眼 |
+| 3 | ear_left | 7 | 被拍者左耳 |
+| 4 | ear_right | 8 | 被拍者右耳 |
+| 5 | shoulder_left | 11 | 左肩 |
+| 6 | shoulder_right | 12 | 右肩 |
+| 7 | elbow_left | 13 | 左肘 |
+| 8 | elbow_right | 14 | 右肘 |
+| 9 | wrist_left | 15 | 左腕 |
+| 10 | wrist_right | 16 | 右腕 |
+| 11 | hip_left | 23 | 左胯 |
+| 12 | hip_right | 24 | 右胯 |
+
+顺序来自 `CommonData` 的 `UpperBodyLandmarkIndex.ORDER`；Windows 客户端的
+`BODY_LANDMARK_ORDER` 必须与上表逐项一致。只上传这 13 个点，MediaPipe Pose 的其余
+20 个点（手指、脚等）不上传。
+
+**坐标语义**（与手机预览一致，客户端画骨架时**不要再做任何翻转**）：
+
+- `x` / `y`：归一化图像坐标，基于**旋转 + 镜像之后**的预览画面。`x=0` 是画面左缘、`x=1` 是右缘；
+  `y=0` 是上缘、`y=1` 是下缘（**y 向下增大**）。协议里裁剪到 `[0,1]`。
+- `z`：MediaPipe 的相对深度，量纲与 `x` 近似（约等于图宽的比例），**越小越靠近镜头**。
+  它是相对量，不能当绝对距离；判断手的前后请用差值（如 `wrist.z - shoulder.z < 0` = 手伸向镜头）。
+  协议里裁剪到 `[-5,5]`。
+- `visibility`：该点可见度 `[0,1]`（MediaPipe 原值），协议里裁剪到 `[0,1]`。
+  建议低于 **0.3~0.5** 的点不参与参数驱动（参考实现取 0.3）；肩 / 胯贴到画面边缘时可见度会明显下降。
+- **镜像语义**：前置摄像头（`mirrorHorizontal=true`）只镜像**像素**，协议不交换左右标签。
+  画面像照镜子：你抬右手，手机预览里抬起的手也在画面右侧；客户端直接用 `x` 画骨架即可。
+- `left` / `right` 始终指**被拍者本人**的左右（MediaPipe 的 `LEFT_*` / `RIGHT_*` 语义），
+  **不是画面左右**。不要用 `x` 的大小去推测左右，按索引取点。
+
+**`body`：相对躯干角（度）**
+
+- `body[0] = roll`：肩线倾斜。**> 0 = 被拍者右肩下沉**（画面上顺时针），典型 ±30。
+- `body[1] = yaw`：肩线绕竖轴转角。**> 0 = 被拍者向自己的左侧转**（与 §5.2 头部 `yaw` 同号），典型 ±45。
+- 已减基线：手机端重新打开上半身开关 / 重置基线后归零；范围裁剪到 `[-180,180]`。
+- 这是**躯干**角，不是相机角；客户端不要把 §5.2 的 `pose` roll/yaw 再重复叠加（§8.5）。
+
+> 手臂抬起角等派生公式见 §8.5；本节只定义**数据语义**，不含客户端映射算法。
+
 ---
 
 ## 6. `GET /status`
@@ -259,10 +340,11 @@
 
 ---
 
-## 8. 参考映射：ARKit-52 → Live2D 参数
+## 8. 参考映射：追踪数据 → Live2D 参数
 
-以下算法与旧版 Android 渲染器（`Live2DAvatarAdapter` + `LAppModel::ModelParameterUpdate`）
-**逐行等价**，Windows 客户端应直接照此实现，保证"换端后手感不变"。
+§8.1 ~ §8.4 的算法与旧版 Android 渲染器（`Live2DAvatarAdapter` + `LAppModel::ModelParameterUpdate`）
+**逐行等价**，Windows 客户端应直接照此实现，保证"换端后手感不变"。§8.5 是可选上半身
+（`ub` / `body`）的参考映射，由 Windows 客户端按自己模型的参数取舍。
 
 ### 8.1 直通参数（每帧绝对赋值）
 
@@ -370,6 +452,59 @@ setParam("ParamBodyAngleX", -y * 10);
 - 物理演算（`*.physics3.json`）保留，头发/衣摆动起来才有"活人感"。
 - 可选：`ParamBodyAngleZ`、`ParamBodyAngleY` 由 roll/pitch 派生少量值让身体跟着动。
 
+### 8.5 上半身 → Live2D 参数参考映射
+
+`body` / `ub` 是**可选**输入：模型没有对应参数时直接跳过（`getParameterIndex` 返回 -1）。
+MediaPipe Pose 只有约 15 fps，所有派生值建议再做 0.15~0.25 s 的一阶低通后再写给模型。
+
+**躯干**（`body = [roll, yaw]`，与 §8.2 的头姿派生值**相加后 clamp**，不要互相覆盖）：
+
+```js
+const poseBodyX = -y * 10;                                       // §8.2 已给的头姿派生值
+ParamBodyAngleX = clamp(poseBodyX + (-body[1] * 0.3), -30, 30);  // 相加，不覆盖
+ParamBodyAngleY = clamp(-body[0] * 0.2, -30, 30);                // 幅度很小，仅为接口完整
+ParamBodyAngleZ = clamp(body[0] * 0.5, -30, 30);
+```
+
+**手臂**（画面坐标 y 向下；「自然下垂」= 0°，水平 = 90°，举过头 = 180°）：
+
+```js
+// ub 取点：下标顺序见 §5.3
+const p = (i) => ({ x: ub[i * 4], y: ub[i * 4 + 1], z: ub[i * 4 + 2], v: ub[i * 4 + 3] });
+const P_LEFT_SHOULDER = 5, P_RIGHT_SHOULDER = 6,
+      P_LEFT_ELBOW = 7, P_RIGHT_ELBOW = 8, P_LEFT_WRIST = 9, P_RIGHT_WRIST = 10;
+
+// 肩 → 腕向量相对「竖直向下」的夹角（度）：0 = 自然下垂、90 = 平举、180 = 举过头顶。
+// 画面 y 向下，所以竖直向下 = (0, +1)；左右对称取 |dx|，镜像只影响 x 正负、不影响该角。
+function armAngleFromDown(shoulder, wrist) {
+  const dx = wrist.x - shoulder.x;
+  const dy = wrist.y - shoulder.y;
+  return Math.atan2(Math.abs(dx), dy) * 180 / Math.PI;
+}
+
+const angleL = armAngleFromDown(p(P_LEFT_SHOULDER), p(P_LEFT_WRIST));
+const angleR = armAngleFromDown(p(P_RIGHT_SHOULDER), p(P_RIGHT_WRIST));
+
+// 参考实现：满量程 150°，归一后乘模型手臂参数量程（常见 30）
+const ARM_ANGLE_MAX = 150, ARM_SCALE = 30;
+setParam("ParamArmLA", clamp(angleL / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
+setParam("ParamArmRA", clamp(angleR / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
+```
+
+- 手肘被躯干挡住时用肩 → 腕更稳；需要更精细时可用
+  `armAngleFromDown(shoulder, elbow)` + `armAngleFromDown(elbow, wrist)` 两段近似
+  （协议没有手心朝向，不要过度解读）。
+- `x` / `y` 分别按画面宽 / 高归一化，协议不带分辨率，参考实现没有做长宽比矫正；
+  手臂主要是上下运动，误差可接受。要精确角度只能由手机端把像素纵横比信息一起下发（v1 不做）。
+- 参考实现（`windows-client/renderer/mapping.js`）只驱动 `ParamBodyAngleX/Y/Z` 与
+  `ParamArmLA/RA`；`ParamShoulderL/R`、`ParamHandL/R` 没有可靠数据源，模型真有参数时再自行接。
+- 参与计算的肩 / 肘 / 腕 `visibility` 任一低于 **0.3** 时，本帧**不更新**该侧手臂参数
+  （参考实现 `BODY_ARM_MIN_VISIBILITY`）。
+- `ubOk=false` 或连续 1.5 s 没有 `ubOk=true`：目标值按帧向 0 衰减（每帧约 15%，
+  0.3~0.8 s 回到中位，同 §7.6 的「回中性」），不要突然跳到默认姿态。
+- `z` 差可以做「手前后」：`wrist.z - shoulder.z < 0` 表示手更靠近镜头；但 MediaPipe 的 `z`
+  抖动较大，建议只在调试面板展示，不要直接映射成角度。
+
 ---
 
 ## 9. 性能预算
@@ -377,7 +512,8 @@ setParam("ParamBodyAngleX", -y * 10);
 | 指标 | 目标 |
 |------|------|
 | 手机端每帧序列化 | < 0.3 ms（手写 StringBuilder，不用反射/JSON 库） |
-| 单帧报文 | < 1 KB |
+| 单帧报文（未开启上半身） | < 1 KB |
+| 单帧报文（开启上半身） | ≈ 1.1 KB（13 点 × 4 值 + `ubOk`/`ubT`/`body`）；60 fps ≈ 66 KB/s |
 | 端到端延迟（相机曝光→PC 屏幕） | < 80 ms（同 Wi-Fi 5/6）：**不含**手机端 0.5 s 发送帧缓冲 |
 | 端到端延迟（含默认 0.5 s 帧缓冲，实测口径） | ≈ 0.58 s（要更低就把 `FRAME_BUFFER_MS` 设为 0） |
 | PC 渲染 | 60 FPS @ 1080p，GPU 占用 < 15% |

@@ -10,6 +10,7 @@
  *   node tools/mock-tracker.js --scenario sway       # 只摆头
  *   node tools/mock-tracker.js --scenario neutral    # 全中性
  *   node tools/mock-tracker.js --hz 30 --jitter 20   # 30 Hz，发送时间随机晚 0~20 ms（测抖动缓冲）
+ *   node tools/mock-tracker.js --no-upper-body       # 不带上半身字段（回归旧手机 / 旧行为）
  *
  * 参数：
  *   --port <n>        监听端口（默认 8765，协议固定值）
@@ -19,13 +20,23 @@
  *   --jitter <ms>     模拟传输抖动：发送时间在计划时间后随机晚 0~ms
  *                     （报文里的 `t` 仍按计划采集时间递增，用来验证 PC 端时间轴）
  *   --scenario <name> all | neutral | blink | sway | jaw | closed | open
+ *   --upper-body <0|1> 是否发上半身字段（默认 1；all / face / neutral 场景自带数据）
+ *   --no-upper-body   等价 --upper-body 0：track 里不出现 ub / ubOk / ubT / body，回归旧行为
  *   --quiet           不打印每秒统计
  *
+ * 环境变量：MOCK_UPPER_BODY=0（或 false/off/no）等价 --no-upper-body；命令行优先。
+ *
+ * 上半身数据（协议 §4.2 / §5.3）：13 点 × 4 扁平数组 + [roll, yaw] 躯干角 + ubOk/ubT，
+ * 双手周期性抬起放下、躯干缓慢摆动，每 9s 丢 0.7s（ubOk=false）用来验证客户端平滑回默认。
+ * 合成细节在 tools/mock-body.js（纯函数，selftest 直接单测）。
+ *
  * 同时提供 HTTP：GET /（信息页）、GET /status（JSON，同协议 §6）、
- *                 GET /__control?mode=blink（运行时切换 scenario）
+ *                 GET /__control?mode=blink（运行时切换 scenario）、
+ *                 GET /__control?upperBody=0|1（运行时开关上半身数据）
  */
 import http from "node:http";
 import crypto from "node:crypto";
+import { buildUpperBody } from "./mock-body.js";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PROTOCOL = "vfc-tracker";
@@ -45,16 +56,28 @@ const BS = {
   mouthSmileRight: 45,
 };
 
+/** 场景自带的上半身行为；undefined = 该场景不发上半身字段（保持旧的单点测试用途）。 */
 const SCENARIOS = {
-  all: { blink: true, sway: true, jaw: true, expression: true, faceDrop: true },
-  neutral: {},
+  all: { blink: true, sway: true, jaw: true, expression: true, faceDrop: true, upperBody: {} },
+  neutral: {
+    upperBody: { rollAmpDeg: 0, yawAmpDeg: 0, armLiftDeg: 0, dropPeriodSec: 0 },
+  },
   blink: { blink: true },
   sway: { sway: true },
   jaw: { jaw: true },
   closed: { staticBlink: 1 },
   open: { staticBlink: 0 },
-  face: { blink: true, sway: true, jaw: true, faceDrop: true },
+  face: { blink: true, sway: true, jaw: true, faceDrop: true, upperBody: {} },
 };
+
+/** 关掉上半身的取值（命令行 / 环境变量共用）。 */
+const OFF_VALUES = new Set(["0", "false", "off", "no"]);
+
+/** MOCK_UPPER_BODY=0/false/off/no 关掉上半身数据（命令行优先）。 */
+function upperBodyFromEnv() {
+  const raw = String(process.env.MOCK_UPPER_BODY ?? "").trim().toLowerCase();
+  return raw === "" ? true : !OFF_VALUES.has(raw);
+}
 
 const options = {
   host: "0.0.0.0",
@@ -63,6 +86,7 @@ const options = {
   hz: 60,
   jitter: 0,
   scenario: "all",
+  upperBody: upperBodyFromEnv(),
   quiet: false,
 };
 
@@ -73,11 +97,24 @@ function parseArgs(argv) {
     else if (arg === "--host") options.host = argv[++i] || options.host;
     else if (arg === "--frames" || arg === "-n") options.frames = Math.max(0, Number(argv[++i]) || 0);
     else if (arg === "--hz") options.hz = Math.max(1, Number(argv[++i]) || options.hz);
-    else if (arg === "--jitter") options.jitter = Math.max(0, Number(argv[++i]) || 0);
+    else if (arg === "--jitter") options.jitter = Math.max(0, Number(argv[++i]) || options.jitter);
     else if (arg === "--scenario" || arg === "--mode") options.scenario = argv[++i] || options.scenario;
-    else if (arg === "--quiet" || arg === "-q") options.quiet = true;
+    else if (arg === "--no-upper-body" || arg === "--no-ub") options.upperBody = false;
+    else if (arg === "--upper-body" || arg === "--ub") {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        options.upperBody = true;
+      } else {
+        options.upperBody = !OFF_VALUES.has(next.toLowerCase());
+        i++;
+      }
+    } else if (arg === "--quiet" || arg === "-q") options.quiet = true;
     else if (arg === "--help" || arg === "-h") {
-      console.log(`用法：node tools/mock-tracker.js [--port 8765] [--frames N] [--hz 60] [--jitter 0] [--scenario all|neutral|blink|sway|jaw|closed|open]`);
+      console.log(
+        `用法：node tools/mock-tracker.js [--port 8765] [--frames N] [--hz 60] [--jitter 0] ` +
+          `[--scenario all|neutral|blink|sway|jaw|closed|open] [--upper-body 0|1] [--quiet]\n` +
+          `环境变量：MOCK_UPPER_BODY=0 关掉上半身字段（命令行优先）`,
+      );
       process.exit(0);
     }
   }
@@ -148,7 +185,7 @@ function buildTrack(seq, timestampMs) {
     pose[2] = 0;
   }
 
-  return {
+  const track = {
     type: "track",
     seq,
     t: Number.isFinite(timestampMs) ? timestampMs : Date.now(),
@@ -159,10 +196,24 @@ function buildTrack(seq, timestampMs) {
     fps: options.hz,
     calibrating: false,
   };
+
+  // 上半身（协议 §4.2，纯增量）：手机端开关打开时才出现这四个字段；--no-upper-body
+  // 时整组消失，用来回归「老手机 / 关闭上半身」的旧行为。ubOk=false 时 ub / body 全 0，
+  // 结构保持稳定（与 Android 端没有结果时的报文一致）。
+  if (options.upperBody && flags.upperBody) {
+    const result = buildUpperBody(t, flags.upperBody);
+    const usable = face && result.ubOk;
+    track.ubOk = usable;
+    track.ub = usable ? result.ub : new Array(52).fill(0);
+    track.ubT = track.t;
+    track.body = usable ? result.body : [0, 0];
+  }
+
+  return track;
 }
 
 function helloMessage() {
-  return {
+  const message = {
     type: "hello",
     protocol: PROTOCOL,
     version: VERSION,
@@ -172,6 +223,10 @@ function helloMessage() {
     targetFps: options.hz,
     t: Date.now(),
   };
+  // 协议 §4.1：只有上半身采集打开、且当前场景真的会发这四个字段时才带（老客户端会忽略）
+  const scenario = SCENARIOS[options.scenario] ?? SCENARIOS.all;
+  if (options.upperBody && scenario.upperBody) message.upperBody = true;
+  return message;
 }
 
 // ------------------------------------------------------------- WebSocket 服务端
@@ -416,6 +471,8 @@ code{background:#1b2333;padding:2px 6px;border-radius:5px}a{color:#5ac8fa}</styl
       <a href="/__control?mode=sway">sway</a> | <a href="/__control?mode=closed">closed</a> |
       <a href="/__control?mode=open">open</a>）</li>
   <li>hz: <code>${options.hz}</code>，抖动: <code>${options.jitter} ms</code>，已发帧：<code>${frame}</code>，客户端：<code>${clients.size}</code></li>
+  <li>上半身字段：<code>${options.upperBody ? (SCENARIOS[options.scenario]?.upperBody ? "发（ub / ubOk / ubT / body）" : "开关已开，但当前 scenario 不发") : "关闭"}</code>
+      （<a href="/__control?upperBody=1">开</a> | <a href="/__control?upperBody=0">关</a>）</li>
   <li><a href="/status">/status</a></li>
 </ul>
 <p>渲染页：<a href="http://127.0.0.1:17890/?ws=ws://127.0.0.1:${options.port}/ws&model=ATRI">
@@ -444,6 +501,8 @@ const server = http.createServer((req, res) => {
         scenario: options.scenario,
         hz: options.hz,
         jitter: options.jitter,
+        upperBody: options.upperBody,
+        upperBodyFields: Boolean(options.upperBody && SCENARIOS[options.scenario]?.upperBody),
       }),
     );
     return;
@@ -454,11 +513,16 @@ const server = http.createServer((req, res) => {
       options.scenario = mode;
       log(`scenario -> ${mode}`);
     }
+    const ub = url.searchParams.get("upperBody") ?? url.searchParams.get("ub");
+    if (ub != null) {
+      options.upperBody = !OFF_VALUES.has(ub.trim().toLowerCase());
+      log(`upperBody -> ${options.upperBody}`);
+    }
     const pause = url.searchParams.get("pause");
     if (pause === "1") stopSending();
     else if (pause === "0") startSending();
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ ok: true, scenario: options.scenario, sending }));
+    res.end(JSON.stringify({ ok: true, scenario: options.scenario, upperBody: options.upperBody, sending }));
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
@@ -479,7 +543,11 @@ server.on("error", (error) => {
 parseArgs(process.argv.slice(2));
 
 server.listen(options.port, options.host, () => {
-  console.log(`[mock] 协议 ${PROTOCOL} v${VERSION} · ${options.hz}Hz · scenario=${options.scenario}${options.jitter ? ` · 发送抖动 0~${options.jitter}ms` : ""}`);
+  console.log(
+    `[mock] 协议 ${PROTOCOL} v${VERSION} · ${options.hz}Hz · scenario=${options.scenario}` +
+      `${options.jitter ? ` · 发送抖动 0~${options.jitter}ms` : ""}` +
+      ` · 上半身 ${options.upperBody ? "开" : "关"}`,
+  );
   console.log(`[mock] WS   ws://127.0.0.1:${options.port}/ws`);
   console.log(`[mock] 页面 http://127.0.0.1:${options.port}/`);
   console.log(`[mock] 渲染 http://127.0.0.1:17890/?ws=ws://127.0.0.1:${options.port}/ws&model=ATRI`);

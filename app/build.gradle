@@ -97,6 +97,8 @@ dependencies {
     // Face-capture SDK (aggregates :MediapipeFaceLandmark + :OpenSeeFaceProcess + :CommonData
     // via `api`, so transitive types like ARKitBlendShapes / Point3D are visible here)
     implementation project(':facecapture-sdk')
+    // 上半身关键点采集（MediaPipe Pose Landmarker，可选功能，默认关）
+    implementation project(':MediapipeUpperBody')
     implementation libs.kotlinx.coroutines.android
     implementation libs.androidx.core.ktx
     implementation libs.androidx.lifecycle.runtime.ktx

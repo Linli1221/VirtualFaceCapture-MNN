@@ -47,6 +47,25 @@ canvas#live2d {
   height: 100%;
 }
 
+/* 上半身调试骨架（D 键 / 调试面板 / ?skeleton=1）：画布右下角，只做排查用，不参与正式渲染 */
+canvas#skeleton {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  width: 176px;
+  height: 234px;
+  background: rgba(18, 22, 33, 0.55);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  z-index: 9;
+}
+
+canvas#skeleton[hidden] {
+  display: none;
+}
+
 /* 透明模式：html / body / 舞台背景都必须透明，否则 Electron 透明窗口会露一块深色矩形。
    （html 单独覆盖是必须的——body 的透明不会影响 html 的 canvas 背景） */
 html.is-transparent,

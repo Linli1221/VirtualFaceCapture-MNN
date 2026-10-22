@@ -6,8 +6,11 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.hardware.camera2.*
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -18,6 +21,8 @@ import androidx.core.content.ContextCompat
 import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.CameraLensFacing
 import java.nio.ByteBuffer
+import java.util.concurrent.Executor
+import kotlin.math.sqrt
 
 /**
  * YUV frame data for direct processing without conversion
@@ -41,10 +46,17 @@ data class YuvFrameData(
  * Camera2 Manager for capturing camera frames.
  *
  * Supports **any** camera exposed by [CameraManager] — front, back, logical
- * multi-cameras and external (USB / capture-card) cameras. The caller can list
- * the available devices via [getAvailableCameras], pick one with
- * [setPreferredCamera], and the manager recalculates the sensor orientation,
- * field of view and rotation formula for that specific device.
+ * multi-cameras and external (USB / capture-card) cameras, plus the physical
+ * sensors (rear ultra-wide / telephoto) hidden behind a logical multi-camera
+ * on API 28+. The caller can list the available devices via
+ * [getAvailableCameras], pick one with [setPreferredCamera], and the manager
+ * recalculates the sensor orientation, field of view and rotation formula for
+ * that specific device.
+ *
+ * Frames are rotated upright from the current `Display.getRotation()` on every
+ * frame, so the same session keeps working while the device is rotated between
+ * portrait and landscape (the app declares `configChanges`, so rotation does
+ * not recreate the activity or restart the camera).
  *
  * Provides RGB frame data for MediaPipe face detection and direct YUV output
  * for zero-copy processing.
@@ -64,8 +76,32 @@ class Camera2Manager(private val context: Context) {
     // LENS_FACING_* of the selected camera (front / back / external).
     @Volatile private var lensFacing: Int = CameraCharacteristics.LENS_FACING_FRONT
 
-    // Camera id the caller asked for ("null" = automatic front-first choice).
+    // Logical camera id the caller asked for ("null" = automatic front-first choice).
     @Volatile private var preferredCameraId: String? = null
+
+    /**
+     * Physical sensor id of the preferred camera, or null for a regular logical
+     * camera. Hidden rear sensors (ultra-wide / telephoto) are streams of the
+     * logical camera, not openable devices — see [createCaptureSession].
+     */
+    @Volatile private var preferredPhysicalCameraId: String? = null
+
+    /** Surface handed to the session callback; set right before a session is created. */
+    @Volatile private var captureSurface: Surface? = null
+
+    /** Guards the one-time fallback from a rejected physical stream to the logical camera. */
+    @Volatile private var physicalFallbackTried: Boolean = false
+
+    /**
+     * Executor used by the API 28+ [SessionConfiguration] overload.
+     *
+     * Session callbacks must be delivered on the camera thread (same contract
+     * as the handler-based overload), and [backgroundHandler] already lives
+     * there, so simply post to it.
+     */
+    private val sessionExecutor: Executor = Executor { command ->
+        backgroundHandler?.post(command) ?: command.run()
+    }
 
     /**
      * Metadata of the camera selected by the most recent [startCamera] call.
@@ -171,12 +207,18 @@ class Camera2Manager(private val context: Context) {
     }
 
     /**
-     * List every camera reported by the platform.
+     * List every camera reported by the platform, plus the physical sensors
+     * hidden behind logical multi-cameras.
      *
      * The list covers front / back cameras, logical multi-cameras and external
-     * cameras such as USB webcams or capture cards. Entries are sorted front →
-     * back → external so the default (front-first) ordering is predictable.
+     * cameras such as USB webcams or capture cards. On API 28+ the rear
+     * ultra-wide / telephoto lenses are often only available as *physical*
+     * cameras of the logical rear camera; those are added as extra entries
+     * (with [CameraDeviceInfo.physicalCameraId] set) so they appear in the
+     * picker and can be streamed via [createCaptureSession].
      *
+     * Entries are sorted front → back → external, with a logical camera before
+     * its physical children and the widest lens first within a facing group.
      * Device capabilities are read per camera here; cameras that cannot be
      * queried are skipped instead of failing the whole enumeration.
      */
@@ -191,59 +233,226 @@ class Camera2Manager(private val context: Context) {
             return emptyList()
         }
 
+        // 1) Logical cameras: these can be opened directly with openCamera(id).
         val raw = mutableListOf<CameraDeviceInfo>()
         for (id in ids) {
             try {
                 val characteristics = manager.getCameraCharacteristics(id)
-                raw += CameraDeviceInfo(
-                    id = id,
-                    lensFacing = mapLensFacing(characteristics.get(CameraCharacteristics.LENS_FACING)),
-                    // Filled in below once we know how many cameras share a facing.
-                    label = "",
-                    sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
-                    verticalFovDegrees = calculateFovDegrees(characteristics),
+                raw += describeCamera(
+                    logicalId = id,
+                    physicalId = null,
+                    characteristics = characteristics,
+                    facingOverride = null,
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "Skipping camera $id: ${e.message}")
             }
         }
 
-        val facingCounts = raw.groupingBy { it.lensFacing }.eachCount()
-        val facingSeen = mutableMapOf<CameraLensFacing, Int>()
-        val labelled = raw.map { info ->
-            val index = (facingSeen[info.lensFacing] ?: 0) + 1
-            facingSeen[info.lensFacing] = index
-            val base = when (info.lensFacing) {
-                CameraLensFacing.FRONT -> "Front"
-                CameraLensFacing.BACK -> "Back"
-                CameraLensFacing.EXTERNAL -> "External"
-                CameraLensFacing.UNKNOWN -> "Camera"
+        // 2) Physical sensors of logical multi-cameras (API 28+). Many phones
+        //    hide the rear ultra-wide this way: it is not in cameraIdList and
+        //    cannot be opened by id, but its stream can be configured on the
+        //    logical device with OutputConfiguration.setPhysicalCameraId().
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val logicalIds = ids.toSet()
+            for (logical in raw.toList()) {
+                val logicalChars = try {
+                    manager.getCameraCharacteristics(logical.id)
+                } catch (e: Exception) {
+                    continue
+                }
+                val physicalIds = try {
+                    logicalChars.physicalCameraIds
+                } catch (e: Exception) {
+                    emptySet<String>()
+                }
+                if (physicalIds.isEmpty()) continue
+
+                val logicalEquiv = equivalentFocalLengthMm(logicalChars)
+                for (physicalId in physicalIds) {
+                    // Already exposed as its own logical camera: it can be opened
+                    // directly, so a physical duplicate would only confuse the UI.
+                    if (physicalId in logicalIds) continue
+
+                    val physicalChars = try {
+                        manager.getCameraCharacteristics(physicalId)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Skipping physical camera $physicalId: ${e.message}")
+                        continue
+                    }
+
+                    // The face pipeline needs YUV; skip sensors that only expose
+                    // JPEG / PRIVATE output (some auxiliary lenses do).
+                    val yuvSizes = physicalChars
+                        .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        ?.getOutputSizes(ImageFormat.YUV_420_888)
+                    if (yuvSizes.isNullOrEmpty()) {
+                        Log.d(TAG, "Physical camera $physicalId has no YUV output, skipped")
+                        continue
+                    }
+
+                    // Skip the sensor the logical camera already streams from
+                    // (usually the main lens): same focal length, duplicate entry.
+                    val physicalEquiv = equivalentFocalLengthMm(physicalChars)
+                    if (logicalEquiv != null && physicalEquiv != null &&
+                        kotlin.math.abs(physicalEquiv - logicalEquiv) / logicalEquiv < 0.12f
+                    ) {
+                        Log.d(
+                            TAG,
+                            "Physical camera $physicalId (%.1fmm) duplicates logical %.1fmm, skipped"
+                                .format(physicalEquiv, logicalEquiv),
+                        )
+                        continue
+                    }
+
+                    raw += describeCamera(
+                        logicalId = logical.id,
+                        physicalId = physicalId,
+                        characteristics = physicalChars,
+                        facingOverride = logical.lensFacing,
+                    )
+                }
             }
-            info.copy(
-                label = if ((facingCounts[info.lensFacing] ?: 0) > 1) "$base $index" else base,
+        }
+
+        return labelCameras(raw)
+    }
+
+    /** Build one picker entry from a logical or physical camera's characteristics. */
+    private fun describeCamera(
+        logicalId: String,
+        physicalId: String?,
+        characteristics: CameraCharacteristics,
+        facingOverride: CameraLensFacing?,
+    ): CameraDeviceInfo = CameraDeviceInfo(
+        id = logicalId,
+        physicalCameraId = physicalId,
+        lensFacing = facingOverride
+            ?: mapLensFacing(characteristics.get(CameraCharacteristics.LENS_FACING)),
+        // Filled in by labelCameras() once the facing group is known.
+        label = "",
+        sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+        verticalFovDegrees = calculateFovDegrees(characteristics),
+        equivalentFocalLengthMm = equivalentFocalLengthMm(characteristics),
+    )
+
+    /**
+     * Assign unique labels and stable ordering.
+     *
+     * Within one facing group a logical camera comes first, then physical
+     * sensors ordered by focal length (ultra-wide → telephoto). Cameras whose
+     * 35 mm-equivalent focal length is clearly wide or telephoto get a
+     * `超广角` / `长焦` suffix so the picker makes the lens obvious.
+     */
+    private fun labelCameras(raw: List<CameraDeviceInfo>): List<CameraDeviceInfo> {
+        val used = mutableMapOf<String, Int>()
+        val labelled = mutableListOf<CameraDeviceInfo>()
+
+        raw.groupBy { it.lensFacing }.values.forEach { group ->
+            val sorted = group.sortedWith(
+                compareBy<CameraDeviceInfo> { it.isPhysical }
+                    .thenBy { it.equivalentFocalLengthMm ?: 0f },
             )
+            val base = baseLabel(sorted.first().lensFacing)
+            sorted.forEach { info ->
+                // Tag by lens first (Back 超广角); entries that would collide
+                // (e.g. two plain rear cameras) get a numeric suffix instead.
+                val tag = lensTag(info.equivalentFocalLengthMm)
+                val label = if (tag != null) "$base $tag" else base
+                labelled += info.copy(label = uniqueLabel(label, used))
+            }
         }
 
         return labelled.sortedWith(
-            compareBy({ facingPriority(it.lensFacing) }, { it.id }),
+            compareBy(
+                { facingPriority(it.lensFacing) },
+                { it.isPhysical },
+                { it.equivalentFocalLengthMm ?: 0f },
+            ),
         )
+    }
+
+    private fun baseLabel(facing: CameraLensFacing): String = when (facing) {
+        CameraLensFacing.FRONT -> "Front"
+        CameraLensFacing.BACK -> "Back"
+        CameraLensFacing.EXTERNAL -> "External"
+        CameraLensFacing.UNKNOWN -> "Camera"
+    }
+
+    /**
+     * Lens tag from the 35 mm-equivalent focal length.
+     *
+     * Thresholds are conservative: only clearly wider-than-normal (< 17.5 mm)
+     * and clearly telephoto lenses (>= 70 mm) get a suffix, so an ordinary
+     * rear camera stays "Back" instead of being relabelled "Back 广角".
+     */
+    private fun lensTag(equivalentFocalLengthMm: Float?): String? = when {
+        equivalentFocalLengthMm == null -> null
+        equivalentFocalLengthMm < 17.5f -> "超广角"
+        equivalentFocalLengthMm >= 70f -> "长焦"
+        else -> null
+    }
+
+    /** Append a numeric suffix only when two entries end up with the same label. */
+    private fun uniqueLabel(label: String, used: MutableMap<String, Int>): String {
+        val count = (used[label] ?: 0) + 1
+        used[label] = count
+        return if (count == 1) label else "$label $count"
+    }
+
+    /**
+     * 35 mm-equivalent focal length from focal length + physical sensor size.
+     *
+     * `focal * 43.27 / sensorDiagonal` — the same "equivalent focal length"
+     * camera specs quote (24 mm = mainstream rear camera, ~13 mm = ultra-wide).
+     */
+    private fun equivalentFocalLengthMm(characteristics: CameraCharacteristics): Float? {
+        val focalLength = characteristics
+            .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            ?.firstOrNull()
+            ?: return null
+        val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            ?: return null
+        if (focalLength <= 0f || sensorSize.width <= 0f || sensorSize.height <= 0f) return null
+
+        val diagonal = sqrt(
+            sensorSize.width * sensorSize.width + sensorSize.height * sensorSize.height
+        )
+        if (diagonal <= 0f) return null
+        return focalLength * 43.266f / diagonal
     }
 
     /**
      * Choose the camera used by the next [startCamera] call.
      *
-     * @param cameraId a [CameraDeviceInfo.id] from [getAvailableCameras], or
-     *                 `null` to fall back to the automatic front-first choice.
-     *                 The id is validated only when the camera is opened, so
-     *                 stale ids from a previous device simply fall back to auto.
+     * @param cameraId a [CameraDeviceInfo.key] from [getAvailableCameras]
+     *                 (`"0"` for a logical camera, `"0#2"` for a physical one),
+     *                 or `null` to fall back to the automatic front-first choice.
+     *                 The key is validated only when the camera is opened, so a
+     *                 stale key from a previous device simply falls back to auto.
+     * @param physicalCameraId optional physical sensor id; when omitted, a
+     *                 `"logical#physical"` [cameraId] is parsed automatically.
      */
-    fun setPreferredCamera(cameraId: String?) {
-        preferredCameraId = cameraId
-        Log.i(TAG, "Preferred camera: ${cameraId ?: "auto (front-first)"}")
+    fun setPreferredCamera(cameraId: String?, physicalCameraId: String? = null) {
+        val parts = cameraId?.split('#', limit = 2)
+        val logicalId = parts?.getOrNull(0)?.takeIf { it.isNotEmpty() }
+        val physicalId = physicalCameraId
+            ?: parts?.getOrNull(1)?.takeIf { it.isNotEmpty() }
+
+        preferredCameraId = logicalId
+        preferredPhysicalCameraId = if (logicalId == null) null else physicalId
+        Log.i(TAG, "Preferred camera: ${getPreferredCameraId() ?: "auto (front-first)"}")
     }
 
-    /** Camera id requested via [setPreferredCamera], or null for automatic choice. */
-    fun getPreferredCameraId(): String? = preferredCameraId
+    /**
+     * Camera key requested via [setPreferredCamera], or null for automatic choice.
+     *
+     * Returns the composite `"logical#physical"` key so it can be persisted and
+     * passed back verbatim.
+     */
+    fun getPreferredCameraId(): String? = preferredCameraId?.let { logicalId ->
+        preferredPhysicalCameraId?.let { "$logicalId#$it" } ?: logicalId
+    }
 
     /**
      * Set callback for frame processing (legacy RGB mode)
@@ -299,6 +508,8 @@ class Camera2Manager(private val context: Context) {
         // 上一轮若因 HAL 拒绝 SENSOR_FRAME_DURATION 关了钉帧率，重开时重新尝试，
         // 否则一次回退会让之后每次采集都停在 30fps。
         pinFrameRate = true
+        // 物理相机流失败退回逻辑相机的机会也重新给一次。
+        physicalFallbackTried = false
 
         openCamera()
     }
@@ -309,6 +520,7 @@ class Camera2Manager(private val context: Context) {
     fun stopCamera() {
         captureSession?.close()
         captureSession = null
+        captureSurface = null
         
         cameraDevice?.close()
         cameraDevice = null
@@ -346,24 +558,55 @@ class Camera2Manager(private val context: Context) {
                 return
             }
 
-            val characteristics = manager.getCameraCharacteristics(info.id)
-            cameraCharacteristics = characteristics
+            // The logical device owns the request / 3A; a physical sensor only
+            // provides the stream, so its characteristics describe size,
+            // orientation and FOV instead.
+            val logicalCharacteristics = manager.getCameraCharacteristics(info.id)
+            cameraCharacteristics = logicalCharacteristics
+
+            var activeInfo = info
+            var physicalCharacteristics: CameraCharacteristics? = null
+            val requestedPhysicalId = info.physicalCameraId
+            if (requestedPhysicalId != null) {
+                physicalCharacteristics = try {
+                    manager.getCameraCharacteristics(requestedPhysicalId)
+                } catch (e: Exception) {
+                    Log.w(
+                        TAG,
+                        "Physical camera $requestedPhysicalId is not queryable: ${e.message}",
+                    )
+                    null
+                }
+                if (physicalCharacteristics == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                    // Never open the plain logical camera while the picker
+                    // claims a physical lens — fall back to the logical entry.
+                    activeInfo = cameras.firstOrNull { it.id == info.id && !it.isPhysical }
+                        ?: info.copy(physicalCameraId = null)
+                    physicalCharacteristics = null
+                    Log.w(TAG, "Falling back to logical camera ${activeInfo.id}")
+                }
+            }
 
             // Remember the device we actually opened so callers can react
             // synchronously (preview mirroring, debug HUD, camera picker).
-            selectedCameraInfo = info
-            lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            selectedCameraInfo = activeInfo
+            lensFacing = logicalCharacteristics.get(CameraCharacteristics.LENS_FACING)
                 ?: CameraCharacteristics.LENS_FACING_FRONT
-            sensorOrientation = info.sensorOrientation
-            cameraVerticalFovDegrees = info.verticalFovDegrees
+            sensorOrientation = activeInfo.sensorOrientation
+            cameraVerticalFovDegrees = activeInfo.verticalFovDegrees
 
+            val physicalSuffix = activeInfo.physicalCameraId?.let { " · physical $it" } ?: ""
             Log.i(
                 TAG,
-                "Camera selected: ${info.label} (id=${info.id}), sensor=$sensorOrientation°, " +
-                    "fov=$cameraVerticalFovDegrees°"
+                "Camera selected: ${activeInfo.label} (id=${activeInfo.id}$physicalSuffix), " +
+                    "sensor=$sensorOrientation°, fov=$cameraVerticalFovDegrees°"
             )
 
-            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            // Physical sensors have their own stream map (and often a different
+            // set of supported sizes), so size / fps probing must use it.
+            val streamCharacteristics = physicalCharacteristics ?: logicalCharacteristics
+            val map = streamCharacteristics
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
             // Choose capture size: 720p @ 60fps when the camera can do it.
             val previewSize = chooseCaptureSize(
@@ -385,7 +628,7 @@ class Camera2Manager(private val context: Context) {
                 setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             }
 
-            manager.openCamera(info.id, stateCallback, backgroundHandler)
+            manager.openCamera(activeInfo.id, stateCallback, backgroundHandler)
 
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error opening camera", e)
@@ -398,17 +641,28 @@ class Camera2Manager(private val context: Context) {
 
     /**
      * Resolve the camera to open: explicit preference first, then front, back,
-     * external. A stale preference (camera unplugged / different device) is
-     * ignored with a warning.
+     * external. A stale preference (camera unplugged / different device / the
+     * physical sensor disappeared) is ignored with a warning.
      */
     private fun chooseCamera(cameras: List<CameraDeviceInfo>): CameraDeviceInfo? {
         if (cameras.isEmpty()) return null
 
-        val preferred = preferredCameraId
-        if (preferred != null) {
-            val match = cameras.firstOrNull { it.id == preferred }
-            if (match != null) return match
-            Log.w(TAG, "Preferred camera $preferred is unavailable, falling back to auto")
+        val preferredKey = getPreferredCameraId()
+        if (preferredKey != null) {
+            cameras.firstOrNull { it.key == preferredKey }?.let { return it }
+
+            // The physical sensor may be gone while its logical parent still
+            // exists (different ROM, camera HAL update): keep using that
+            // camera instead of jumping to an unrelated one.
+            cameras.firstOrNull { it.id == preferredCameraId && !it.isPhysical }?.let {
+                Log.w(
+                    TAG,
+                    "Physical camera $preferredPhysicalCameraId is unavailable, " +
+                        "using logical ${it.id}",
+                )
+                return it
+            }
+            Log.w(TAG, "Preferred camera $preferredKey is unavailable, falling back to auto")
         }
 
         return cameras.firstOrNull { it.isFrontFacing }
@@ -601,63 +855,138 @@ class Camera2Manager(private val context: Context) {
         }
     }
 
+    /**
+     * Create the YUV capture session.
+     *
+     * A regular logical camera uses the classic
+     * `createCaptureSession(listOf(surface), …)` call. A hidden physical sensor
+     * (rear ultra-wide / telephoto) is bound to the logical device through the
+     * API 28 [SessionConfiguration] + [OutputConfiguration.setPhysicalCameraId]
+     * overload: the logical device stays the capture target while the stream is
+     * produced by the physical sensor.
+     *
+     * If the physical stream is rejected ([sessionStateCallback]'s
+     * `onConfigureFailed`), the session is recreated once on the logical camera
+     * so face tracking still works instead of going dark.
+     */
     private fun createCaptureSession() {
         val camera = cameraDevice ?: return
         val reader = imageReader ?: return
-        
+        val surface = reader.surface
+        captureSurface = surface
+
+        val physicalId = selectedCameraInfo?.physicalCameraId
+        if (physicalId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val output = OutputConfiguration(surface).apply {
+                    setPhysicalCameraId(physicalId)
+                }
+                val configuration = SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR,
+                    listOf(output),
+                    sessionExecutor,
+                    sessionStateCallback,
+                )
+                // API 29+ can tell up front whether this physical stream
+                // combination is supported; some HALs expose the sensor but
+                // reject the stream in the session callback instead.
+                val supported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    try {
+                        camera.isSessionConfigurationSupported(configuration)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "isSessionConfigurationSupported failed: ${e.message}")
+                        true // let createCaptureSession decide
+                    }
+                } else {
+                    true
+                }
+                if (!supported) {
+                    // Reflect what the session will really stream so the UI
+                    // does not keep claiming an ultra-wide feed.
+                    selectedCameraInfo = selectedCameraInfo?.copy(physicalCameraId = null)
+                    Log.w(
+                        TAG,
+                        "HAL rejects physical stream $physicalId for logical " +
+                            "${selectedCameraInfo?.id}; falling back to the logical camera"
+                    )
+                } else {
+                    Log.i(
+                        TAG,
+                        "Creating capture session: logical ${selectedCameraInfo?.id}, " +
+                            "physical $physicalId"
+                    )
+                    camera.createCaptureSession(configuration)
+                    return
+                }
+            } catch (e: Exception) {
+                selectedCameraInfo = selectedCameraInfo?.copy(physicalCameraId = null)
+                Log.e(TAG, "Physical camera session rejected, falling back to logical", e)
+            }
+        }
+
         try {
-            val surface = reader.surface
-
-            camera.createCaptureSession(
-                listOf(surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        Log.i(TAG, "Capture session configured")
-                        captureSession = session
-
-                        val request = buildCaptureRequest(surface)
-                        if (request == null) {
-                            Log.e(TAG, "Failed to build capture request")
-                            return
-                        }
-
-                        try {
-                            // Start continuous capture
-                            session.setRepeatingRequest(
-                                request,
-                                captureCallback,
-                                backgroundHandler
-                            )
-                        } catch (e: IllegalArgumentException) {
-                            // 个别 HAL 不接受显式 SENSOR_FRAME_DURATION，退回到只设 AE 区间。
-                            Log.w(TAG, "Repeating request rejected, retrying without pinned frame rate", e)
-                            pinFrameRate = false
-                            val fallback = buildCaptureRequest(surface)
-                            if (fallback != null) {
-                                try {
-                                    session.setRepeatingRequest(
-                                        fallback,
-                                        captureCallback,
-                                        backgroundHandler
-                                    )
-                                } catch (e2: Exception) {
-                                    Log.e(TAG, "Error starting capture (fallback)", e2)
-                                }
-                            }
-                        } catch (e: CameraAccessException) {
-                            Log.e(TAG, "Error starting capture", e)
-                        }
-                    }
-                    
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(TAG, "Capture session configuration failed")
-                    }
-                },
-                backgroundHandler
-            )
-            
+            camera.createCaptureSession(listOf(surface), sessionStateCallback, backgroundHandler)
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error creating capture session", e)
+        }
+    }
+
+    private val sessionStateCallback = object : CameraCaptureSession.StateCallback() {
+        override fun onConfigured(session: CameraCaptureSession) {
+            Log.i(TAG, "Capture session configured")
+            captureSession = session
+
+            val surface = captureSurface ?: run {
+                Log.e(TAG, "Capture surface missing")
+                return
+            }
+            val request = buildCaptureRequest(surface)
+            if (request == null) {
+                Log.e(TAG, "Failed to build capture request")
+                return
+            }
+
+            try {
+                // Start continuous capture
+                session.setRepeatingRequest(
+                    request,
+                    captureCallback,
+                    backgroundHandler
+                )
+            } catch (e: IllegalArgumentException) {
+                // 个别 HAL 不接受显式 SENSOR_FRAME_DURATION，退回到只设 AE 区间。
+                Log.w(TAG, "Repeating request rejected, retrying without pinned frame rate", e)
+                pinFrameRate = false
+                val fallback = buildCaptureRequest(surface)
+                if (fallback != null) {
+                    try {
+                        session.setRepeatingRequest(
+                            fallback,
+                            captureCallback,
+                            backgroundHandler
+                        )
+                    } catch (e2: Exception) {
+                        Log.e(TAG, "Error starting capture (fallback)", e2)
+                    }
+                }
+            } catch (e: CameraAccessException) {
+                Log.e(TAG, "Error starting capture", e)
+            }
+        }
+
+        override fun onConfigureFailed(session: CameraCaptureSession) {
+            if (selectedCameraInfo?.physicalCameraId != null && !physicalFallbackTried) {
+                physicalFallbackTried = true
+                Log.w(
+                    TAG,
+                    "Physical camera stream was rejected; retrying on the logical camera"
+                )
+                selectedCameraInfo = selectedCameraInfo?.copy(physicalCameraId = null)
+                runCatching { session.close() }
+                createCaptureSession()
+            } else {
+                Log.e(TAG, "Capture session configuration failed")
+            }
         }
     }
 

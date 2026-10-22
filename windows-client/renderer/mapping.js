@@ -389,3 +389,379 @@ export class TrackMapper {
     return this.mapper.apply(track).params;
   }
 }
+
+// ---------------------------------------------------------------- 上半身关键点（协议 §4.2 / §5.3）
+
+/**
+ * 上半身 13 个关键点在 `track.ub` 里的**协议顺序下标**（docs/tracking-protocol.md §5.3）。
+ *
+ * 必须与 Android 端 `CommonData/UpperBodyLandmarkIndex.ORDER` 逐项一致；这里的数字是
+ * 「协议顺序」（0..12），**不是** MediaPipe Pose 的原始 33 点索引。改顺序 / 改数量都属于
+ * 协议不兼容变更，必须同步 Android 端、协议文档与这张表。
+ */
+export const BODY_LANDMARK_ORDER = Object.freeze({
+  nose: 0,
+  eye_left: 1,
+  eye_right: 2,
+  ear_left: 3,
+  ear_right: 4,
+  shoulder_left: 5,
+  shoulder_right: 6,
+  elbow_left: 7,
+  elbow_right: 8,
+  wrist_left: 9,
+  wrist_right: 10,
+  hip_left: 11,
+  hip_right: 12,
+});
+
+/** 协议里的上半身点数（13）。 */
+export const BODY_COUNT = 13;
+
+/** `track.ub` 的扁平长度：13 点 × (x, y, z, visibility)。 */
+export const BODY_FLOATS = BODY_COUNT * 4;
+
+/**
+ * 15 条骨架边（协议顺序下标），与 Android 端 `UpperBodySkeleton.BONES` 逐项一致。
+ * 手机预览叠加层与 PC 调试骨架共用这张表，两端看起来才一样。
+ */
+export const BODY_BONES = Object.freeze([
+  Object.freeze([BODY_LANDMARK_ORDER.nose, BODY_LANDMARK_ORDER.eye_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.nose, BODY_LANDMARK_ORDER.eye_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.eye_left, BODY_LANDMARK_ORDER.ear_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.eye_right, BODY_LANDMARK_ORDER.ear_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.eye_left, BODY_LANDMARK_ORDER.eye_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.nose, BODY_LANDMARK_ORDER.shoulder_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.nose, BODY_LANDMARK_ORDER.shoulder_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.shoulder_left, BODY_LANDMARK_ORDER.shoulder_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.shoulder_left, BODY_LANDMARK_ORDER.elbow_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.elbow_left, BODY_LANDMARK_ORDER.wrist_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.shoulder_right, BODY_LANDMARK_ORDER.elbow_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.elbow_right, BODY_LANDMARK_ORDER.wrist_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.shoulder_left, BODY_LANDMARK_ORDER.hip_left]),
+  Object.freeze([BODY_LANDMARK_ORDER.shoulder_right, BODY_LANDMARK_ORDER.hip_right]),
+  Object.freeze([BODY_LANDMARK_ORDER.hip_left, BODY_LANDMARK_ORDER.hip_right]),
+]);
+
+/**
+ * 上半身派生出的 Live2D 参数（全部是**可选参数**：模型没有时由 live2d.js 查参数表跳过）。
+ *
+ * ParamBodyAngleX 同时被头部姿态驱动（协议 §8.2 的 `-yaw*10`），叠加规则见 combineBodyAngleX()。
+ * `ParamShoulderL/R`、`ParamHandL/R` 协议没有可靠数据源，mapBody 不输出（不造数据）；
+ * live2d.js 仍会应用这两个 id，模型将来真有参数时可以直接接。
+ */
+export const BODY_PARAM_IDS = Object.freeze([
+  "ParamBodyAngleX",
+  "ParamBodyAngleY",
+  "ParamBodyAngleZ",
+  "ParamArmLA",
+  "ParamArmRA",
+]);
+
+/** 上半身快照多久没更新就按「丢失」处理（协议 §4.2：手机端 1500 ms 过期）。 */
+export const BODY_STALE_MS = 1500;
+
+/** 肩 / 肘 / 腕可见度低于该值时，该侧手臂参数不输出（交回模型默认姿态）。 */
+export const BODY_ARM_MIN_VISIBILITY = 0.3;
+
+/** 躯干 / 手臂参数绝对值上限（与 Cubism 模型常见参数范围一致）。 */
+export const BODY_ANGLE_LIMIT = 30;
+
+/** mapBody 默认系数（协议 §4.2 的参考映射，没有额外玄学）。 */
+export const BODY_DEFAULTS = Object.freeze({
+  /** roll → ParamBodyAngleZ（roll > 0 = 右肩下沉 → 身体向对应方向倾）。 */
+  bodyZScale: 0.5,
+  /** yaw → ParamBodyAngleX（yaw > 0 = 向本人左侧转 → 与头部同向叠加）。 */
+  bodyXScale: 0.3,
+  /** roll → ParamBodyAngleY（幅度很小，只为接口完整）。 */
+  bodyYScale: 0.2,
+  /** 手臂抬起角满量程（度）：0 = 自然下垂，150 = 举过头顶。 */
+  armAngleMax: 150,
+  /** armUp（0..1）× armScale → ParamArmLA/RA。 */
+  armScale: 30,
+  /** 该侧肩 / 肘 / 腕可见度下限。 */
+  minVisibility: BODY_ARM_MIN_VISIBILITY,
+  /** 所有躯干 / 手臂参数的绝对值上限。 */
+  angleLimit: BODY_ANGLE_LIMIT,
+});
+
+/** ubOk=false / 过期时每帧向 0 靠拢的比例（平滑回默认，不能突然跳）。 */
+export const BODY_DECAY_PER_FRAME = 0.15;
+
+/** 手臂链（协议下标）：肩 → 肘 → 腕。可见度取三者最小值。 */
+const BODY_ARM_CHAINS = Object.freeze({
+  L: Object.freeze([BODY_LANDMARK_ORDER.shoulder_left, BODY_LANDMARK_ORDER.elbow_left, BODY_LANDMARK_ORDER.wrist_left]),
+  R: Object.freeze([BODY_LANDMARK_ORDER.shoulder_right, BODY_LANDMARK_ORDER.elbow_right, BODY_LANDMARK_ORDER.wrist_right]),
+});
+
+function finiteOr(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** 只认 Array / TypedArray（DataView 没有 length，不认）。 */
+function isNumericArray(value) {
+  return Array.isArray(value) || (ArrayBuffer.isView(value) && typeof value.length === "number");
+}
+
+function sanitizeBodyPoint(point) {
+  return {
+    x: finiteOr(point?.x),
+    y: finiteOr(point?.y),
+    z: finiteOr(point?.z),
+    v: clamp(finiteOr(point?.v), 0, 1),
+  };
+}
+
+/** 扁平 52 项 / 已解析的 13 点 → 13 个 {x,y,z,v}；其它长度返回 null。 */
+function toBodyPoints(input) {
+  if (!input) return null;
+  if (isNumericArray(input) && input.length === BODY_FLOATS) {
+    const points = new Array(BODY_COUNT);
+    for (let i = 0; i < BODY_COUNT; i++) {
+      const base = i * 4;
+      points[i] = {
+        x: finiteOr(input[base]),
+        y: finiteOr(input[base + 1]),
+        z: finiteOr(input[base + 2]),
+        v: clamp(finiteOr(input[base + 3]), 0, 1),
+      };
+    }
+    return points;
+  }
+  if (Array.isArray(input) && input.length === BODY_COUNT) {
+    return Array.from({ length: BODY_COUNT }, (_, i) => sanitizeBodyPoint(input[i]));
+  }
+  return null;
+}
+
+/**
+ * 解析 `track.ub`（13 点 × 4 个 float 的扁平数组，顺序 = BODY_LANDMARK_ORDER）。
+ *
+ * - 长度不是 52 → `null`（整帧当作没有上半身，交给「平滑回默认」逻辑）；
+ * - 单个分量坏掉（NaN / Infinity / 非数字）→ 该分量记 0（渲染路径不能崩，同 normalizeBs）；
+ * - visibility 会 clamp 到 [0,1]。
+ *
+ * @param {ArrayLike<number>} ub
+ * @returns {{x:number,y:number,z:number,v:number}[]|null}
+ */
+export function parseUpperBody(ub) {
+  if (!isNumericArray(ub) || ub.length !== BODY_FLOATS) return null;
+  return toBodyPoints(ub);
+}
+
+/**
+ * 肩 → 腕向量与「竖直向下」的夹角（度）。
+ *
+ * 画面 y 向下为正，所以竖直向下 = (0, +1)；用 `atan2(|dx|, dy)` 一次算出 0..180°：
+ * 0 = 手腕在肩正下方（自然下垂）、90 = 平举、180 = 举过头顶。左右对称（取 |dx|）。
+ *
+ * 注意：ub 的 x / y 是按画面宽 / 高**分别**归一化的，这里没有做长宽比矫正（协议不带
+ * 画面尺寸）；因为只取角度、且手臂主要是上下运动，误差可以接受。
+ */
+function armAngleFromDown(shoulder, wrist) {
+  const dx = wrist.x - shoulder.x;
+  const dy = wrist.y - shoulder.y;
+  if (Math.hypot(dx, dy) < 1e-6) return 0;
+  return (Math.atan2(Math.abs(dx), dy) * 180) / Math.PI;
+}
+
+/**
+ * 上半身躯干 + 手臂 → Live2D 可选参数（纯函数，无 DOM，Node 可直接单测）。
+ *
+ * @param {ArrayLike<number>} bodyAngles 协议 §4.2 的 `body` = [roll, yaw]（相对基线，度）
+ * @param {ArrayLike<number>|{x:number,y:number,z:number,v:number}[]} ub `track.ub` 或 parseUpperBody() 的结果
+ * @param {Partial<typeof BODY_DEFAULTS>} [opts]
+ * @returns {{params:object, metrics:{roll:number,yaw:number,armAngleL:number|null,armAngleR:number|null,shoulderWidth:number,confidence:number}}}
+ *
+ * 算法（协议 §4.2 / docs/upper-body.md §3.6）：
+ *   ParamBodyAngleZ = clamp(roll * 0.5, ±30)   // roll > 0 = 右肩下沉
+ *   ParamBodyAngleX = clamp(-yaw * 0.3, ±30)   // yaw > 0 = 向本人左侧转（与头部同向）
+ *   ParamBodyAngleY = clamp(-roll * 0.2, ±30)  // 幅度很小，保持接口完整
+ *   armAngle(side)  = 肩→腕 与竖直向下的夹角（度，0..180）
+ *   armUp(side)     = clamp(armAngle / 150, 0, 1) → ParamArm{side}A = armUp * 30
+ *
+ * params 只包含「这一帧想驱动」的参数：
+ *   - ParamBodyAngleX/Y/Z 始终输出（躯干角来自手机端 TorsoAngles，与关键点可见度无关）；
+ *   - ParamArmLA/RA 只在该侧肩 / 肘 / 腕可见度都 ≥ minVisibility 时输出；低可见度 → 不输出，
+ *     由客户端把该参数平滑回模型默认，而不是拿坏关键点硬驱动。
+ *
+ * metrics.armAngleL/R 是**原始角度**（不可信侧也有值，方便调试面板看），是否真的驱动看 params。
+ */
+export function mapBody(bodyAngles, ub, opts = {}) {
+  // docs/upper-body.md §3.6 写的是 mapBody(ub, body, opts)。两个参数都是数组，这里按长度
+  // 识别并交换，避免调用方按文档顺序写时静默拿到全 0。
+  if (isNumericArray(bodyAngles) && bodyAngles.length === BODY_FLOATS && isNumericArray(ub) && ub.length === 2) {
+    const swap = bodyAngles;
+    bodyAngles = ub;
+    ub = swap;
+  }
+
+  const o = { ...BODY_DEFAULTS, ...opts };
+  const roll = finiteOr(bodyAngles?.[0]);
+  const yaw = finiteOr(bodyAngles?.[1]);
+  const limit = Math.max(1, finiteOr(o.angleLimit, BODY_ANGLE_LIMIT));
+  const armScale = finiteOr(o.armScale, 30);
+  const armAngleMax = Math.max(1, finiteOr(o.armAngleMax, 150));
+  const minVisibility = clamp(finiteOr(o.minVisibility, BODY_ARM_MIN_VISIBILITY), 0, 1);
+
+  const params = {
+    ParamBodyAngleX: clamp(-yaw * finiteOr(o.bodyXScale, 0.3), -limit, limit),
+    ParamBodyAngleY: clamp(-roll * finiteOr(o.bodyYScale, 0.2), -limit, limit),
+    ParamBodyAngleZ: clamp(roll * finiteOr(o.bodyZScale, 0.5), -limit, limit),
+  };
+  const metrics = {
+    roll,
+    yaw,
+    armAngleL: null,
+    armAngleR: null,
+    shoulderWidth: 0,
+    confidence: 0,
+  };
+
+  const points = toBodyPoints(ub);
+  if (!points) return { params, metrics };
+
+  // 肩宽与 Android 端 UpperBodyPoseFrame.shoulderSpan() 同一公式（便于两端对数字）。
+  const shoulderL = points[BODY_LANDMARK_ORDER.shoulder_left];
+  const shoulderR = points[BODY_LANDMARK_ORDER.shoulder_right];
+  metrics.shoulderWidth = Math.abs(shoulderL.x - shoulderR.x) + Math.abs(shoulderL.y - shoulderR.y) * 0.5;
+  metrics.confidence = Math.min(
+    shoulderL.v,
+    shoulderR.v,
+    points[BODY_LANDMARK_ORDER.elbow_left].v,
+    points[BODY_LANDMARK_ORDER.elbow_right].v,
+    points[BODY_LANDMARK_ORDER.wrist_left].v,
+    points[BODY_LANDMARK_ORDER.wrist_right].v,
+  );
+
+  for (const side of ["L", "R"]) {
+    const [shoulderIndex, elbowIndex, wristIndex] = BODY_ARM_CHAINS[side];
+    const visibility = Math.min(points[shoulderIndex].v, points[elbowIndex].v, points[wristIndex].v);
+    const angle = armAngleFromDown(points[shoulderIndex], points[wristIndex]);
+    const angleKey = side === "L" ? "armAngleL" : "armAngleR";
+    metrics[angleKey] = angle;
+    if (visibility < minVisibility) continue; // 不可信 → 不输出该侧手臂参数
+    const armUp = clamp(angle / armAngleMax, 0, 1);
+    params[side === "L" ? "ParamArmLA" : "ParamArmRA"] = armUp * armScale;
+  }
+
+  return { params, metrics };
+}
+
+/**
+ * 头部与躯干共用 ParamBodyAngleX：**相加后** clamp 到 ±30，不能互相覆盖。
+ * （头部来自协议 §8.2 的 `-yaw*10`，躯干来自 mapBody 的 `-yaw_body*0.3`。）
+ */
+export function combineBodyAngleX(headBodyAngleX, torsoBodyAngleX, limit = BODY_ANGLE_LIMIT) {
+  const max = Math.max(1, finiteOr(limit, BODY_ANGLE_LIMIT));
+  return clamp(finiteOr(headBodyAngleX) + finiteOr(torsoBodyAngleX), -max, max);
+}
+
+/**
+ * 解析一条 `track` 报文里的上半身字段（纯函数，Node 可直接单测）。
+ *
+ * 字段语义（协议 §4.2）：
+ *   - `ub`    13×4 扁平数组（可选；缺省 = 这一帧完全没有上半身结果）
+ *   - `ubOk`  false = 本帧没有可用结果（缺省按 true 处理，兼容只发 ub 的早期实现）
+ *   - `ubT`   手机采集时间（ms）。⚠️ 两端时钟不同步，**不能**和本机 now 直接比较；
+ *              这里只用它判断「是不是新采集的一帧」，过期用**本地到达时间**的 age 量：
+ *              同一个 ubT 连续出现（手机还在发面捕、但上半身停了）→ age 一直涨 → 1.5s 后 stale。
+ *   - `body`  [roll, yaw]（相对基线躯干角，度；缺省 = [0,0]）
+ *
+ * @param {object} track
+ * @param {number} now 本机单调时钟（performance.now() 口径）
+ * @param {object|null} prev 上一次的返回值（用于 ubT 变化检测 / 保留最后一帧点做调试骨架）
+ */
+export function readUpperBodyTrack(track, now = 0, prev = null) {
+  const message = track && typeof track === "object" ? track : {};
+  const last = prev && typeof prev === "object" ? prev : {};
+  const nowMs = finiteOr(now);
+  const hasUb = message.ub != null;
+  const points = hasUb ? parseUpperBody(message.ub) : null;
+  const ubT = Number(message.ubT);
+  const hasStamp = Number.isFinite(ubT);
+  const rawTorso = message.body;
+  const torso =
+    isNumericArray(rawTorso) && rawTorso.length >= 2
+      ? [finiteOr(rawTorso[0]), finiteOr(rawTorso[1])]
+      : [0, 0];
+
+  let receivedAt = typeof last.receivedAt === "number" && Number.isFinite(last.receivedAt) ? last.receivedAt : null;
+  if (hasUb) {
+    if (hasStamp) {
+      // 新的采集时间戳才算新帧；同一个 ubT 反复出现 = 手机端上半身没更新，age 继续累积
+      if (last.t == null || ubT !== last.t) receivedAt = nowMs;
+    } else {
+      // 没有 ubT 的老实现：只要这一帧带了 ub，就当作新鲜
+      receivedAt = nowMs;
+    }
+  }
+  const ageMs = receivedAt == null ? null : Math.max(0, nowMs - receivedAt);
+  const stale = ageMs != null && ageMs > BODY_STALE_MS;
+  const declared = message.ubOk;
+  const ubOk = declared === undefined || declared === null ? true : Boolean(declared);
+
+  return {
+    /** 这一帧的上半身数据是否可用（有 ub + 长度对 + ubOk + 未过期）。 */
+    ok: Boolean(hasUb) && points !== null && ubOk && !stale,
+    /** 报文里是否出现了 ub 字段（老手机的 track 里没有）。 */
+    present: hasUb,
+    ubOk,
+    stale,
+    ageMs,
+    /** 13 个点；本帧没有就保留上一帧（调试骨架画最后一帧，配 ok=false 灰显）。 */
+    points: points ?? (Array.isArray(last.points) ? last.points : null),
+    /** [roll, yaw] */
+    torso,
+    /** 手机采集时间戳（没有就是 null）。 */
+    t: hasStamp ? ubT : hasUb ? null : typeof last.t === "number" ? last.t : null,
+    /** 本机到达时间（age 的基准）。 */
+    receivedAt,
+  };
+}
+
+/**
+ * 上半身参数平滑（ubOk=false / ubT 过期时**按帧**回 0，不能突然跳到默认姿态）。
+ *
+ * 规则：
+ *   - 本帧有目标值 → 直接取目标（连续性与缓动交给 live2d 的时间轴平滑）；
+ *   - 本帧没有目标（丢失 / 过期 / 该侧低可见度）→ 在上一帧输出值基础上**向 0 前进 15%**；
+ *   - 已经衰减到 0（|v| < epsilon）→ 从输出里删掉，并停止输出：把该参数交还给模型的
+ *     idle motion / breath（否则会每帧写死 0，模型的身体摆动就没了）；
+ *   - 从没被上半身驱动过的参数不输出（老手机 / 关闭上半身时行为与以前完全一致）。
+ *
+ * @param {object|null} current 上一帧 smoothBodyParams 的返回值
+ * @param {object|null} target 本帧 mapBody(...).params（不可用传 null）
+ * @param {{decay?:number, epsilon?:number, snap?:boolean}} [opts] snap = 直接落到目标（截图 / 自测用）
+ * @returns {object} 新的输出表（只含需要继续驱动的参数）
+ */
+export function smoothBodyParams(current, target, opts = {}) {
+  const prev = current && typeof current === "object" ? current : {};
+  const goal = target && typeof target === "object" ? target : {};
+  const decay = clamp(finiteOr(opts.decay, BODY_DECAY_PER_FRAME), 0.01, 1);
+  const epsilon = Math.max(0, finiteOr(opts.epsilon, 0.01));
+  const snap = Boolean(opts.snap);
+  const out = {};
+
+  for (const id of BODY_PARAM_IDS) {
+    const hasGoal = typeof goal[id] === "number" && Number.isFinite(goal[id]);
+    const hasPrev = Object.prototype.hasOwnProperty.call(prev, id);
+    if (!hasGoal && !hasPrev) continue; // 从未被上半身驱动：不输出，交给 idle motion
+    const base = hasPrev && Number.isFinite(prev[id]) ? prev[id] : 0;
+    let value;
+    if (hasGoal) value = goal[id];
+    else value = snap ? 0 : base * (1 - decay);
+    if (!Number.isFinite(value)) value = 0;
+    if (Math.abs(value) < epsilon) value = 0;
+    out[id] = value;
+  }
+
+  // 本帧完全没有目标且都已衰减到 0：全部删掉，让模型自己的 idle motion 接管。
+  const anyGoal = BODY_PARAM_IDS.some((id) => typeof goal[id] === "number" && Number.isFinite(goal[id]));
+  if (!anyGoal) {
+    for (const id of Object.keys(out)) if (out[id] === 0) delete out[id];
+  }
+  return out;
+}
+

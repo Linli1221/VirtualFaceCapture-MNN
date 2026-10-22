@@ -1,0 +1,5 @@
+# MediaPipe Pose 模型（5~9 MB）不进 Git，用 tools/fetch-pose-model.* 下载
+/src/main/assets/*.task
+/src/main/assets/*.tflite
+
+/build

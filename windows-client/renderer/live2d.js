@@ -22,7 +22,7 @@
  *
  * 全局依赖（index.html 按顺序加载）：window.Live2DCubismCore → window.PIXI → PIXI.live2d
  */
-import { PARAM_IDS } from "./mapping.js";
+import { BODY_PARAM_IDS, PARAM_IDS, combineBodyAngleX } from "./mapping.js";
 import { ParamTimeline } from "./interp.js";
 
 /** 默认渲染目标帧率（协议 §9：PC 渲染 60 FPS @ 1080p）。 */
@@ -37,6 +37,8 @@ const MAX_TARGET_FPS = 240;
 
 /** 插值开启时的轻量平滑时间常数：只压输入噪声，不制造额外拖尾。 */
 const INTERP_SMOOTH_TAU_MS = 10;
+/** 上半身参数的一阶低通时间常数（协议 §8.5 建议 0.15~0.25 s；Pose 只有 ~15 fps）。 */
+const BODY_SMOOTH_TAU_MS = 160;
 
 /** 单帧 dt 上限：切后台回来 / 卡顿一帧时不要一步跳到目标。 */
 const MAX_STEP_MS = 100;
@@ -88,6 +90,16 @@ export class Live2DStage {
     this.timeline = new ParamTimeline();
     this.targetFps = DEFAULT_TARGET_FPS;
     this.availableParams = [];
+    /** 上半身派生参数（mapBody 的结果）：与头部参数分开存，每帧在头部之后叠加写入。 */
+    this.bodyParams = Object.create(null);
+    /** 躯干 X 的低通状态（与头部参数分开，避免半身 15fps 的跳变直接叠到头部插值上）。 */
+    this.currentTorsoX = null;
+    /** 当前模型对 BODY_PARAM_IDS 的支持情况 { id: boolean }（调试面板 / 降级说明用）。 */
+    this.bodySupport = Object.create(null);
+    /** 模型支持、且不在 PARAM_IDS 里的上半身参数（写参数时单独缓动 / 释放）。 */
+    this.bodyOnlyParamIds = [];
+    /** 本帧真正写进 core 的参数 id（PARAM_IDS + 模型支持的上半身可选参数）。 */
+    this.paramIds = PARAM_IDS.slice();
     this.lastApplyAt = 0;
     this.lastError = null;
     this.missingParams = [];
@@ -219,6 +231,22 @@ export class Live2DStage {
     const realIds = internal.coreModel._parameterIds ?? internal.coreModel._model?.parameters?.ids ?? [];
     this.availableParams = PARAM_IDS.filter((id) => realIds.includes(id));
     this.missingParams = PARAM_IDS.filter((id) => !realIds.includes(id));
+
+    // 上半身可选参数（ParamBodyAngleY/Z、ParamArmLA/RA）：模型没有就跳过 —— 属预期降级，
+    // 不算错误（自带 4 个模型都只有 ParamBodyAngleX/Y/Z + ParamBreath，没有手臂参数）。
+    // 判定用 getParameterIndex(id) >= 0 + 真实 id 表双保险：Cubism 对未知 id 也会给虚拟索引。
+    this.bodyParams = Object.create(null);
+    this.bodySupport = Object.create(null);
+    this.bodyOnlyParamIds = [];
+    this.paramIds = PARAM_IDS.slice();
+    for (const id of BODY_PARAM_IDS) {
+      const supported = this._hasParam(internal.coreModel, id);
+      this.bodySupport[id] = supported;
+      if (!supported) continue;
+      if (!this.paramIds.includes(id)) this.paramIds.push(id);
+      if (!PARAM_IDS.includes(id)) this.bodyOnlyParamIds.push(id);
+    }
+
     this.ready = true;
     this.fit();
     return model;
@@ -251,6 +279,51 @@ export class Live2DStage {
     return this.timeline.push(params, at, stamp);
   }
 
+  /**
+   * 上半身派生参数（mapping.mapBody 的结果）：**每帧在头部参数之后叠加**写入，不覆盖头部。
+   *
+   * - `ParamBodyAngleX`：与头部同源（协议 §8.2 的 `-yaw*10`），按 combineBodyAngleX() 相加后
+   *   clamp 到 ±30，两个来源不会互相打架；
+   * - `ParamBodyAngleY/Z`、`ParamArmLA/RA`：模型没有对应参数时自动跳过（见 bodySupport）；
+   * - 传 null / {}：本帧没有可用的上半身数据（ubOk=false / 过期 / 该侧低可见度），
+   *   立刻停止驱动这些参数，把控制权交还给 idle motion / breath，避免冻结在最后一帧。
+   *
+   * 平滑（丢失时按帧回 0）由调用方 app.js 的 smoothBodyParams() 做好，这里只负责写。
+   *
+   * @param {object|null} params mapBody(...).params
+   */
+  setBodyParams(params) {
+    const next = Object.create(null);
+    if (params && typeof params === "object") {
+      for (const id of BODY_PARAM_IDS) {
+        const value = params[id];
+        if (typeof value === "number" && Number.isFinite(value)) next[id] = value;
+      }
+    }
+    for (const id of this.bodyOnlyParamIds) {
+      if (Object.prototype.hasOwnProperty.call(next, id)) continue;
+      // 不再驱动的参数：清掉缓存值，否则会一直写最后一帧（idle motion 永远起不来）
+      delete this._frameValues[id];
+      delete this.currentParams[id];
+    }
+    if (typeof next.ParamBodyAngleX !== "number" || !Number.isFinite(next.ParamBodyAngleX)) this.currentTorsoX = null;
+    this.bodyParams = next;
+  }
+
+  /** 模型是否真的有这个参数（getParameterIndex >= 0 且 id 在真实参数表里）。 */
+  _hasParam(core, id) {
+    if (!core) return false;
+    try {
+      const index = core.getParameterIndex(id);
+      if (!(typeof index === "number" && index >= 0)) return false;
+      const ids = core._parameterIds ?? core._model?.parameters?.ids;
+      if (Array.isArray(ids) && ids.length > 0) return ids.includes(id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** 模型自身的参数默认值（断线后回到中性用）。 */
   getDefaultParams() {
     const result = Object.create(null);
@@ -276,6 +349,13 @@ export class Live2DStage {
   relax(durationMs = 700) {
     if (!this.model) return;
     this.setTargetParams(this.getDefaultParams());
+    // 上半身参数也一起平滑回 0（接下来几帧由每帧缓动走完），durationMs 后统一释放给 idle motion
+    const zeroBody = Object.create(null);
+    for (const id of this.bodyOnlyParamIds) {
+      if (Object.prototype.hasOwnProperty.call(this._frameValues, id)) zeroBody[id] = 0;
+    }
+    if (Object.prototype.hasOwnProperty.call(this._frameValues, "ParamBodyAngleX")) zeroBody.ParamBodyAngleX = 0;
+    this.bodyParams = zeroBody;
     this._clearRelaxTimer();
     this._relaxTimer = setTimeout(() => {
       this.clearTargetParams();
@@ -345,6 +425,37 @@ export class Live2DStage {
       this.currentParams[id] = value;
       values[id] = value;
     }
+
+    // 上半身：在头部参数之后叠加（ParamBodyAngleX 相加后 clamp，其余写可选参数）。
+    // Pose 只有 ~15 fps，按 0.15~0.2 s 一阶低通再写（协议 §8.5 建议），
+    // 与头部参数的时间轴插值互不影响；immediate（截图 / 单步）直接落位。
+    const bodyAlpha = immediate ? 1 : 1 - Math.exp(-dt / BODY_SMOOTH_TAU_MS);
+    const body = this.bodyParams;
+    const torsoX = body?.ParamBodyAngleX;
+    if (typeof torsoX === "number" && Number.isFinite(torsoX)) {
+      const previous =
+        typeof this.currentTorsoX === "number" && Number.isFinite(this.currentTorsoX) ? this.currentTorsoX : torsoX;
+      const smoothed = bodyAlpha >= 1 ? torsoX : previous + (torsoX - previous) * bodyAlpha;
+      this.currentTorsoX = Math.abs(torsoX - smoothed) < 0.0005 ? torsoX : smoothed;
+      const headX = this.currentParams.ParamBodyAngleX;
+      values.ParamBodyAngleX = combineBodyAngleX(
+        typeof headX === "number" && Number.isFinite(headX) ? headX : 0,
+        this.currentTorsoX,
+      );
+    }
+    for (const id of this.bodyOnlyParamIds) {
+      const goal = body?.[id];
+      if (typeof goal !== "number" || !Number.isFinite(goal)) continue;
+      const current = this.currentParams[id];
+      let value = goal;
+      if (bodyAlpha < 1) {
+        const base = typeof current === "number" && Number.isFinite(current) ? current : goal;
+        value = base + (goal - base) * bodyAlpha;
+        if (Math.abs(goal - value) < 0.0005) value = goal;
+      }
+      this.currentParams[id] = value;
+      values[id] = value;
+    }
     return values;
   }
 
@@ -359,7 +470,8 @@ export class Live2DStage {
 
   _writeParams(core, values) {
     if (!values) return;
-    for (const id of PARAM_IDS) {
+    // paramIds = PARAM_IDS + 该模型真实存在的上半身可选参数（不存在的绝不会被写）
+    for (const id of this.paramIds) {
       const value = values[id];
       if (typeof value === "number" && Number.isFinite(value)) {
         core.setParameterValueById(id, value);
@@ -437,6 +549,8 @@ export class Live2DStage {
     this.targetParams = Object.create(null);
     this.currentParams = Object.create(null);
     this._frameValues = Object.create(null);
+    this.bodyParams = Object.create(null);
+    this.currentTorsoX = null;
     this.timeline.reset();
   }
 

@@ -9,7 +9,18 @@
  *   window.__vfc      = { ready, freeze(v), applyTrack({bs,pose}), state(), connect(url), disconnect(), setModel(name), ... }
  *   window.__vfcDebug = { version, ready, model, wsUrl, connected, frames, seq, fps, latencyMs, lastTrack, params, angles, ... }
  */
-import { createMapper, BS_INDEX } from "./mapping.js";
+import {
+  BODY_ARM_MIN_VISIBILITY,
+  BODY_BONES,
+  BODY_DECAY_PER_FRAME,
+  BODY_PARAM_IDS,
+  BS_INDEX,
+  combineBodyAngleX,
+  createMapper,
+  mapBody,
+  readUpperBodyTrack,
+  smoothBodyParams,
+} from "./mapping.js";
 import {
   ALIGN_DURATION_MS,
   DEFAULT_POSE_OFFSET,
@@ -29,6 +40,10 @@ const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
 const HEARTBEAT_INTERVAL_MS = 5000;
 const STALE_TIMEOUT_MS = 20000;
 const SMOOTHING = 0.6;
+
+/** 调试骨架画布尺寸（画布右下角；D 键 / 调试面板 / ?skeleton=1 显示）。 */
+const SKELETON_WIDTH = 176;
+const SKELETON_HEIGHT = 234;
 
 /** 一键校准期间进度提示的刷新间隔（ms）。 */
 const ALIGN_TICK_MS = 100;
@@ -109,6 +124,7 @@ const ui = {
   btnQuit: document.getElementById("btn-quit"),
   debugBox: document.getElementById("debug-box"),
   debugGrid: document.getElementById("debug-grid"),
+  skeleton: document.getElementById("skeleton"),
   errorBox: document.getElementById("error-box"),
 };
 
@@ -145,6 +161,10 @@ const state = {
   lastAlign: null,
   /** 最近一帧「叠加偏移后」的 pose（调试面板显示）。 */
   lastAppliedPose: null,
+  /** 上半身（协议 §4.2）：{ ok, points, torso, t, … }，见 createBodyState()。 */
+  body: createBodyState(),
+  /** 头部 + 上半身合并后的参数表（真正写 core 由 live2d.js 叠加；这里给调试 / __vfc 看）。 */
+  mergedParams: null,
 };
 
 const mapper = createMapper();
@@ -187,6 +207,8 @@ const debugState = {
   frozen: false,
   error: null,
   missingParams: [],
+  body: null,
+  mergedParams: null,
 };
 window.__vfcDebug = debugState;
 
@@ -465,6 +487,7 @@ const client = new TrackerClient({
     // 断线后不要保留最后一帧的表情：清掉归一化窗口 + 平滑回模型默认姿态，再由 idle motion 接管
     mapper.reset();
     state.faceMissingSince = null;
+    resetBodyState();
     if (stage.ready) stage.relax();
     if (info?.manual) {
       setStatus("未连接", "idle");
@@ -487,6 +510,7 @@ const client = new TrackerClient({
     // hello = 新会话的起点：兜底重置 seq 跟踪与自适应归一化窗口
     client.lastSeq = -1;
     mapper.reset();
+    resetBodyState();
     state.faceMissingSince = null;
     state.device = typeof message.device === "string" ? message.device : "";
     state.phoneApp = typeof message.app === "string" ? message.app : "";
@@ -539,6 +563,7 @@ function connectTo(url) {
   state.seq = null;
   state.device = "";
   mapper.reset();
+  resetBodyState();
   storeSet(STORE_KEYS.ws, trimmed);
   ui.wsInput.value = trimmed;
   setStatus("连接中…", "connecting");
@@ -555,8 +580,11 @@ function feedTrack(track) {
   // 本地姿态校准：镜头没正对你时，收到的 pose 会带一个固定偏移，先叠加本地 offset 再映射。
   const pose = applyPoseOffset(track.pose, state.poseOffset);
   const result = mapper.apply(track.bs ?? [], pose);
+  // 上半身：解析 ub / ubOk / ubT / body；丢失 / 过期时按帧平滑回 0（不跳变）
+  const body = updateBodyState(track, now);
   state.lastTrack = track;
   state.lastResult = result;
+  state.mergedParams = mergeBodyParams(result.params, body.current);
   state.lastAppliedPose = { pitch: pose[0], yaw: pose[1], roll: pose[2] };
   state.frames += 1;
 
@@ -575,6 +603,8 @@ function feedTrack(track) {
   // 走时间轴：输入帧率低于渲染帧率时，渲染层会在两帧之间插值（见 interp.js）。
   // track.t 是手机采集时间戳：到达时间被 WS 批量/PC 卡顿挤在一起时，用它还原真实帧间隔。
   stage.pushTrackParams(result.params, now, track.t);
+  // 上半身参数单独交给 stage：ParamBodyAngleX 与头部**相加后 clamp**，其余写可选参数
+  stage.setBodyParams(body.current);
 
   if (Array.isArray(track.bs) && track.bs.length !== 52) {
     state.badFrames = (state.badFrames ?? 0) + 1;
@@ -629,11 +659,243 @@ function publishDebug() {
     ParamAngleY: stage.getEngineParam("ParamAngleY"),
     ParamAngleZ: stage.getEngineParam("ParamAngleZ"),
     ParamBodyAngleX: stage.getEngineParam("ParamBodyAngleX"),
+    ParamBodyAngleY: stage.getEngineParam("ParamBodyAngleY"),
+    ParamBodyAngleZ: stage.getEngineParam("ParamBodyAngleZ"),
+    ParamArmLA: stage.getEngineParam("ParamArmLA"),
+    ParamArmRA: stage.getEngineParam("ParamArmRA"),
   };
+  const body = state.body ?? createBodyState();
+  // 上半身调试信息（verifier / 调试面板 / 无手机截图都能读到）
+  debugState.body = {
+    ok: Boolean(body.ok),
+    ageMs: body.ageMs,
+    stale: Boolean(body.stale),
+    present: Boolean(body.present),
+    declaredOk: body.ubOk !== false,
+    t: body.t,
+    torso: { roll: body.torso?.[0] ?? 0, yaw: body.torso?.[1] ?? 0 },
+    armAngleL: body.metrics?.armAngleL ?? null,
+    armAngleR: body.metrics?.armAngleR ?? null,
+    shoulderWidth: body.metrics?.shoulderWidth ?? 0,
+    confidence: body.metrics?.confidence ?? 0,
+    params: { ...(body.current ?? {}) },
+    support: { ...(stage.bodySupport ?? {}) },
+  };
+  debugState.mergedParams = state.mergedParams ? { ...state.mergedParams } : null;
   debugState.dropped = state.dropped;
   debugState.frozen = state.frozen;
   debugState.error = state.error;
   debugState.missingParams = stage.missingParams ?? [];
+}
+
+// ---------------------------------------------------------------- 上半身（协议 §4.2）
+
+/**
+ * 上半身状态机的初始值（连接 / 重连 / 断线时复位）。
+ *
+ * points / torso 保留最后一帧给调试骨架灰显；ok=false 时所有 body 参数按帧回 0。
+ */
+function createBodyState() {
+  return {
+    /** 本帧上半身数据是否可用（有 ub + 长度对 + ubOk + 未过期）。 */
+    ok: false,
+    /** 报文里出现过 ub 字段（老手机的 track 没有）。 */
+    present: false,
+    ubOk: true,
+    stale: false,
+    ageMs: null,
+    points: null,
+    torso: [0, 0],
+    t: null,
+    receivedAt: null,
+    metrics: null,
+    /** 本帧实际写给 live2d 的上半身参数（smoothBodyParams 的结果）。 */
+    current: {},
+    /** 下一帧直接落到目标（__vfc.applyUpperBody 截图 / 自测用）。 */
+    snap: false,
+  };
+}
+
+function resetBodyState() {
+  state.body = createBodyState();
+  state.mergedParams = null;
+}
+
+/**
+ * 解析 track 的 ub / ubOk / ubT / body，并算出这一帧要驱动的上半身参数。
+ *
+ * 丢失（ubOk=false / 字段缺失 / ubT 过期 / ub 长度不对 / 低可见度侧的参数）时，
+ * 由 smoothBodyParams() 按帧向 0 衰减 —— 绝不保留最后一帧不动。
+ */
+function updateBodyState(track, now) {
+  const prev = state.body ?? createBodyState();
+  const next = readUpperBodyTrack(track, now, prev);
+  const mapped = next.ok ? mapBody(next.torso, next.points) : null;
+  next.metrics = mapped ? mapped.metrics : prev.metrics;
+  next.current = smoothBodyParams(prev.current, mapped ? mapped.params : null, {
+    decay: BODY_DECAY_PER_FRAME,
+    snap: Boolean(prev.snap),
+  });
+  next.snap = false; // snap 只作用于本帧
+  state.body = next;
+  return next;
+}
+
+/**
+ * 头部参数 + 上半身参数 → 合并参数表（调试 / __vfc.state 用）。
+ *
+ * ParamBodyAngleX 在**这里只做展示**：真正写入 core 时由 live2d.js 用 combineBodyAngleX()
+ * 叠加（头部走时间轴插值，上半身按输入帧更新，两者节奏不同，不能提前烧死）。
+ */
+function mergeBodyParams(headParams, bodyParams) {
+  const merged = { ...(headParams ?? {}) };
+  const bodyX = bodyParams?.ParamBodyAngleX;
+  if (typeof bodyX === "number" && Number.isFinite(bodyX)) {
+    merged.ParamBodyAngleX = combineBodyAngleX(headParams?.ParamBodyAngleX, bodyX);
+  }
+  for (const id of BODY_PARAM_IDS) {
+    if (id === "ParamBodyAngleX") continue;
+    const value = bodyParams?.[id];
+    if (typeof value === "number" && Number.isFinite(value)) merged[id] = value;
+  }
+  return merged;
+}
+
+/** 调试面板 / 骨架角标的上半身状态文本。 */
+function bodyStatusText(body) {
+  if (!body || !body.present) return "未下发";
+  if (body.ok) return "ok";
+  if (body.stale) return "过期";
+  if (body.ubOk === false) return "无结果";
+  return "无效";
+}
+
+/** 手臂参数在当前模型上是否存在（自带 4 个模型都没有 → 预期降级）。 */
+function armParamSupportText() {
+  const support = stage.bodySupport ?? {};
+  const left = Boolean(support.ParamArmLA);
+  const right = Boolean(support.ParamArmRA);
+  if (!left && !right) return "模型没有（跳过）";
+  return `L:${left ? "有" : "无"} R:${right ? "有" : "无"}`;
+}
+
+// ---- 调试骨架：画布右下角，13 点 + 15 条边（低可见度灰点），D 键 / ?skeleton=1 显示 ----
+
+const skeletonView = {
+  canvas: null,
+  ctx: null,
+  visible: false,
+  raf: 0,
+  palette: null,
+};
+
+/** 读 CSS 变量取色：骨架只用调色板里已有的 --accent / --ok / --muted，不新增颜色。 */
+function initSkeletonView() {
+  const canvas = ui.skeleton;
+  if (!canvas) return;
+  canvas.width = SKELETON_WIDTH;
+  canvas.height = SKELETON_HEIGHT;
+  skeletonView.canvas = canvas;
+  skeletonView.ctx = canvas.getContext("2d");
+  const styles = getComputedStyle(document.documentElement);
+  const read = (name, fallback) => styles.getPropertyValue(name).trim() || fallback;
+  skeletonView.palette = {
+    bone: read("--accent", "#5ac8fa"),
+    point: read("--ok", "#3ddc97"),
+    dim: read("--muted", "#8d97ab"),
+  };
+}
+
+/** 调试面板打开 / D 键 / ?skeleton=1 → 显示骨架；否则停止 rAF 并清屏。 */
+function syncSkeletonVisibility() {
+  const canvas = ui.skeleton;
+  if (!canvas) return;
+  const wanted = Boolean(ui.debugBox?.open) || query.get("skeleton") === "1";
+  skeletonView.visible = wanted;
+  canvas.hidden = !wanted;
+  if (wanted) {
+    if (!skeletonView.raf) scheduleSkeletonFrame();
+  } else {
+    stopSkeletonFrames();
+    skeletonView.ctx?.clearRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+function scheduleSkeletonFrame() {
+  skeletonView.raf = window.requestAnimationFrame(() => {
+    skeletonView.raf = 0;
+    drawSkeleton();
+    if (skeletonView.visible) scheduleSkeletonFrame();
+  });
+}
+
+function stopSkeletonFrames() {
+  if (skeletonView.raf) window.cancelAnimationFrame(skeletonView.raf);
+  skeletonView.raf = 0;
+}
+
+/**
+ * 画 13 点骨架：坐标直接用 ub 的**镜像归一化坐标**（协议 §5.3，本人左 = 画面左），
+ * 按画布宽高缩放；低可见度点 / 骨架丢失时灰显。
+ */
+function drawSkeleton() {
+  const ctx = skeletonView.ctx;
+  const canvas = skeletonView.canvas;
+  if (!ctx || !canvas) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  const palette = skeletonView.palette ?? { bone: "#5ac8fa", point: "#3ddc97", dim: "#8d97ab" };
+  const body = state.body;
+  const points = Array.isArray(body?.points) ? body.points : null;
+  ctx.clearRect(0, 0, width, height);
+  ctx.save();
+  if (!points) {
+    ctx.fillStyle = palette.dim;
+    ctx.font = '11px "Cascadia Mono", Consolas, monospace';
+    ctx.textAlign = "center";
+    ctx.fillText("无上半身数据", width / 2, height / 2);
+    ctx.restore();
+    return;
+  }
+
+  const reliable = (point) => Boolean(body.ok) && point.v >= BODY_ARM_MIN_VISIBILITY;
+
+  // 骨架：两端点都可信才连线（丢失时整体灰显，保留最后一帧形状方便排查）
+  ctx.globalAlpha = body.ok ? 0.85 : 0.45;
+  ctx.strokeStyle = body.ok ? palette.bone : palette.dim;
+  ctx.lineWidth = 2;
+  for (const [a, b] of BODY_BONES) {
+    const pa = points[a];
+    const pb = points[b];
+    if (!pa || !pb || !reliable(pa) || !reliable(pb)) continue;
+    ctx.beginPath();
+    ctx.moveTo(pa.x * width, pa.y * height);
+    ctx.lineTo(pb.x * width, pb.y * height);
+    ctx.stroke();
+  }
+
+  // 13 个点：低可见度的小灰点
+  for (const point of points) {
+    const okPoint = reliable(point);
+    ctx.globalAlpha = okPoint ? 1 : 0.55;
+    ctx.fillStyle = okPoint ? palette.point : palette.dim;
+    ctx.beginPath();
+    ctx.arc(point.x * width, point.y * height, okPoint ? 3 : 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 角标：状态 + 数据年龄
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = body.ok ? palette.point : palette.dim;
+  ctx.font = '11px "Cascadia Mono", Consolas, monospace';
+  ctx.textAlign = "left";
+  ctx.fillText(bodyStatusText(body), 6, 14);
+  if (body.ageMs != null) {
+    ctx.fillStyle = palette.dim;
+    ctx.textAlign = "right";
+    ctx.fillText(`${Math.round(body.ageMs)} ms`, width - 6, height - 6);
+  }
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------- 姿态校准（镜头没正对你）
@@ -894,6 +1156,14 @@ function renderDebugGrid() {
     ["AngleY →", fmt(stage.getEngineParam("ParamAngleY"), 2)],
     ["AngleZ →", fmt(stage.getEngineParam("ParamAngleZ"), 2)],
     ["BodyAngleX →", fmt(stage.getEngineParam("ParamBodyAngleX"), 2)],
+    ["BodyAngleY →", fmt(stage.getEngineParam("ParamBodyAngleY"), 2)],
+    ["BodyAngleZ →", fmt(stage.getEngineParam("ParamBodyAngleZ"), 2)],
+    ["BodyAngleX 头+身", fmt(state.mergedParams?.ParamBodyAngleX, 2)],
+    ["上半身", bodyStatusText(state.body)],
+    ["ub age", state.body?.ageMs == null ? "-" : `${Math.round(state.body.ageMs)} ms`],
+    ["torso r/y", `${fmt(state.body?.torso?.[0], 1)} / ${fmt(state.body?.torso?.[1], 1)}`],
+    ["arm L/R", `${fmt(state.body?.metrics?.armAngleL, 0)}° / ${fmt(state.body?.metrics?.armAngleR, 0)}°`],
+    ["手臂参数", armParamSupportText()],
     ["target AngleX", fmt(params.ParamAngleX, 2)],
     ["target AngleY", fmt(params.ParamAngleY, 2)],
     ["目标帧率", stage.targetFps ? String(stage.targetFps) : "不限"],
@@ -1080,7 +1350,10 @@ function wireUi() {
     ui.collapse.textContent = "+";
   }
 
-  ui.debugBox.addEventListener("toggle", () => renderDebugGrid());
+  ui.debugBox.addEventListener("toggle", () => {
+    renderDebugGrid();
+    syncSkeletonVisibility();
+  });
 
   window.addEventListener("keydown", (event) => {
     if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
@@ -1089,6 +1362,7 @@ function wireUi() {
     } else if (event.key === "d" || event.key === "D") {
       ui.debugBox.open = !ui.debugBox.open;
       renderDebugGrid();
+      syncSkeletonVisibility();
     }
   });
 
@@ -1128,6 +1402,43 @@ window.__vfc = {
       publishDebug(); // 渲染后再读一次，engine 里就是这一帧真正生效的值
     }
     return state.lastResult;
+  },
+
+  /**
+   * 手动喂上半身数据（没有手机 / 截图自测）：不经过 WS，直接更新 body 状态并立即渲染。
+   *
+   *   __vfc.applyUpperBody({ ub: [...52 个数], body: [roll, yaw], ubOk: true })
+   *   __vfc.applyUpperBody({ ubOk: false })   // 验证平滑回默认
+   *
+   * 会自动冻结 WS（与 applyTrack 一致），返回本帧的 body 调试信息。
+   *
+   * @param {{ub?:number[], body?:number[], ubOk?:boolean, ubT?:number}} [payload]
+   */
+  applyUpperBody(payload = {}) {
+    state.frozen = true;
+    stage.setSmoothing(1);
+    const base = state.lastTrack && typeof state.lastTrack === "object" ? state.lastTrack : {};
+    const track = {
+      ...base,
+      type: "track",
+      seq: Number.isFinite(Number(base.seq)) ? Number(base.seq) + 1 : state.frames + 1,
+      t: Number.isFinite(Number(base.t)) ? Number(base.t) + 33 : Date.now(),
+    };
+    const ubInput = payload?.ub;
+    if (Array.isArray(ubInput) || ArrayBuffer.isView(ubInput)) track.ub = ubInput;
+    const bodyInput = payload?.body;
+    if (Array.isArray(bodyInput) || ArrayBuffer.isView(bodyInput)) track.body = bodyInput;
+    track.ubOk = payload?.ubOk !== undefined ? Boolean(payload.ubOk) : track.ub != null;
+    const ubT = Number(payload?.ubT);
+    track.ubT = Number.isFinite(ubT) ? ubT : Number(track.t);
+    // 截图 / 自测要确定性：这一帧直接落到目标（丢失时直接回 0），不按 15%/帧慢慢衰减
+    if (state.body) state.body.snap = true;
+    feedTrack(track);
+    if (stage.ready) {
+      stage.renderNow();
+      publishDebug();
+    }
+    return { body: { ...(debugState.body ?? {}) }, params: state.mergedParams };
   },
 
   /** 本地姿态偏移（镜头没正对你时的校准量，度）。 */
@@ -1212,6 +1523,8 @@ window.__vfc = {
         : null,
       poseOffset: { ...state.poseOffset },
       params: state.lastResult?.params ?? null,
+      mergedParams: state.mergedParams ?? null,
+      body: { ...(state.body ?? createBodyState()) },
       normalized: state.lastResult?.normalized ?? null,
       ready: stage.ready,
       modelUrl: stage.modelUrl,
@@ -1260,6 +1573,8 @@ window.__vfc = {
 
 async function boot() {
   wireUi();
+  initSkeletonView();
+  syncSkeletonVisibility();
   renderCalibUi(); // 把 localStorage 里保存的本地姿态偏移回填到滑块 / 提示
   await initNativeControls();
   ui.renderFps.title =

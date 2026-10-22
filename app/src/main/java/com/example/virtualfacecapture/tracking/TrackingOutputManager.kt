@@ -11,6 +11,7 @@ import android.view.WindowManager
 import androidx.compose.runtime.mutableStateOf
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.HeadPoseData
+import com.example.commondata.UpperBodyPoseFrame
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import kotlin.math.roundToInt
@@ -70,6 +71,10 @@ class TrackingOutputManager(
     @Volatile
     private var trackingFlag = false
 
+    /** 上半身采集是否启用；服务没起来时也要记住，[start] 时再应用。 */
+    @Volatile
+    private var upperBodyFlag = false
+
     private val deviceName: String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
 
     private val appName: String = buildString {
@@ -108,6 +113,7 @@ class TrackingOutputManager(
             frameBufferMs = frameBufferMs,
         )
         newServer.trackingActive = trackingFlag
+        newServer.setUpperBodyEnabled(upperBodyFlag)
 
         if (!newServer.start()) {
             errorMessage.value = newServer.lastError ?: ("无法监听端口 " + PORT)
@@ -165,6 +171,27 @@ class TrackingOutputManager(
     fun setTrackingActive(active: Boolean) {
         trackingFlag = active
         server?.trackingActive = active
+    }
+
+    /**
+     * 开启 / 关闭上半身数据（协议 §4.1 的 hello.upperBody / §4.2 的 ub* 字段）。
+     *
+     * 服务没启动时只记住状态，[start] 时再应用；不需要等下一次连接才生效。
+     */
+    fun setUpperBodyEnabled(enabled: Boolean) {
+        upperBodyFlag = enabled
+        server?.setUpperBodyEnabled(enabled)
+    }
+
+    /**
+     * 把最新一帧上半身关键点交给服务（约 15 Hz 调用）。
+     *
+     * 这里只做一次判空 + 引用赋值：JSON 序列化在面捕帧线程的 [submitFrame] 里统一完成，
+     * 上半身回调线程（MediaPipe）绝不做重活。
+     */
+    fun submitUpperBody(frame: UpperBodyPoseFrame) {
+        if (!running) return
+        server?.submitUpperBodySnapshot(frame)
     }
 
     /**

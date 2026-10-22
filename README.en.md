@@ -163,10 +163,12 @@ A multi-module Gradle project plus a standalone Windows client:
 | `app/` | **Android capture app**: camera, face pipeline, debug HUD, WebSocket tracking server |
 | `windows-client/` | **Windows renderer**: Electron + Cubism Web, connects to the phone and draws Live2D |
 | `docs/tracking-protocol.md` | **The single contract** between both sides: VFC Tracking Protocol v1 |
+| `docs/upper-body.md` | upper-body capture design + interface contract (module API / data flow / acceptance) |
 | `:MediapipeFaceLandmark` | **core inference**: MNN + `.mnn` models + native C++ pipeline + NEON |
 | `:OpenSeeFaceProcess` | OpenSeeFace-style post-processing: smoothing, pose, blendshape solve |
 | `:CommonData` | shared data types (`Point3D` / `HeadPose` / `ARKitBlendShapes` …) |
 | `:facecapture-sdk` | publishable AAR facade over the modules above |
+| `:MediapipeUpperBody` | **optional upper-body module**: official MediaPipe Tasks `PoseLandmarker`, 13 upper-body points, off by default |
 | `Live2D/` | **no longer built.** Legacy on-device Cubism SDK wrapper (CMake + JNI), kept for reference |
 | `ThirdParty/MNN/` | headers only |
 | `tools/verify/` | end-to-end verification (mock phone + headless Chrome screenshots + mapping unit tests) |
@@ -224,6 +226,14 @@ npm run mock     # fake phone on ws://127.0.0.1:8765/ws, no device needed
 Drop them into `windows-client/models/<name>/<anything>.model3.json` — folders are
 auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Yuuka`, `zzzz`.
 
+The optional upper body feature needs a MediaPipe Pose model; fetch it into
+`MediapipeUpperBody/src/main/assets/`:
+
+```bash
+./tools/fetch-pose-model.sh          # macOS / Linux
+pwsh -File tools/fetch-pose-model.ps1   # Windows
+```
+
 ---
 
 ## 🎮 Controls
@@ -235,11 +245,12 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 | **Start / Stop** | camera + inference pipeline |
 | **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). Also remotely triggerable from the PC via `command: recalibrate` |
 | **Network output** | start/stop the tracking server, copy the `ws://` address, see client count, output fps and the active frame-buffer length, open the `/status` page |
-| **Camera: front / back / external** | enumerate and switch cameras; re-calibrates after switching, remembers the choice |
+| **Camera: front / back / external / ultra-wide** | enumerate and switch cameras, including physical ultra-wide / telephoto sensors hidden behind a logical multi-camera; re-calibrates after switching, remembers the choice; works in portrait and landscape |
 | **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |
 | **Landmark: GPU parallel** | cycles single / GPU×2 / GPU×3: several GPU engines steal frames from one queue to keep the GPU busy (restarts the pipeline briefly) |
 | **Blink curve / speed** | shape blinks into a natural 230 ms curve, adjustable speed |
 | **Eye sensitivity** | eye EAR threshold sensitivity (0.5x–2.0x) with live closed/open thresholds |
+| **Upper body: on / off** | start/stop MediaPipe Pose upper-body capture (needs the model first — see "Where do models come from?"); adds a skeleton overlay, HUD body fps / points / torso angles; follows capture start/stop |
 | **Debug / landmarks** | fps, frame cost, pitch/yaw/roll with bars, raw ARKit values, landmark + bbox overlay |
 
 ### Windows client
@@ -254,7 +265,8 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 | **Click-through** | mouse passes through the window; **press `Ctrl + Alt + T` to undo** (global hotkey) |
 | **One-click calibration + fine-tune** | when the phone camera is not facing you (mounted to the side, new seat), hold still for 3 s to treat the current head pose as neutral, then nudge yaw / pitch / roll with sliders. The offset is saved and survives restarts |
 | **Redo phone baseline** | asks the phone to recapture its neutral face baseline (expression + head pose) and resets the PC adaptive ranges; the local pose offset is cleared afterwards to avoid double calibration |
-| **Hide UI / Debug** | `H` hides every panel (avatar only), `D` toggles the live parameter grid |
+| **Hide UI / Debug** | `H` hides every panel (avatar only), `D` toggles the live parameter grid (incl. upper body: ub age / torso angles / arm params) |
+| **Upper-body skeleton** | with the debug panel open a canvas skeleton (13 points / 15 bones) is drawn; or open `?skeleton=1` directly. Low-visibility points and lost state are dimmed; pointer events pass through |
 
 Disconnects reconnect automatically (0.5 s → 1 s → 2 s → 5 s, capped) and the avatar returns to
 its default pose instead of freezing on the last frame.
@@ -277,8 +289,8 @@ no image encoding on the phone.
 | `GET /` | PC → phone | embedded info page |
 | `GET /status` | PC → phone | JSON: `running / tracking / clients / fps / device / protocol / version / seq` |
 | `WS /ws` | both | tracking stream (fixed port 8765) |
-| `hello` | phone → PC | once per connection: protocol / version / device / fps / decimation |
-| `track` | phone → PC | per frame: `seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating` |
+| `hello` | phone → PC | once per connection: protocol / version / device / fps / decimation; `upperBody: true` when enabled |
+| `track` | phone → PC | per frame: `seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating`; with upper body enabled it **optionally** adds `ubOk` / `ub[52]` / `ubT` / `body[2]` (additive, old clients ignore) |
 | `calib` | phone → PC | entered / left the calibration window |
 | `ping` / `pong` | both | keep-alive and RTT (client every 5 s, phone every 30 s) |
 | `command` / `ack` | PC → phone | currently only `recalibrate` |
@@ -295,6 +307,44 @@ stall the phone (each connection only keeps the newest frame).
 > even when inference time, scheduling or Wi-Fi hiccups jitter — at the cost of a constant
 > ~0.5 s of extra end-to-end latency. Set it to `0` to disable the buffer and send immediately.
 > The phone's *Network output* dialog shows the active buffer length.
+
+---
+
+## 🧍 Upper body (optional, MediaPipe Pose)
+
+Face capture drives the head and expressions only. This optional feature runs a
+[MediaPipe Pose](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker)
+landmarker (official `com.google.mediapipe:tasks-vision` `PoseLandmarker`, LIVE_STREAM) on the
+**same camera stream**, extracting 13 upper-body points (nose / eyes / ears / shoulders / elbows /
+wrists / hips) plus **baseline-relative torso angles**, so the avatar can lean, turn and raise arms:
+
+- **Off by default** — no extra cost on the camera thread and no MediaPipe Tasks runtime loaded.
+  When enabled it taps one frame every 66 ms (~15 fps), GPU first with automatic CPU fallback.
+- **~0.6 KB extra per frame**: `ubOk` / `ub` (13×4) / `ubT` / `body` are appended to `track`
+  ([`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)), ≈36 KB/s at 60 fps.
+- **Consumed automatically on the PC**: torso drives `ParamBodyAngleX/Y/Z`, arms drive
+  `ParamArmLA/RA`; parameters a model does not have are **skipped** (the four bundled models only
+  ship `ParamBodyAngleX/Y/Z`, so arms will not visibly move there — expected degradation).
+- **Smooth fallback**: on `ubOk=false` or 1.5 s without an update the parameters decay toward 0
+  per frame, handing control back to the model's own idle motion.
+- **Visible while debugging**: skeleton overlay on the phone preview; PC debug panel gets an
+  upper-body section and `?skeleton=1` draws the overlay skeleton.
+
+Enabling it:
+
+```bash
+# 1) fetch the model (~5.5 MB, not in Git)
+./tools/fetch-pose-model.sh          # Windows: pwsh -File tools/fetch-pose-model.ps1
+# 2) rebuild/install the app, start capture, tap "Upper body: on"
+./gradlew :app:assembleDebug
+```
+
+You can also `adb push` `pose_landmarker_lite.task` / `pose_landmarker_full.task` into
+`/data/data/com.example.virtualfacecapture/files/models/` (no rebuild). Without a model the button
+only reports "model missing" and the feature stays off — capture and streaming are unaffected.
+
+Design + interface contract: [`docs/upper-body.md`](docs/upper-body.md); module notes:
+[`MediapipeUpperBody/README.md`](MediapipeUpperBody/README.md).
 
 ---
 
@@ -469,8 +519,19 @@ To reuse the wire format, just copy `docs/tracking-protocol.md` — it was writt
 - **ARKit-52 solved in-house**: no third blendshape model — the shapes come from landmark
   geometry, saving an entire inference pass.
 - **Publishable AAR**: `:facecapture-sdk` is wired for `maven-publish`.
-- **Multi-camera**: enumerate and switch front / back / external cameras at runtime,
-  recomputing rotation, vertical FOV and preview mirroring, re-calibrating after a switch.
+- **Optional upper body**: `:MediapipeUpperBody` runs the official MediaPipe Tasks
+  `PoseLandmarker` at 15 fps on the same YUV frames and adds only 13 points + torso angles to the
+  existing protocol; off by default, degrades gracefully without the model, fully decoupled from the
+  face pipeline.
+- **Multi-camera (incl. physical ultra-wide)**: enumerate and switch front / back / external
+  cameras at runtime. On API 28+ the physical sensors hidden behind a logical multi-camera
+  (rear ultra-wide / telephoto) are exposed as selectable streams via
+  `OutputConfiguration.setPhysicalCameraId`, recomputing rotation, vertical FOV and preview
+  mirroring, and re-calibrating after a switch.
+- **Seamless portrait ↔ landscape**: `screenOrientation="sensor"` + `configChanges` keeps the
+  activity, camera session, pipeline and preview alive across rotation; frames are rotated
+  upright from `display.rotation` every frame, and the control panel / camera list adapt to
+  the available height.
 - **Streaming never blocks inference**: each WS client has a single "latest frame" slot, so
   slow networks drop frames instead of stalling the inference thread.
 - **Both ends are verifiable offline**: the phone has JVM unit tests for the protocol; the PC
@@ -496,7 +557,9 @@ VirtualFaceCapture-MNN/
 ├── OpenSeeFaceProcess/          # OpenSeeFace-style post-processing
 ├── CommonData/                  # shared data classes
 ├── facecapture-sdk/             # publishable AAR facade
+├── MediapipeUpperBody/          # optional: upper-body landmarks (MediaPipe Tasks PoseLandmarker)
 ├── docs/tracking-protocol.md    # the wire contract
+├── docs/upper-body.md           # upper-body capture design + contract
 ├── tools/verify/                # end-to-end verification scripts
 ├── Live2D/                      # legacy on-device renderer (not built anymore)
 └── ThirdParty/MNN/              # headers only

@@ -10,6 +10,9 @@ import com.example.commondata.FaceLandmarkIndices
 import com.example.commondata.FaceVisualizationData
 import com.example.commondata.HeadPoseData
 import com.example.commondata.Point3D
+import com.example.commondata.UpperBodyLandmarkIndex
+import com.example.commondata.UpperBodyPoseFrame
+import com.example.commondata.UpperBodySkeleton
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicReference
 
@@ -156,7 +159,28 @@ class CameraPreviewView @JvmOverloads constructor(
         strokeWidth = 1f
         isAntiAlias = true
     }
-    
+
+    // ---- 上半身骨架（MediaPipe Pose 13 点）--------------------------------
+    // 连线用青色，关节点用黄色；可见度低的点用半透明 / 直接跳过。
+    private val bodyBonePaint = Paint().apply {
+        color = Color.rgb(0, 229, 255)  // #FF00E5FF
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        isAntiAlias = true
+    }
+
+    private val bodyJointPaint = Paint().apply {
+        color = Color.YELLOW
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
+    private val bodyJointDimPaint = Paint().apply {
+        color = Color.argb(110, 255, 255, 0)  // 半透明黄：点可见但不那么可信
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
     private val textPaint = Paint().apply {
         color = Color.YELLOW
         textSize = 36f
@@ -174,6 +198,14 @@ class CameraPreviewView @JvmOverloads constructor(
     
     // Thread-safe visualization data
     private val visualizationDataRef = AtomicReference<FaceVisualizationData?>(null)
+
+    // 上半身最新一帧（MediaPipe 回调线程写、UI 线程读）
+    private val upperBodyFrameRef = AtomicReference<UpperBodyPoseFrame?>(null)
+
+    // 上半身 13 点的屏幕坐标 / 可见度复用数组：onDraw 里不允许每帧分配
+    private val bodyScreenX = FloatArray(UpperBodyLandmarkIndex.COUNT)
+    private val bodyScreenY = FloatArray(UpperBodyLandmarkIndex.COUNT)
+    private val bodyVisibility = FloatArray(UpperBodyLandmarkIndex.COUNT)
     
     // Drawing options
     var drawLandmarks = true
@@ -183,8 +215,20 @@ class CameraPreviewView @JvmOverloads constructor(
     var drawIris = true
     var mirrorHorizontal = true
     var rotationDegrees = 0f
+
+    /** 上半身骨架叠加开关（关闭时 onDraw 里连读引用都省掉）。 */
+    var drawUpperBody = true
     
     companion object {
+        /** 上半身连线门槛：两端可见度都 >= 这个值才画，避免低置信度点拉出乱线。 */
+        private const val BODY_LINE_VISIBILITY = 0.3f
+
+        /** 上半身关节点门槛：低于此值直接跳过；[0.3, 0.5) 用半透明画。 */
+        private const val BODY_POINT_VISIBILITY = 0.3f
+
+        /** 关节点半径（像素）。 */
+        private const val BODY_JOINT_RADIUS = 5f
+
         // 使用统一的点位定义
         private val IMAGE_RIGHT_EYE_INDICES = FaceLandmarkIndices.ImageRightEye.ALL_EYELID.toSet()
         private val IMAGE_LEFT_EYE_INDICES = FaceLandmarkIndices.ImageLeftEye.ALL_EYELID.toSet()
@@ -287,6 +331,20 @@ class CameraPreviewView @JvmOverloads constructor(
         visualizationDataRef.set(data)
         postInvalidate()
     }
+
+    /**
+     * 更新上半身骨架（约 15fps，从 MediaPipe 回调线程调用）。
+     *
+     * 传 null 表示关闭 / 已停止，下一帧 onDraw 就不会再画骨架。
+     *
+     * 坐标语义（docs/upper-body.md §3.2 / §3.5）：[UpperBodyPoseFrame.points] 的 x/y
+     * **已经是镜像后的「预览方向」**（检测器在镜像过的输入像素上推理），所以这里不
+     * 需要（也**不能**）再跟随 [drawBitmapFrame] 里 bitmap 的那个 scale(-1,1) 翻转。
+     */
+    fun updateUpperBody(frame: UpperBodyPoseFrame?) {
+        upperBodyFrameRef.set(frame)
+        postInvalidate()
+    }
     
     /**
      * 把旧 Bitmap 丢给主线程回收。
@@ -318,6 +376,7 @@ class CameraPreviewView @JvmOverloads constructor(
             frameHeight = 0
         }
         visualizationDataRef.set(null)
+        upperBodyFrameRef.set(null)
         pixelBuffer = null
         rgbBytesBuffer = null
         postInvalidate()
@@ -380,6 +439,62 @@ class CameraPreviewView @JvmOverloads constructor(
         visualizationDataRef.get()?.let { data ->
             drawFaceVisualization(canvas, data, dstRect)
             drawPoseInfo(canvas, data.headPose)
+        }
+
+        // 上半身骨架（可选功能）：没有帧 / 没检出 / 开关关闭时完全不画。
+        // 注意在 bitmap 的 canvas.scale(-1,1) 之外画 —— 关键点坐标已经是预览方向。
+        if (drawUpperBody) {
+            val upperBodyFrame = upperBodyFrameRef.get()
+            if (upperBodyFrame != null && upperBodyFrame.tracking) {
+                drawUpperBodySkeleton(canvas, upperBodyFrame, dstRect)
+            }
+        }
+    }
+
+    /**
+     * 画上半身骨架：13 个关节点 + [UpperBodySkeleton.BONES] 连线。
+     *
+     * 坐标系：直接映射到 [dstRect]（与相机画面完全重合的区域）。前置摄像头时整张
+     * bitmap 在 [drawBitmapFrame] 里被 canvas.scale(-1,1) 翻转，但上半身点是检测器在
+     * **已镜像的输入像素**上算出来的，x/y 已经是预览方向，所以这里不能再翻转。
+     *
+     * 性能：坐标写进复用数组，onDraw 里零分配；低可见度的点和线跳过 / 半透明。
+     */
+    private fun drawUpperBodySkeleton(canvas: Canvas, frame: UpperBodyPoseFrame, dstRect: RectF) {
+        if (frame.points.size < UpperBodyLandmarkIndex.COUNT) return
+
+        val offsetX = dstRect.left
+        val offsetY = dstRect.top
+        val scaleX = dstRect.width()
+        val scaleY = dstRect.height()
+
+        for (index in 0 until UpperBodyLandmarkIndex.COUNT) {
+            val point = frame.points[index]
+            bodyScreenX[index] = offsetX + point.x * scaleX
+            bodyScreenY[index] = offsetY + point.y * scaleY
+            bodyVisibility[index] = point.visibility
+        }
+
+        // 骨架连线：两端都足够可信才画
+        for (bone in UpperBodySkeleton.BONES) {
+            val a = bone[0]
+            val b = bone[1]
+            if (bodyVisibility[a] < BODY_LINE_VISIBILITY || bodyVisibility[b] < BODY_LINE_VISIBILITY) {
+                continue
+            }
+            canvas.drawLine(
+                bodyScreenX[a], bodyScreenY[a],
+                bodyScreenX[b], bodyScreenY[b],
+                bodyBonePaint,
+            )
+        }
+
+        // 关节点：不可信的跳过，勉强可信的半透明
+        for (index in 0 until UpperBodyLandmarkIndex.COUNT) {
+            val visibility = bodyVisibility[index]
+            if (visibility < BODY_POINT_VISIBILITY) continue
+            val paint = if (visibility >= 0.5f) bodyJointPaint else bodyJointDimPaint
+            canvas.drawCircle(bodyScreenX[index], bodyScreenY[index], BODY_JOINT_RADIUS, paint)
         }
     }
     

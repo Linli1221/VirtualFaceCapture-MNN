@@ -447,6 +447,156 @@ test('clamp(v, lo, hi)', () => {
   exact(api.clamp(0.5, 0, 1), 0.5);
 });
 
+// ---------------------------------------------------------------- upper body (protocol §4.2 / §5.3)
+// 协议顺序（CommonData.UpperBodyLandmarkIndex.ORDER）
+const BP = {
+  nose: 0, eye_left: 1, eye_right: 2, ear_left: 3, ear_right: 4,
+  shoulder_left: 5, shoulder_right: 6, elbow_left: 7, elbow_right: 8,
+  wrist_left: 9, wrist_right: 10, hip_left: 11, hip_right: 12
+};
+/** 构造 52 项 ub：默认直立站姿、双臂自然下垂。 */
+function makeUb({
+  shoulderL = [0.35, 0.4], shoulderR = [0.65, 0.4],
+  wristL = [0.35, 0.78], wristR = [0.65, 0.78],
+  visibility = 0.9, visibilityL = null, visibilityR = null
+} = {}) {
+  const ub = new Array(52).fill(0);
+  const set = (i, x, y, z, v) => { ub[i * 4] = x; ub[i * 4 + 1] = y; ub[i * 4 + 2] = z; ub[i * 4 + 3] = v; };
+  const vL = visibilityL == null ? visibility : visibilityL;
+  const vR = visibilityR == null ? visibility : visibilityR;
+  set(BP.nose, 0.5, 0.16, 0, visibility);
+  set(BP.eye_left, 0.46, 0.15, 0, visibility);
+  set(BP.eye_right, 0.54, 0.15, 0, visibility);
+  set(BP.ear_left, 0.42, 0.17, 0, visibility);
+  set(BP.ear_right, 0.58, 0.17, 0, visibility);
+  set(BP.shoulder_left, shoulderL[0], shoulderL[1], 0, vL);
+  set(BP.shoulder_right, shoulderR[0], shoulderR[1], 0, vR);
+  set(BP.elbow_left, (shoulderL[0] + wristL[0]) / 2, (shoulderL[1] + wristL[1]) / 2, 0, vL);
+  set(BP.elbow_right, (shoulderR[0] + wristR[0]) / 2, (shoulderR[1] + wristR[1]) / 2, 0, vR);
+  set(BP.wrist_left, wristL[0], wristL[1], 0, vL);
+  set(BP.wrist_right, wristR[0], wristR[1], 0, vR);
+  set(BP.hip_left, 0.39, 0.86, 0, visibility);
+  set(BP.hip_right, 0.61, 0.86, 0, visibility);
+  return ub;
+}
+
+test('upper body: BODY_LANDMARK_ORDER / BODY_BONES match CommonData (§5.3)', () => {
+  exact(api.BODY_COUNT, 13, 'BODY_COUNT');
+  exact(api.BODY_FLOATS, 52, 'BODY_FLOATS');
+  assert.deepStrictEqual(Object.values(api.BODY_LANDMARK_ORDER), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  exact(api.BODY_BONES.length, 15, 'BODY_BONES.length');
+  assert.deepStrictEqual(
+    api.BODY_BONES.map((e) => [...e]),
+    [[0, 1], [0, 2], [1, 3], [2, 4], [1, 2], [0, 5], [0, 6], [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12]]
+  );
+  assert.deepStrictEqual(
+    [...api.BODY_PARAM_IDS],
+    ['ParamBodyAngleX', 'ParamBodyAngleY', 'ParamBodyAngleZ', 'ParamArmLA', 'ParamArmRA']
+  );
+});
+
+test('upper body: parseUpperBody 52 -> 13 points, wrong length -> null, NaN -> 0', () => {
+  const pts = api.parseUpperBody(makeUb());
+  exact(pts.length, 13, 'points length');
+  close(pts[BP.shoulder_left].x, 0.35, 1e-12, 'shoulder_left.x');
+  close(pts[BP.wrist_right].v, 0.9, 1e-12, 'wrist_right.v');
+  exact(api.parseUpperBody(new Array(51).fill(0)), null, '51 -> null');
+  exact(api.parseUpperBody(new Array(53).fill(0)), null, '53 -> null');
+  exact(api.parseUpperBody(null), null, 'null -> null');
+  const broken = makeUb();
+  broken[BP.nose * 4] = NaN;
+  broken[BP.nose * 4 + 3] = 7;
+  const fixed = api.parseUpperBody(broken);
+  exact(fixed[BP.nose].x, 0, 'NaN -> 0');
+  exact(fixed[BP.nose].v, 1, 'visibility clamped to 1');
+});
+
+test('upper body: mapBody neutral -> all params 0, shoulder width, confidence', () => {
+  const m = api.mapBody([0, 0], makeUb());
+  close(m.params.ParamBodyAngleX, 0, 1e-12, 'BodyAngleX');
+  close(m.params.ParamBodyAngleY, 0, 1e-12, 'BodyAngleY');
+  close(m.params.ParamBodyAngleZ, 0, 1e-12, 'BodyAngleZ');
+  close(m.params.ParamArmLA, 0, 1e-12, 'ArmLA');
+  close(m.params.ParamArmRA, 0, 1e-12, 'ArmRA');
+  close(m.metrics.shoulderWidth, 0.3, 1e-12, 'shoulderWidth');
+  close(m.metrics.confidence, 0.9, 1e-12, 'confidence');
+});
+
+test('upper body: mapBody arm formulas (raise -> ParamArmLA, other side unchanged)', () => {
+  const raised = api.mapBody([0, 0], makeUb({ wristL: [0.2, 0.05] }));
+  close(raised.params.ParamArmLA, 30, 1e-12, 'ArmLA saturated');
+  close(raised.params.ParamArmRA, 0, 1e-12, 'ArmRA unchanged');
+  close(raised.metrics.armAngleL, (Math.atan2(0.15, -0.35) * 180) / Math.PI, 1e-9, 'armAngleL');
+  const horizontal = api.mapBody([0, 0], makeUb({ wristL: [0.05, 0.4] }));
+  close(horizontal.metrics.armAngleL, 90, 1e-12, 'armAngleL 90');
+  close(horizontal.params.ParamArmLA, 18, 1e-12, 'ArmLA = 90/150*30 = 18');
+});
+
+test('upper body: mapBody body formulas (§5.3 Z=roll*0.5, X=-yaw*0.3, Y=-roll*0.2, clamp 30)', () => {
+  close(api.mapBody([10, 0], null).params.ParamBodyAngleZ, 5, 1e-12, 'Z=roll*0.5');
+  close(api.mapBody([10, 0], null).params.ParamBodyAngleY, -2, 1e-12, 'Y=-roll*0.2');
+  close(api.mapBody([0, 20], null).params.ParamBodyAngleX, -6, 1e-12, 'X=-yaw*0.3');
+  const ext = api.mapBody([300, 200], null).params;
+  close(ext.ParamBodyAngleZ, 30, 1e-12, 'Z clamp');
+  close(ext.ParamBodyAngleY, -30, 1e-12, 'Y clamp');
+  close(ext.ParamBodyAngleX, -30, 1e-12, 'X clamp');
+});
+
+test('upper body: mapBody omits that side arm params when visibility < 0.3', () => {
+  const low = api.mapBody([0, 0], makeUb({ visibilityL: 0.1, wristL: [0.2, 0.05] }));
+  if ('ParamArmLA' in low.params) throw new Error('ParamArmLA should be omitted (visibility < 0.3)');
+  if (!('ParamArmRA' in low.params)) throw new Error('ParamArmRA should still be present');
+  close(low.metrics.confidence, 0.1, 1e-12, 'confidence = min visibility');
+  const edge = api.mapBody([0, 0], makeUb({ visibilityL: 0.3 }));
+  if (!('ParamArmLA' in edge.params)) throw new Error('visibility == 0.3 must keep the params');
+});
+
+test('upper body: mapBody tolerates bad ub and supports docs §3.6 arg order', () => {
+  for (const bad of [null, undefined, [], [1, 2, 3], new Array(52).fill(NaN)]) {
+    const m = api.mapBody([0, 0], bad);
+    if (!Number.isFinite(m.params.ParamBodyAngleZ)) throw new Error('bad ub produced non-finite body params');
+    if ('ParamArmLA' in m.params) throw new Error('bad ub must not fabricate arm params');
+  }
+  const doc = api.mapBody(makeUb({ wristL: [0.05, 0.4] }), [3, -7]);
+  const task = api.mapBody([3, -7], makeUb({ wristL: [0.05, 0.4] }));
+  close(doc.params.ParamBodyAngleX, task.params.ParamBodyAngleX, 1e-12, 'doc order X');
+  close(doc.params.ParamArmLA, task.params.ParamArmLA, 1e-12, 'doc order ArmLA');
+});
+
+test('upper body: readUpperBodyTrack handles ubOk / stale / missing fields', () => {
+  const ub = makeUb();
+  const first = api.readUpperBodyTrack({ ub, ubOk: true, ubT: 1000, body: [3, -5] }, 0, null);
+  exact(first.ok, true, 'first.ok');
+  close(first.torso[0], 3, 1e-12, 'torso roll');
+  const stale = api.readUpperBodyTrack({ ub, ubOk: true, ubT: 1000, body: [3, -5] }, 1600, first);
+  exact(stale.ok, false, 'stale.ok');
+  exact(stale.stale, true, 'stale.stale');
+  const fresh = api.readUpperBodyTrack({ ub, ubOk: true, ubT: 2000, body: [0, 0] }, 1700, stale);
+  exact(fresh.ok, true, 'fresh.ok');
+  const off = api.readUpperBodyTrack({ ub, ubOk: false, ubT: 3000, body: [0, 0] }, 1800, fresh);
+  exact(off.ok, false, 'ubOk=false');
+  exact(off.present, true, 'ubOk=false still present');
+  const legacy = api.readUpperBodyTrack({ type: 'track', bs: zeros(), pose: [0, 0, 0] }, 1900, fresh);
+  exact(legacy.present, false, 'legacy track has no ub');
+  exact(legacy.ok, false, 'legacy track not ok');
+});
+
+test('upper body: smoothBodyParams decays 15%/frame and releases to idle', () => {
+  close(api.smoothBodyParams({ ParamArmLA: 30 }, null).ParamArmLA, 25.499999999999996, 1e-9, '30*0.85');
+  let cur = { ParamArmLA: 30 };
+  for (let i = 0; i < 100; i++) cur = api.smoothBodyParams(cur, null);
+  if ('ParamArmLA' in cur) throw new Error('param should be released after decay');
+  assert.deepStrictEqual(api.smoothBodyParams({}, null), {}, 'never-driven ids stay untouched');
+  close(api.smoothBodyParams({ ParamArmLA: 30 }, { ParamArmLA: 7 }, { snap: true }).ParamArmLA, 7, 1e-12, 'snap');
+});
+
+test('upper body: combineBodyAngleX sums head + torso then clamps to +/-30', () => {
+  close(api.combineBodyAngleX(10, 25), 30, 1e-12, 'clamp +');
+  close(api.combineBodyAngleX(-10, -25), -30, 1e-12, 'clamp -');
+  close(api.combineBodyAngleX(4, -7), -3, 1e-12, 'sum');
+  close(api.combineBodyAngleX(undefined, 5), 5, 1e-12, 'head missing');
+});
+
 // ---------------------------------------------------------------- verdict
 R.finishedAt = new Date().toISOString();
 const failed = R.tests.filter((t) => !t.ok);

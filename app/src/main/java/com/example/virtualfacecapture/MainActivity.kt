@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -30,21 +31,26 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.HeadPoseData
+import com.example.commondata.UpperBodyPoseFrame
 import com.example.mediapipefacelandmark.MnnBackend
+import com.example.mediapipefacelandmark.YuvFrameData
 import com.example.virtualfacecapture.tracking.TrackingOutputManager
 import com.example.virtualfacecapture.ui.theme.VirtualFaceCaptureTheme
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val CAMERA_PREFS_NAME = "face_capture_prefs"
 private const val KEY_PREFERRED_CAMERA_ID = "preferred_camera_id"
@@ -60,6 +66,18 @@ private data class DebugSnapshot(
     val fps: Float = 0f,
     val blendShapes: ARKitBlendShapes? = null,
     val headPose: HeadPoseData = HeadPoseData(),
+    // ---- 上半身（可选功能，默认关）----
+    /** 中文状态：关 / 缺少模型 / 启动中 / 运行中 / 出错。 */
+    val bodyState: String = "关",
+    /** 实际产出的 body 帧率（≈15fps 目标）。 */
+    val bodyFps: Float = 0f,
+    /** 可见度 ≥ 0.5 的关键点个数，满分 13。 */
+    val bodyPoints: Int = 0,
+    /** 13 点平均可见度 [0,1]。 */
+    val bodyQuality: Float = 0f,
+    /** 相对躯干角（度）：roll 正值 = 右肩下沉，yaw 正值 = 向本人左侧转。 */
+    val bodyRoll: Float = 0f,
+    val bodyYaw: Float = 0f,
 )
 
 /** 调试面板的刷新间隔：10Hz 已经足够看清数值，重组次数降到原来的 1/6 以下。 */
@@ -85,6 +103,15 @@ private class DebugSnapshotBatcher(
     private var fps: Float = 0f
     private var blendShapes: ARKitBlendShapes? = null
     private var headPose: HeadPoseData = HeadPoseData()
+
+    // 上半身（约 15fps 回调）：同样只在 10Hz 的发布节奏里写进快照
+    private var bodyState: String = "关"
+    private var bodyFps: Float = 0f
+    private var bodyPoints: Int = 0
+    private var bodyQuality: Float = 0f
+    private var bodyRoll: Float = 0f
+    private var bodyYaw: Float = 0f
+
     private var lastPublishNanos: Long = 0L
 
     fun updateFps(value: Float) {
@@ -105,6 +132,33 @@ private class DebugSnapshotBatcher(
         publishIfDue()
     }
 
+    /**
+     * 上半身结果（约 15fps，在 MediaPipe 回调线程触发）。
+     *
+     * [frame] 为 null 表示功能已关闭 / 已停止，HUD 要显示成空状态。
+     * 和面捕的其它字段一起走同一个 10Hz 节流，绝不每帧写 Compose state。
+     */
+    fun updateUpperBody(frame: UpperBodyPoseFrame?, stateLabel: String, outputFps: Float) {
+        if (!enabled) return
+        synchronized(lock) {
+            bodyState = stateLabel
+            bodyFps = outputFps
+            if (frame == null || !frame.tracking) {
+                bodyPoints = 0
+                bodyQuality = 0f
+                bodyRoll = 0f
+                bodyYaw = 0f
+            } else {
+                // count {} 是 inline 的，不会在回调线程上额外分配
+                bodyPoints = frame.points.count { it.visibility >= 0.5f }
+                bodyQuality = frame.quality
+                bodyRoll = frame.torso.roll
+                bodyYaw = frame.torso.yaw
+            }
+        }
+        publishIfDue()
+    }
+
     private fun publishIfDue() {
         val now = System.nanoTime()
         val snapshot: DebugSnapshot? = synchronized(lock) {
@@ -112,7 +166,17 @@ private class DebugSnapshotBatcher(
                 null
             } else {
                 lastPublishNanos = now
-                DebugSnapshot(fps = fps, blendShapes = blendShapes, headPose = headPose)
+                DebugSnapshot(
+                    fps = fps,
+                    blendShapes = blendShapes,
+                    headPose = headPose,
+                    bodyState = bodyState,
+                    bodyFps = bodyFps,
+                    bodyPoints = bodyPoints,
+                    bodyQuality = bodyQuality,
+                    bodyRoll = bodyRoll,
+                    bodyYaw = bodyYaw,
+                )
             }
         }
         if (snapshot != null) {
@@ -133,6 +197,32 @@ class MainActivity : ComponentActivity() {
     private lateinit var faceTracker: PipelineFaceTracker
     private lateinit var trackingOutput: TrackingOutputManager
     private var isTracking = mutableStateOf(false)
+
+    /** 上半身关键点控制器（可选功能，默认关；契约见 docs/upper-body.md §3.5）。 */
+    private lateinit var upperBody: UpperBodyPoseController
+
+    /** 上半身开关（用户意图）：开着但面捕没跑时不采集，开始面捕时自动接力。 */
+    private var upperBodyEnabled = mutableStateOf(false)
+
+    /**
+     * 相机线程上的上半身 YUV 抽头。
+     *
+     * 做成一个字段而不是每次新建 lambda：挂上 / 摘掉时零分配。
+     * 关闭时 [PipelineFaceTracker.onYuvFrameForBody] 为 null，相机回调里只多一次判空。
+     */
+    private val bodyFrameTap: (YuvFrameData) -> Unit = { frame ->
+        upperBody.pushYuvFrame(frame)
+    }
+
+    /**
+     * 挂上 / 摘掉上半身帧抽头（相机线程侧）。
+     *
+     * @param on true = 按 66ms（≈15fps）抽帧；false = tap 置 null，面捕热路径零额外开销。
+     */
+    private fun attachBodyTap(on: Boolean) {
+        faceTracker.onYuvFrameForBody = if (on) bodyFrameTap else null
+        faceTracker.bodyTapIntervalMs = UpperBodyPoseController.TAP_INTERVAL_MS
+    }
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -157,6 +247,10 @@ class MainActivity : ComponentActivity() {
         val cameraPrefs = getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
         faceTracker.setPreferredCamera(cameraPrefs.getString(KEY_PREFERRED_CAMERA_ID, null))
 
+        // 上半身关键点（:MediapipeUpperBody）：默认关，打开后才挂相机 YUV 抽头并加载模型。
+        // 控制器自己不依赖 tracking / UI，帧的分发由下面两个回调接线。
+        upperBody = UpperBodyPoseController(this)
+
         // 网络输出（追踪数据）：默认关闭，用户可在控制面板里开启。
         // PC 端发 command:recalibrate 时回到主线程触发与 UI 相同的「重置基线」逻辑。
         trackingOutput = TrackingOutputManager(this) {
@@ -174,6 +268,10 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+        // 上半身结果 → 网络输出（协议组：内部只存最新快照，track 报文按需带 ub / ubOk / body）。
+        // 预览骨架由 FaceCaptureScreen 里的 onOverlay 接（那边才有 CameraPreviewView 实例）。
+        upperBody.onFrame = { frame -> trackingOutput.submitUpperBody(frame) }
+
         if (checkCameraPermission()) {
             initializeFaceTracker()
         } else {
@@ -186,6 +284,9 @@ class MainActivity : ComponentActivity() {
                     faceTracker = faceTracker,
                     trackingOutput = trackingOutput,
                     isTracking = isTracking,
+                    upperBody = upperBody,
+                    upperBodyEnabled = upperBodyEnabled,
+                    onAttachBodyTap = ::attachBodyTap,
                 )
             }
         }
@@ -197,14 +298,24 @@ class MainActivity : ComponentActivity() {
         if (isTracking.value && !faceTracker.isTracking()) {
             faceTracker.start()
         }
+        // 上半身：onPause 停过检测器；回前台且开关还开着就重新挂 tap、接着采
+        if (upperBodyEnabled.value) {
+            attachBodyTap(true)
+            if (isTracking.value && faceTracker.isTracking()) {
+                upperBody.start()
+            }
+        }
         trackingOutput.setTrackingActive(isTracking.value && faceTracker.isTracking())
     }
 
     override fun onPause() {
         super.onPause()
         if (faceTracker.isTracking()) {
+            // stop() 里会顺手把上半身 tap 置 null，避免相机停掉后仍有回调
             faceTracker.stop()
         }
+        // 没有帧源就没有意义：停掉上半身检测器（用户开关状态保留，回前台自动恢复）
+        upperBody.stop()
         // 相机已释放，/status 的 tracking 要如实变成 false（PC 端据此判断「手机在不在面捕」）
         trackingOutput.setTrackingActive(false)
     }
@@ -212,6 +323,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         trackingOutput.dispose()
+        // 先放掉上半身（它持有 MediaPipe Tasks 运行时），再释放面捕管线
+        upperBody.release()
         faceTracker.release()
     }
 
@@ -238,13 +351,23 @@ fun FaceCaptureScreen(
     faceTracker: PipelineFaceTracker,
     trackingOutput: TrackingOutputManager,
     isTracking: MutableState<Boolean>,
+    upperBody: UpperBodyPoseController,
+    upperBodyEnabled: MutableState<Boolean>,
+    onAttachBodyTap: (Boolean) -> Unit,
 ) {
     // 调试面板数据：fps / BlendShape / 姿态合并为一个快照，且限制在 ≤10Hz（见 DebugSnapshotBatcher）
     val debugSnapshotState = remember { mutableStateOf(DebugSnapshot()) }
     var showDebug by remember { mutableStateOf(true) }
     var showTrackingDialog by remember { mutableStateOf(false) }
     var showCameraSelectorDialog by remember { mutableStateOf(false) }
-    var showControlPanel by rememberSaveable { mutableStateOf(true) }
+
+    // 横屏适配：控制面板高度不能超过屏幕可用高度（否则面板顶部被顶出屏幕、滚不到），
+    // 横屏首次进入默认收起面板——否则 280dp 的面板会盖住几乎整个横屏画面。
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val controlPanelMaxHeight = (configuration.screenHeightDp.dp - 88.dp)
+        .coerceAtLeast(160.dp)
+    var showControlPanel by rememberSaveable { mutableStateOf(!isLandscape) }
 
     // 相机预览叠加层开关（关键点 / 检测框）
     var drawLandmarks by rememberSaveable { mutableStateOf(true) }
@@ -263,6 +386,10 @@ fun FaceCaptureScreen(
     var gpuActiveChannels by remember { mutableStateOf(faceTracker.getActiveChannelCount()) }
 
     var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
+
+    // 上半身：初始化（加载模型）期间按钮显示「启动中」；模型缺失 / 出错时显示中文提示
+    var upperBodyBusy by remember { mutableStateOf(false) }
+    var upperBodyMessage by remember { mutableStateOf("") }
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -306,18 +433,42 @@ fun FaceCaptureScreen(
             isCalibrating = calibrating
         }
 
+        // 上半身：每帧（~15fps，MediaPipe 回调线程）刷新预览骨架；
+        // HUD 数值走合批器（≤10Hz 写 Compose state），不逐帧重组。
+        upperBody.onOverlay = { frame ->
+            cameraPreviewView?.updateUpperBody(frame)
+            debugBatcher.updateUpperBody(frame, upperBody.stateLabelZh(), upperBody.outputFps)
+        }
+
+        // 上半身状态 / 错误的中文提示（模型缺失、GPU 回退 CPU 等）
+        upperBody.onStatus = { message ->
+            upperBodyMessage = message
+            Log.w("UpperBodyPose", message)
+        }
+
         faceTracker.onCameraChanged = { camera ->
             currentCamera = camera
             // 前置预览习惯性镜像，后置 / 外接相机保持真实方向
             cameraPreviewView?.mirrorHorizontal = camera?.isFrontFacing ?: true
+            // 上半身：检测器按「镜像后的像素」推理，产出的 x/y 才和预览方向一致（契约 §3.2）
+            upperBody.mirrorHorizontal = camera?.isFrontFacing ?: true
+            // 相机几何 / FOV 变了，躯干的中性基线跟着重取
+            upperBody.resetBaseline()
+            // 管线内部重启（切摄像头 / 切后端 / 改并行度）时 stop() 会清掉 tap，这里按开关补挂
+            if (upperBodyEnabled.value) {
+                onAttachBodyTap(true)
+            }
         }
 
         // 摄像头列表 + 初始选中项（用于在 Start 之前就显示正确的标签/镜像）
         availableCameras = faceTracker.getAvailableCameras()
         currentCamera = faceTracker.getCurrentCamera()
-            ?: availableCameras.firstOrNull { it.id == faceTracker.getPreferredCameraId() }
+            ?: availableCameras.firstOrNull { it.key == faceTracker.getPreferredCameraId() }
             ?: availableCameras.firstOrNull { it.isFrontFacing }
             ?: availableCameras.firstOrNull()
+
+        // 第一帧之前就把镜像方向同步给上半身
+        upperBody.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
     }
 
     // 相机预览帧门控：本 app 只有相机预览一个画面，进前台常开、离开时关掉，
@@ -342,6 +493,58 @@ fun FaceCaptureScreen(
     val tracking: Boolean = isTracking.value
     LaunchedEffect(tracking) {
         trackingOutput.setTrackingActive(tracking)
+    }
+
+    /**
+     * 「上半身: 开/关」按钮（控制面板）。
+     *
+     * 开启：初始化模型（后台线程，几百毫秒）→ 通知网络层 → 挂相机抽帧 tap → 启动检测器。
+     * 关闭：先摘 tap（相机线程立刻不再调用）→ 通知网络层 → 停检测器 → 清预览骨架。
+     *
+     * 模型缺失时只提示中文指引、不改变开关状态；面捕没在跑时只保留开关 + tap，
+     * 等「开始面捕」时再真正 start()（见 onToggleTracking）。
+     */
+    val onToggleUpperBody: () -> Unit = {
+        if (!upperBodyBusy) {
+            if (upperBodyEnabled.value) {
+                // ---- 关闭 ----
+                upperBodyBusy = true
+                upperBodyEnabled.value = false
+                onAttachBodyTap(false)
+                trackingOutput.setUpperBodyEnabled(false)
+                cameraPreviewView?.updateUpperBody(null)
+                upperBodyMessage = ""
+                scope.launch {
+                    withContext(Dispatchers.Default) { upperBody.stop() }
+                    upperBodyBusy = false
+                }
+            } else {
+                // ---- 开启 ----
+                upperBodyBusy = true
+                scope.launch {
+                    val ready = withContext(Dispatchers.Default) { upperBody.initialize() }
+                    if (!ready) {
+                        // onStatus 通常已经给了原因（模型缺失 / 初始化失败），这里兜底
+                        if (upperBodyMessage.isEmpty()) {
+                            upperBodyMessage = "上半身不可用：未找到 " +
+                                UpperBodyPoseController.MODEL_LITE +
+                                "，请运行 tools/fetch-pose-model.ps1 下载模型后重试"
+                        }
+                        upperBodyEnabled.value = false
+                        upperBodyBusy = false
+                        return@launch
+                    }
+                    upperBodyEnabled.value = true
+                    trackingOutput.setUpperBodyEnabled(true)
+                    if (isTracking.value && faceTracker.isTracking()) {
+                        onAttachBodyTap(true)
+                        withContext(Dispatchers.Default) { upperBody.start() }
+                    }
+                    upperBodyMessage = ""
+                    upperBodyBusy = false
+                }
+            }
+        }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -393,25 +596,25 @@ fun FaceCaptureScreen(
         if (showCameraSelectorDialog) {
             CameraSelectorDialog(
                 cameras = availableCameras,
-                currentCameraId = currentCamera?.id ?: faceTracker.getPreferredCameraId(),
+                currentCameraKey = currentCamera?.key ?: faceTracker.getPreferredCameraId(),
                 onCameraSelected = { camera ->
                     showCameraSelectorDialog = false
                     scope.launch {
-                        val switched = faceTracker.switchCamera(camera.id)
+                        val switched = faceTracker.switchCamera(camera.key)
                         if (switched) {
                             currentCamera = camera
                             context.getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
                                 .edit()
-                                .putString(KEY_PREFERRED_CAMERA_ID, camera.id)
+                                .putString(KEY_PREFERRED_CAMERA_ID, camera.key)
                                 .apply()
                             // 相机几何 / FOV 变了，重做基线校准，避免姿态与表情残留旧基线
                             faceTracker.resetAdaptiveBaseline()
                             Log.i(
                                 "FaceCapturePipeline",
-                                "Camera switched to " + camera.label + " (" + camera.id + ")"
+                                "Camera switched to " + camera.label + " (key=" + camera.key + ")"
                             )
                         } else {
-                            Log.e("FaceCapturePipeline", "Failed to switch camera to " + camera.id)
+                            Log.e("FaceCapturePipeline", "Failed to switch camera to " + camera.key)
                             availableCameras = faceTracker.getAvailableCameras()
                         }
                     }
@@ -479,6 +682,10 @@ fun FaceCaptureScreen(
                     backendSwitching = backendSwitching,
                     gpuChannels = gpuChannels,
                     gpuActiveChannels = gpuActiveChannels,
+                    upperBodyEnabled = upperBodyEnabled.value,
+                    upperBodyBusy = upperBodyBusy,
+                    upperBodyMessage = upperBodyMessage,
+                    maxHeight = controlPanelMaxHeight,
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
@@ -486,6 +693,12 @@ fun FaceCaptureScreen(
                                 faceTracker.stop()
                                 isTracking.value = false
                                 trackingOutput.setTrackingActive(false)
+                                // 面捕停了就没有 YUV 帧源：摘 tap + 停上半身（开关状态保留）
+                                if (upperBodyEnabled.value) {
+                                    onAttachBodyTap(false)
+                                    withContext(Dispatchers.Default) { upperBody.stop() }
+                                    cameraPreviewView?.updateUpperBody(null)
+                                }
                             } else {
                                 Log.i("FaceCapturePipeline", "Starting face tracking...")
                                 faceTracker.start()
@@ -494,12 +707,19 @@ fun FaceCaptureScreen(
                                 // 实际生效几路要等 start() 之后才知道
                                 gpuChannels = faceTracker.getGpuChannelCount()
                                 gpuActiveChannels = faceTracker.getActiveChannelCount()
+                                // 上半身开关开着 → 跟着面捕一起恢复采集
+                                if (upperBodyEnabled.value) {
+                                    onAttachBodyTap(true)
+                                    withContext(Dispatchers.Default) { upperBody.start() }
+                                }
                             }
                         }
                     },
                     onResetBaseline = {
                         Log.i("FaceCapturePipeline", "Resetting adaptive baseline...")
                         faceTracker.resetAdaptiveBaseline()
+                        // 上半身的躯干基线一起重取
+                        upperBody.resetBaseline()
                     },
                     onToggleDebug = {
                         showDebug = !showDebug
@@ -561,6 +781,7 @@ fun FaceCaptureScreen(
                             }
                         }
                     },
+                    onToggleUpperBody = onToggleUpperBody,
                     onToggleGpuChannels = {
                         // 并行度变化要在 start() 里拉起/收起推理线程，属于管线重启，
                         // 和切后端一样放 IO 线程，避免主线程卡顿。
@@ -614,6 +835,12 @@ private fun DebugOverlayHost(
         trackingClients = trackingClients,
         blendShapes = value.blendShapes,
         headPose = value.headPose,
+        bodyState = value.bodyState,
+        bodyFps = value.bodyFps,
+        bodyPoints = value.bodyPoints,
+        bodyQuality = value.bodyQuality,
+        bodyRoll = value.bodyRoll,
+        bodyYaw = value.bodyYaw,
         modifier = modifier,
         faceTracker = faceTracker
     )
@@ -628,6 +855,12 @@ fun DebugOverlay(
     trackingClients: Int,
     blendShapes: ARKitBlendShapes?,
     headPose: HeadPoseData,
+    bodyState: String = "关",
+    bodyFps: Float = 0f,
+    bodyPoints: Int = 0,
+    bodyQuality: Float = 0f,
+    bodyRoll: Float = 0f,
+    bodyYaw: Float = 0f,
     modifier: Modifier = Modifier,
     faceTracker: PipelineFaceTracker
 ) {
@@ -734,6 +967,28 @@ fun DebugOverlay(
                     color = Color.Blue
                 )
             }
+
+            // 上半身（可选功能）：状态 / body fps / 有效点数 / 质量 / 相对躯干角。
+            // 数据来自 DebugSnapshotBatcher（≤10Hz），不会每帧重组。
+            HorizontalDivider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
+
+            Text(
+                text = "上半身: " + bodyState + " · body %.1f fps".format(bodyFps),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (bodyState == "运行中") Color(0xFF00E5FF) else Color.Gray
+            )
+
+            Text(
+                text = "点数 %d/13 · 质量 %.2f".format(bodyPoints, bodyQuality),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White
+            )
+
+            Text(
+                text = "躯干: roll %+.1f° · yaw %+.1f°".format(bodyRoll, bodyYaw),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White
+            )
 
             blendShapes?.let { bs ->
                 HorizontalDivider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
@@ -911,6 +1166,10 @@ fun ControlPanel(
     backendSwitching: Boolean,
     gpuChannels: Int,
     gpuActiveChannels: Int,
+    upperBodyEnabled: Boolean,
+    upperBodyBusy: Boolean,
+    upperBodyMessage: String,
+    maxHeight: Dp = 380.dp,
     onToggleTracking: () -> Unit,
     onResetBaseline: () -> Unit,
     onToggleDebug: () -> Unit,
@@ -922,6 +1181,7 @@ fun ControlPanel(
     onToggleDetectionBox: () -> Unit,
     onToggleMnnBackend: () -> Unit,
     onToggleGpuChannels: () -> Unit,
+    onToggleUpperBody: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -940,7 +1200,7 @@ fun ControlPanel(
         Column(
             modifier = Modifier
                 .padding(16.dp)
-                .heightIn(max = 380.dp)
+                .heightIn(max = maxHeight)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1134,6 +1394,37 @@ fun ControlPanel(
                 )
             }
 
+            // 上半身关键点（MediaPipe Pose）：与面捕完全解耦的可选功能，默认关。
+            // 打开后才挂相机 YUV 抽头（66ms ≈ 15fps）并加载 pose_landmarker_lite.task。
+            Button(
+                onClick = onToggleUpperBody,
+                enabled = !upperBodyBusy,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (upperBodyEnabled) Color(0xFF00BCD4)
+                    else MaterialTheme.colorScheme.secondary
+                )
+            ) {
+                Text(
+                    text = when {
+                        upperBodyBusy -> "上半身: 启动中..."
+                        upperBodyEnabled -> "上半身: 开 (点击关闭)"
+                        else -> "上半身: 关 (点击开启)"
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            // 模型缺失 / 初始化失败 / GPU 回退 CPU 等提示（中文，显示在按钮下方）
+            if (upperBodyMessage.isNotEmpty()) {
+                Text(
+                    text = upperBodyMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
             // 眨眼速度滑块（仅在 Blink Curve 启用时显示）
             if (blinkCurveEnabled) {
                 Column {
@@ -1185,10 +1476,13 @@ fun ControlPanel(
 @Composable
 fun CameraSelectorDialog(
     cameras: List<CameraDeviceInfo>,
-    currentCameraId: String?,
+    currentCameraKey: String?,
     onCameraSelected: (CameraDeviceInfo) -> Unit,
     onDismiss: () -> Unit
 ) {
+    // 横屏时屏幕高度只有 300dp 出头，固定 320dp 的列表会把按钮顶出屏幕
+    val maxListHeight = (LocalConfiguration.current.screenHeightDp.dp * 0.5f)
+        .coerceAtLeast(120.dp)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择摄像头") },
@@ -1200,7 +1494,7 @@ fun CameraSelectorDialog(
                     color = MaterialTheme.colorScheme.error
                 )
             } else {
-                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                LazyColumn(modifier = Modifier.heightIn(max = maxListHeight)) {
                     items(cameras) { camera ->
                         Row(
                             modifier = Modifier
@@ -1210,7 +1504,7 @@ fun CameraSelectorDialog(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             RadioButton(
-                                selected = camera.id == currentCameraId,
+                                selected = camera.key == currentCameraKey,
                                 onClick = { onCameraSelected(camera) }
                             )
                             Spacer(modifier = Modifier.width(8.dp))
@@ -1220,10 +1514,14 @@ fun CameraSelectorDialog(
                                     style = MaterialTheme.typography.bodyLarge
                                 )
                                 Text(
-                                    text = "ID " + camera.id + " · 传感器 " +
+                                    text = "ID " + camera.key + " · 传感器 " +
                                         camera.sensorOrientation + "° · FOV %.0f°".format(
                                         camera.verticalFovDegrees
-                                    ),
+                                    ) +
+                                        (camera.equivalentFocalLengthMm?.let {
+                                            " · 等效 %.0fmm".format(it)
+                                        } ?: "") +
+                                        (if (camera.isPhysical) " · 物理流" else ""),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = Color.Gray
                                 )

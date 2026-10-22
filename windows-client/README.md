@@ -29,7 +29,7 @@ windows-client/
 │  ├─ live2d.js               # Live2DStage：加载模型、逐帧写参数、渲染
 │  ├─ interp.js               # 低输入帧率插值：输入帧时间轴（纯函数，可被 Node 直接 import）
 │  ├─ calibrate.js            # 本地姿态校准：offset 叠加 / 一键采样 / 持久化（纯函数，可单测）
-│  ├─ mapping.js              # 纯函数映射层（可被 Node 直接 import）
+│  ├─ mapping.js              # 纯函数映射层：面部 / 头部 / 上半身（可被 Node 直接 import）
 │  ├─ style.css
 │  └─ vendor/                 # 已提交的浏览器构建：cubism core / pixi / pixi-live2d-display(cubism4)
 ├─ models/                    # ATRI / sensei / Yuuka / zzzz（已就绪）
@@ -37,8 +37,9 @@ windows-client/
    ├─ start-electron.js       # npm start 入口
    ├─ web-launch.js           # npm run web：不用 Electron，用 Edge/Chrome --app 开窗
    ├─ mock-tracker.js         # 模拟手机端（零依赖 WS 服务端 + 60Hz 合成数据）
+   ├─ mock-body.js            # mock 的上半身合成：13 关键点 + 躯干角（纯函数，可单测）
    ├─ vendor-assets.js        # 从 node_modules 复制浏览器构建到 renderer/vendor
-   ├─ selftest.js             # 映射数值 + 低/抖动输入插值 + 模型发现 + 静态路由的自检
+   ├─ selftest.js             # 映射（面部/头部/上半身）+ 低/抖动输入插值 + 模型发现 + 静态路由的自检
    ├─ package-windows.js      # npm run package：组装免安装便携版（Electron 运行时 + 代码 + 模型）
    ├─ shot.js                 # 可选：系统 Chrome headless 截图（原始 CDP，不装 puppeteer）
    └─ evals/                  # 截图时注入的状态脚本（自测用）
@@ -73,7 +74,7 @@ npm i
 | `npm start` | Electron 桌面窗口（透明/无边框/置顶/鼠标穿透都可用） |
 | `npm run web` | 不用 Electron：起本地服务 + Edge/Chrome `--app` 窗口（找不到浏览器则只起服务） |
 | `npm run serve` | 只起静态服务：<http://127.0.0.1:17890/>，用任意浏览器打开 |
-| `npm run mock` | 模拟手机端：`ws://127.0.0.1:8765/ws`，60Hz 推合成数据（`--hz` / `--jitter` 可调） |
+| `npm run mock` | 模拟手机端：`ws://127.0.0.1:8765/ws`，60Hz 推合成数据（`--hz` / `--jitter` 可调；默认带上半身关键点，`--no-upper-body` 关闭） |
 | `npm run selftest` | 一条命令的自检（映射数值 / 模型发现 / 静态路由） |
 | `npm run package` | 组装免安装便携版：`dist/windows/VFC-Live2D-win32-x64/`（见下文「打包」） |
 | `npm run shot -- --url ... --out ...` | 可选，自测截图；用**系统 Chrome**，不需要 puppeteer |
@@ -95,7 +96,7 @@ npm i
    ```
 
    支持 `?ws=`、`?model=`（大小写不敏感，默认 ATRI）、`?transparent=1`（纯浏览器下模拟透明底）、
-   `?fps=<n>`（渲染目标帧率，默认 60，`0` = 不限制）。
+   `?fps=<n>`（渲染目标帧率，默认 60，`0` = 不限制）、`?skeleton=1`（直接显示上半身调试骨架）。
 
 状态条会显示 已连接 / 重连中 / 未连接、设备名、输入 fps、渲染 fps、RTT、seq、丢旧帧数；
 连续 0.8s 收不到人脸（`face:false`）会显示「未检测到人脸」。
@@ -165,7 +166,7 @@ models/<名字>/<xxx>.model3.json     # 必须包含 moc3 / textures / physics3.
 服务启动时扫描 `models/*/*.model3.json`，面板下拉框/URL `?model=<目录名>` 均可切换。
 `GET /api/models` 返回发现结果。当前自带 4 个：ATRI / sensei / Yuuka / zzzz。
 
-映射的 10 个参数（协议 §8）：
+映射的 10 个头部参数（协议 §8）：
 
 | 参数 | 来源 |
 | --- | --- |
@@ -178,8 +179,54 @@ models/<名字>/<xxx>.model3.json     # 必须包含 moc3 / textures / physics3.
 
 头部姿态用**自适应归一化**（协议 §8.2）：按当前会话观察到的最大幅度动态缩放，
 首帧不会打满。模型缺少的参数不会报错（`__vfcDebug.missingParams` 可查）。
+上半身（躯干 + 手臂）的 5 个可选参数见下一节，同样「模型没有就跳过」。
 注意 Cubism 会按模型自身的参数范围 clamp（例如 ATRI 的 `ParamMouthForm` 范围是 `[-1,0]`），
 所以「下发的目标值」与「引擎最终值」可能不同——调试面板里两个都显示。
+
+## 上半身关键点（躯干 / 手臂，协议 §4.2 / §5.3）
+
+手机端打开「上半身关键点」开关后，`track` 会多带 4 个**可选**字段：
+
+- `ubOk`：这一帧有没有上半身结果；
+- `ub`：13 个关键点 × `(x, y, z, visibility)`，固定 52 个数，镜像归一化坐标
+  （顺序：鼻、左/右眼、左/右耳、左/右肩、左/右肘、左/右腕、左/右髋）；
+- `ubT`：这批关键点的采集时间戳（手机时钟）；
+- `body: [roll, yaw]`：躯干相对相机的旋转角（度）。
+
+老手机 / 关掉开关时这几个字段**完全不存在**，客户端行为与以前一模一样（不会凭空造手臂姿势）。
+
+PC 端自动消费，不需要任何开关：
+
+| Cubism 参数 | 来源 |
+| --- | --- |
+| ParamBodyAngleZ | `clamp(roll * 0.5, ±30)`（躯干左右侧倾） |
+| ParamBodyAngleY | `clamp(-roll * 0.2, ±30)`（侧倾时轻微扭转） |
+| ParamBodyAngleX | `clamp(-yaw * 0.3, ±30)`，**与头部的 `-yaw*10` 相加后统一 clamp**，不覆盖头部 |
+| ParamArmLA / ParamArmRA | `clamp(肩→腕与竖直向下的夹角 / 150°, 0, 1) * 30`（左/右独立） |
+
+- **丢失时不跳变**：`ubOk=false`、字段缺失，或 `ubT` 超过 **1.5 s** 没有新值 → 参数按帧向 0
+  衰减（每帧 ×0.85，约 0.3 s 回到模型默认），然后把控制权交还给 idle motion / breath。
+- **15 fps 也不会一跳一跳**：Pose 只有 ~15 fps，上半身参数在写进模型前还会按 **0.16 s 一阶低通**
+  再平滑一次（协议 §8.5 的建议值）；截图 / 单步调试模式（`renderNow`）直接落位，保证确定性。
+- **该侧看不见就不动**：肩 / 肘 / 腕三个点的 visibility 最小值 < 0.3 时，那一侧的手臂参数
+  直接不下发（保持自然状态），避免抬手时另一只手抽风。
+- **模型降级（重要）**：自带 4 个模型（ATRI / sensei / Yuuka / zzzz）**只有**
+  `ParamBodyAngleX/Y/Z` + `ParamBreath`，**没有** `ParamArmLA/RA`（也没有
+  `ParamShoulderL/R`、`ParamHandL/R`）。所以现在能看到**躯干跟着侧倾 / 转身**，
+  但**手臂不会动**——这是模型缺参数，不是数据没到。`Live2DStage` 用
+  `coreModel.getParameterIndex(id) >= 0` 判断，模型没有的参数一律跳过（不算错误），
+  `__vfcDebug.body.support` 能看每个 id 的支持情况。想验证手臂链路：换一个带
+  `ParamArmLA/RA` 的模型（Cubism 4 标准参数的模型，例如 Live2D 官方 Haru / Hiyori），
+  或临时给模型加这两个参数。
+- **调试骨架**：按 `D` 打开调试面板（或 URL 加 `?skeleton=1`），画布右下角出现 13 点 /
+  15 条边（与 `CommonData.UpperBodySkeleton.BONES` 一致）的骨架，直接画在归一化坐标上；
+  低可见度点灰显，`ubOk=false` 时整具骨架灰显并显示「无上半身数据」或「过期」。
+  调试面板新增「上半身 / ub age / torso r/y / arm L/R / 手臂参数 / BodyAngleX 头+身」。
+- **不开手机也能验证**：`npm run mock` 默认就带上半身数据（双手交替抬起，并且每 9 s 有
+  0.7 s 的「丢失窗口」，用来观察平滑回默认）；`--no-upper-body`（或 `MOCK_UPPER_BODY=0`）
+  回到旧行为，用于回归「没有任何上半身字段时参数完全不变」。
+  控制台也可以手动喂数据：`__vfc.applyUpperBody({ ub: [...52 个数], body: [roll, yaw], ubOk: true })`，
+  或 `__vfc.applyUpperBody({ ubOk: false })` 验证平滑回默认。
 
 ## 四个窗口开关
 
@@ -215,6 +262,10 @@ models/<名字>/<xxx>.model3.json     # 必须包含 moc3 / textures / physics3.
   「一键校准」保持坐姿 3 秒；还差一点就展开「手动微调姿态」拖滑块，直到模型正对镜头。
 - **眼睛不闭 / 某个参数没反应**：模型没有该参数。展开「调试参数」看 `missingParams`，
   或换 ATRI / zzzz 等参数齐全的模型。
+- **身体会侧倾但手臂不动**：自带 4 个模型都没有 `ParamArmLA/RA`，属预期降级（见上文
+  「上半身关键点」）；`__vfcDebug.body.support.ParamArmLA === false` 即为此情况。
+- **上半身数据过期 / 骨架灰了**：`__vfcDebug.body.ageMs` 超过 1500 ms。看手机端「上半身
+  关键点」开关是否开着、`hello.upperBody` 是否为 true（手机端上半身推理掉帧时 age 会持续涨）。
 - **透明窗口有黑底**：确认用 `npm start`（纯浏览器拿不到真实窗口透明），且页面已切到透明模式。
 
 ## 自测
@@ -223,10 +274,13 @@ models/<名字>/<xxx>.model3.json     # 必须包含 moc3 / textures / physics3.
 npm run selftest
 ```
 
-覆盖：协议 §8.1 的 eye/mouth/mouthForm/eyeBall 公式与 clamp、§8.2 自适应归一化首帧与收敛、
-本地姿态校准（offset 叠加 / 取反 / 截尾平均 / 持久化编解码 / 坏数据兜底）、
-reset 可复现性、apply(bs,pose) 与 apply(track) 等价、低输入帧率插值（30/15 fps 输入 + 60 fps 渲染
-时每帧步进均匀、延迟收敛、断流外推有上限）、4 个模型发现、静态服务路由（含路径穿越拒绝）。
+覆盖（当前 70 项）：协议 §8.1 的 eye/mouth/mouthForm/eyeBall 公式与 clamp、§8.2 自适应归一化
+首帧与收敛、本地姿态校准（offset 叠加 / 取反 / 截尾平均 / 持久化编解码 / 坏数据兜底）、
+reset 可复现性、apply(bs,pose) 与 apply(track) 等价、上半身（§4.2 / §5.3：13 点解析与长度校验、
+躯干 Z/X/Y 公式与 clamp、肩→腕抬臂角度、低可见度侧参数不输出、1.5 s 过期判定、
+丢失后 15%/帧回 0、头+身 `ParamBodyAngleX` 相加不覆盖、模型缺参数跳过、mock 合成数据合法性）、
+低输入帧率插值（30/15 fps 输入 + 60 fps 渲染时每帧步进均匀、延迟收敛、断流外推有上限）、
+4 个模型发现、静态服务路由（含路径穿越拒绝）。
 
 端到端渲染自测（可选，需要系统 Chrome）：
 

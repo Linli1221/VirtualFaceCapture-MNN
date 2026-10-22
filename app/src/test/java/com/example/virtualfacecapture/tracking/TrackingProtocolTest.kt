@@ -1,6 +1,10 @@
 package com.example.virtualfacecapture.tracking
 
 import com.example.commondata.ARKitBlendShapes
+import com.example.commondata.BodyPoint
+import com.example.commondata.TorsoAngles
+import com.example.commondata.UpperBodyLandmarkIndex
+import com.example.commondata.UpperBodyPoseFrame
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -16,6 +20,7 @@ import org.junit.Test
  *  2. track 报文能被 org.json 解析、字段齐全、小数位 <= 4、单帧 < 1KB
  *  3. hello / status / calib / pong / ack / bye 的 JSON 合法性
  *  4. 客户端上行 ping / command / 畸形 JSON 的分类（必须是 PING / RECALIBRATE / IGNORED，且不抛异常）
+ *  5. 上半身增量字段（hello.upperBody、track.ubOk/ub/ubT/body）的开关、边界与数值清洗
  */
 class TrackingProtocolTest {
 
@@ -395,5 +400,191 @@ class TrackingProtocolTest {
         // hello.version 不匹配时客户端仍应能读到 version（协议 §10）
         val hello = TrackingProtocol.buildHello(device = "d", app = "a")
         assertEquals(1L, TrackingProtocol.parseLongField(hello, "version"))
+    }
+
+    // --------------------------------------------- §4.1 / §4.2 上半身增量字段
+
+    /** 13 个点各不相同的样例帧，用来校验顺序 / 展平下标（协议 §5.3）。 */
+    private fun sampleUpperBody(timestampMs: Long = 1730000000100L): UpperBodyPoseFrame {
+        val points = List(UpperBodyLandmarkIndex.COUNT) { index ->
+            BodyPoint(
+                x = 0.1f + index * 0.05f,
+                y = 0.2f + index * 0.04f,
+                z = -0.01f * index,
+                visibility = 0.9f - index * 0.01f,
+            )
+        }
+        return UpperBodyPoseFrame(
+            points = points,
+            torso = TorsoAngles(roll = 2.5f, yaw = -4.25f),
+            tracking = true,
+            quality = 0.85f,
+            timestampMs = timestampMs,
+        )
+    }
+
+    private fun buildTrackWithUpperBody(
+        upperBody: UpperBodyPoseFrame?,
+        upperBodyOk: Boolean,
+    ): String = TrackingProtocol.buildTrack(
+        seq = 129L,
+        timestampMs = 1730000000200L,
+        bs = sampleShapes().toMediaPipeArray(),
+        pose = floatArrayOf(-3.5f, 8.25f, 0.4f),
+        face = true,
+        score = 0.9f,
+        fps = 60f,
+        calibrating = false,
+        upperBody = upperBody,
+        upperBodyOk = upperBodyOk,
+    )
+
+    @Test
+    fun trackJsonCarriesFullUpperBody() {
+        val json = JSONObject(buildTrackWithUpperBody(sampleUpperBody(), true))
+        assertTrue(json.getBoolean("ubOk"))
+        assertEquals(1730000000100L, json.getLong("ubT"))
+
+        val body = json.getJSONArray("body")
+        assertEquals(2, body.length())
+        assertEquals(2.5, body.getDouble(0), 1e-6)
+        assertEquals(-4.25, body.getDouble(1), 1e-6)
+
+        val ub = json.getJSONArray("ub")
+        assertEquals(52, ub.length())
+        // 第 0 点（鼻子）：x=0.1, y=0.2, z=0, visibility=0.9
+        assertEquals(0.1, ub.getDouble(0), 1e-6)
+        assertEquals(0.2, ub.getDouble(1), 1e-6)
+        assertEquals(0.0, ub.getDouble(2), 1e-6)
+        assertEquals(0.9, ub.getDouble(3), 1e-6)
+        // 第 5 点（左肩）：x=0.35, y=0.4, z=-0.05, visibility=0.85
+        val leftShoulder = UpperBodyLandmarkIndex.P_LEFT_SHOULDER * 4
+        assertEquals(0.35, ub.getDouble(leftShoulder), 1e-4)
+        assertEquals(0.4, ub.getDouble(leftShoulder + 1), 1e-4)
+        assertEquals(-0.05, ub.getDouble(leftShoulder + 2), 1e-6)
+        assertEquals(0.85, ub.getDouble(leftShoulder + 3), 1e-6)
+        // 第 12 点（右胯）：x=0.7, y=0.68, z=-0.12, visibility=0.78
+        val rightHip = UpperBodyLandmarkIndex.P_RIGHT_HIP * 4
+        assertEquals(0.7, ub.getDouble(rightHip), 1e-4)
+        assertEquals(0.68, ub.getDouble(rightHip + 1), 1e-4)
+        assertEquals(-0.12, ub.getDouble(rightHip + 2), 1e-6)
+        assertEquals(0.78, ub.getDouble(rightHip + 3), 1e-6)
+    }
+
+    @Test
+    fun upperBodyOkDefaultsFromFrameUsability() {
+        val json = JSONObject(
+            TrackingProtocol.buildTrack(
+                seq = 1L,
+                timestampMs = 2L,
+                bs = FloatArray(52),
+                pose = floatArrayOf(0f, 0f, 0f),
+                face = true,
+                score = 1f,
+                fps = 60f,
+                calibrating = false,
+                upperBody = sampleUpperBody(),
+            )
+        )
+        assertTrue(json.getBoolean("ubOk"))
+    }
+
+    @Test
+    fun trackJsonOmitsUpperBodyFieldsWhenDisabled() {
+        val json = JSONObject(sampleTrackJson())
+        assertFalse("未开启上半身时不应出现 ubOk", json.has("ubOk"))
+        assertFalse("未开启上半身时不应出现 ub", json.has("ub"))
+        assertFalse("未开启上半身时不应出现 ubT", json.has("ubT"))
+        assertFalse("未开启上半身时不应出现 body", json.has("body"))
+    }
+
+    @Test
+    fun noUpperBodyResultKeepsStableZeroStructure() {
+        val json = JSONObject(buildTrackWithUpperBody(sampleUpperBody(), false))
+        assertFalse(json.getBoolean("ubOk"))
+        // ubT 保留最后一次采集时间，供客户端判重 / 判断陈旧程度
+        assertEquals(1730000000100L, json.getLong("ubT"))
+
+        val ub = json.getJSONArray("ub")
+        assertEquals(52, ub.length())
+        for (index in 0 until 52) {
+            assertEquals("ubOk=false 时 ub 必须全 0（下标 " + index + "）", 0.0, ub.getDouble(index), 0.0)
+        }
+
+        val body = json.getJSONArray("body")
+        assertEquals(2, body.length())
+        assertEquals(0.0, body.getDouble(0), 0.0)
+        assertEquals(0.0, body.getDouble(1), 0.0)
+
+        // 调用方即使误传 upperBodyOk=true，帧本身 tracking=false 时也必须发 ubOk=false
+        val notTracking = sampleUpperBody().copy(tracking = false)
+        assertFalse(JSONObject(buildTrackWithUpperBody(notTracking, true)).getBoolean("ubOk"))
+    }
+
+    @Test
+    fun upperBodyValuesAreSanitizedAndClamped() {
+        val points = MutableList(UpperBodyLandmarkIndex.COUNT) {
+            BodyPoint(Float.NaN, Float.POSITIVE_INFINITY, 99f, -1f)
+        }
+        points[1] = BodyPoint(-1f, 2f, -99f, 2f)
+        val frame = UpperBodyPoseFrame(
+            points = points,
+            torso = TorsoAngles(Float.NaN, Float.POSITIVE_INFINITY),
+            tracking = true,
+            quality = 1f,
+            timestampMs = 100L,
+        )
+        val raw = buildTrackWithUpperBody(frame, true)
+        assertFalse("NaN 不能写进 JSON", raw.contains("NaN"))
+        assertFalse("Infinity 不能写进 JSON", raw.contains("Infinity"))
+
+        val json = JSONObject(raw)
+        val ub = json.getJSONArray("ub")
+        assertEquals(52, ub.length())
+        // 第 0 点：NaN / Inf 写 0；z 截到 5；visibility 截到 0
+        assertEquals(0.0, ub.getDouble(0), 0.0)
+        assertEquals(0.0, ub.getDouble(1), 0.0)
+        assertEquals(5.0, ub.getDouble(2), 0.0)
+        assertEquals(0.0, ub.getDouble(3), 0.0)
+        // 第 1 点：x / y 截到 [0,1]，z 截到 -5，visibility 截到 1
+        assertEquals(0.0, ub.getDouble(4), 0.0)
+        assertEquals(1.0, ub.getDouble(5), 0.0)
+        assertEquals(-5.0, ub.getDouble(6), 0.0)
+        assertEquals(1.0, ub.getDouble(7), 0.0)
+
+        val body = json.getJSONArray("body")
+        assertEquals(0.0, body.getDouble(0), 0.0)
+        assertEquals(0.0, body.getDouble(1), 0.0)
+    }
+
+    @Test
+    fun helloAdvertisesUpperBodyOnlyWhenEnabled() {
+        val enabled = JSONObject(
+            TrackingProtocol.buildHello(device = "Pixel 8 Pro", app = "app", upperBody = true)
+        )
+        assertTrue(enabled.getBoolean("upperBody"))
+
+        val disabled = JSONObject(
+            TrackingProtocol.buildHello(device = "Pixel 8 Pro", app = "app")
+        )
+        assertFalse("关闭上半身时 hello 不应带 upperBody 字段", disabled.has("upperBody"))
+    }
+
+    @Test
+    fun upperBodyBodyAnglesUseAtMostFourDecimals() {
+        val frame = sampleUpperBody().copy(torso = TorsoAngles(roll = 12.34567f, yaw = -0.00004f))
+        val raw = buildTrackWithUpperBody(frame, true)
+        assertTrue("body 应保留 4 位小数并去掉尾随 0，实际: " + raw, raw.contains("\"body\":[12.3457,0]"))
+
+        val body = JSONObject(raw).getJSONArray("body")
+        assertEquals(12.3457, body.getDouble(0), 1e-9)
+        assertEquals(0.0, body.getDouble(1), 0.0)
+        assertTrue("上半身报文小数位也必须 <= 4", maxFractionDigits(raw) <= 4)
+    }
+
+    @Test
+    fun trackWithUpperBodyFitsOnePointTwoKilobytes() {
+        val bytes = buildTrackWithUpperBody(sampleUpperBody(), true).toByteArray(Charsets.UTF_8)
+        assertTrue("开启上半身后单帧应 < 1.2KB，实际 " + bytes.size, bytes.size < 1229)
     }
 }
