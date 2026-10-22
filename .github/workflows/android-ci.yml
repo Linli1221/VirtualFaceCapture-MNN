@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ThirdParty/MNN 子模块只用到头文件（include/），
       # 用 sparse + partial clone 只拉取 include，避免整仓下载
@@ -51,7 +51,7 @@ jobs:
           test -d ThirdParty/MNN/include/MNN
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -71,7 +71,7 @@ jobs:
             "cmake;3.18.1"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # versionCode = run_number（单调递增，可直接覆盖安装旧包）
       # versionName = 1.0.<run_number>+<commit>（区分每次修改的产物）
@@ -95,12 +95,13 @@ jobs:
           ls -lh dist
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VirtualFaceCapture-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0   # APK/AAR 本身已压缩
 
   release:
     name: Publish GitHub Release
@@ -111,7 +112,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: VirtualFaceCapture-${{ github.sha }}
           path: dist
