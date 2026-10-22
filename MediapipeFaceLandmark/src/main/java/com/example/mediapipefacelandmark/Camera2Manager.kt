@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.hardware.camera2.*
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -89,8 +90,8 @@ class Camera2Manager(private val context: Context) {
     /**
      * Enable RGB preview callback even in YUV mode (for debug visualization).
      *
-     * 每帧生成一帧 RGB 预览意味着相机线程上要多做一次整帧 YUV→RGB（480x480 级别
-     * 约 0.7MB/帧、数十万次像素运算）。调试预览默认关闭时这项开销纯属浪费，直接
+     * 每帧生成一帧 RGB 预览意味着相机线程上要多做一次整帧 YUV→RGB（720p 级别
+     * 约 2.7MB/帧、上百万次像素运算）。调试预览默认关闭时这项开销纯属浪费，直接
      * 拖慢相机线程（进而压缩实际采集帧率），所以改由上层按需开关，并且 volatile
      * 保证相机线程能立刻看到变化。
      */
@@ -126,30 +127,37 @@ class Camera2Manager(private val context: Context) {
 
     companion object {
         private const val TAG = "Camera2Manager"
-        
-        // Model input dimensions for reference
-        // - Face Detection: 128x128
-        // - Face Landmarks: 192x192 or 256x256
-        private const val MODEL_INPUT_SIZE = 256
-        
-        // Target resolution constraints
-        private const val MIN_SIZE = 192       // Minimum dimension to ensure quality
-        private const val MAX_SIZE = 640       // Maximum dimension to limit computation
-        private const val IDEAL_SIZE = 480     // Ideal dimension for balance
 
         /**
-         * 整帧像素硬上限（640x480）。
+         * 采集目标：1280x720（720p）@ 60 fps。
          *
-         * 人脸检测只用 128/192 的输入、landmark 只用 192 的 ROI，整帧再大也只是让
-         * YUV 旋转/缩放/裁剪多做无用功，而且大尺寸的 YUV 输出往往拿不到 60fps。
+         * 720p 是「清晰度」和「喂得动 60fps」之间的平衡点：预览 / 关键点 ROI 的
+         * 源分辨率从 480 级升到 720p（远景、小脸更稳），像素量约 92 万，主流
+         * sensor 在 720p 下仍能出 60fps。
          */
-        private const val MAX_PIXEL_COUNT = 640 * 480
+        private const val TARGET_WIDTH = 1280
+        private const val TARGET_HEIGHT = 720
 
-        /** 面捕管线的目标帧率（用于钉住 SENSOR_FRAME_DURATION）。 */
-        private const val PINNED_FPS = 60
-        
-        // Aspect ratio preference (1.0 = perfect square)
-        private const val MAX_ASPECT_RATIO = 1.5f  // Allow up to 3:2 ratio
+        /** 面捕管线的目标帧率（用于挑 AE 区间、钉住 SENSOR_FRAME_DURATION）。 */
+        private const val TARGET_FPS = 60
+
+        /** 判断「这个尺寸能不能跑满目标帧率」时的容差（实测 59.94fps 也算 60fps）。 */
+        private const val FPS_TOLERANCE = 1.0f
+
+        // Target resolution constraints
+        private const val MIN_SIZE = 192       // Minimum dimension to ensure quality
+
+        /**
+         * 整帧像素硬上限（720p）。
+         *
+         * 720p 是采集目标，同时把 1080p 这类「更大但更难喂满 60fps」的尺寸挡在
+         * 外面：大尺寸 YUV 的打包 / 旋转 / 缩放开销翻倍，对 128~256 输入的人脸
+         * 检测没有收益。
+         */
+        private const val MAX_PIXEL_COUNT = TARGET_WIDTH * TARGET_HEIGHT
+
+        /** 目标宽高比（16:9），没有 720p 时用于同族尺寸的次级排序。 */
+        private val TARGET_ASPECT = TARGET_WIDTH.toFloat() / TARGET_HEIGHT
     }
     
     /**
@@ -286,7 +294,11 @@ class Camera2Manager(private val context: Context) {
         appliedFrameDurationNs = 0L
         appliedExposureNs = 0L
         appliedFpsRange = null
+        activeFpsRange = null
         lastCaptureResultKey = null
+        // 上一轮若因 HAL 拒绝 SENSOR_FRAME_DURATION 关了钉帧率，重开时重新尝试，
+        // 否则一次回退会让之后每次采集都停在 30fps。
+        pinFrameRate = true
 
         openCamera()
     }
@@ -353,12 +365,13 @@ class Camera2Manager(private val context: Context) {
 
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-            // Choose optimal preview size for this camera
-            val previewSize = chooseOptimalSize(
-                map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+            // Choose capture size: 720p @ 60fps when the camera can do it.
+            val previewSize = chooseCaptureSize(
+                map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray(),
+                map,
             )
 
-            Log.i(TAG, "Selected preview size: ${previewSize.width}x${previewSize.height}")
+            Log.i(TAG, "Selected capture size: ${previewSize.width}x${previewSize.height}")
 
             // Create ImageReader for frame capture.
             // 3 个 buffer：处理端偶尔慢一拍时相机可以继续出帧，配合
@@ -449,116 +462,123 @@ class Camera2Manager(private val context: Context) {
     }
 
     /**
-     * Choose optimal camera resolution for face detection
-     * 
-     * Selection criteria (in order of priority):
-     * 1. Aspect ratio close to 1:1 (square-like)
-     * 2. Size close to model input dimension (256x256)
-     * 3. Not too large (avoid wasting computation)
-     * 4. Not too small (ensure detection quality)
+     * 选采集尺寸：优先 720p（1280x720），其次「720p 以内能跑满 60fps 的最大尺寸」。
+     *
+     * Camera2 只允许从设备上报的尺寸里选，所以这里不是「想要什么就是什么」，
+     * 而是按下面的顺序挑最接近目标的那个：
+     *
+     *  1. 设备报了 1280x720（或竖屏的 720x1280）→ 直接用。如果该尺寸的
+     *     `minFrameDuration` 说明它跑不满 60fps，打警告（仍然保留 720p）；
+     *  2. 没有 720p → 在 720p 以内、且 [StreamConfigurationMap.getOutputMinFrameDuration]
+     *     证明能跑满 60fps 的尺寸里取最大的（先保证 60fps，再尽量清晰）；
+     *  3. 整台相机都没有 60fps 尺寸 → 取 720p 以内最大的尺寸，并警告实际帧率。
+     *
+     * 为什么用 `getOutputMinFrameDuration` 而不是只看
+     * `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`：后者只说明 sensor 能跑多快，
+     * 不保证 720p 这种大尺寸的带宽也能跑满 60fps。
      */
-    private fun chooseOptimalSize(choices: Array<Size>): Size {
+    private fun chooseCaptureSize(
+        choices: Array<Size>,
+        map: StreamConfigurationMap?,
+    ): Size {
         if (choices.isEmpty()) {
-            Log.w(TAG, "No available sizes, using default 640x480")
-            return Size(640, 480)
+            Log.w(TAG, "No available sizes, using default ${TARGET_WIDTH}x${TARGET_HEIGHT}")
+            return Size(TARGET_WIDTH, TARGET_HEIGHT)
         }
-        
-        Log.d(TAG, "Available camera resolutions:")
-        choices.forEach { size ->
-            val aspectRatio = size.width.toFloat() / size.height.toFloat()
-            Log.d(TAG, "  ${size.width}x${size.height} (aspect: %.2f)".format(aspectRatio))
-        }
-        
-        // Filter and score each resolution
-        data class ScoredSize(val size: Size, val score: Float, val details: String)
-        
-        val scoredSizes = choices.mapNotNull { size ->
-            val width = size.width
-            val height = size.height
-            val minDim = minOf(width, height)
-            val maxDim = maxOf(width, height)
-            
-            // Skip sizes that are too small or too large
-            if (minDim < MIN_SIZE || maxDim > MAX_SIZE * 2) {
-                return@mapNotNull null
-            }
 
-            // 整帧像素硬上限：大尺寸只会拖慢预处理且通常拿不到 60fps
-            if (width * height > MAX_PIXEL_COUNT) {
-                return@mapNotNull null
-            }
-            
-            // Calculate aspect ratio (always >= 1.0)
-            val aspectRatio = maxDim.toFloat() / minDim.toFloat()
-            
-            // Skip sizes with extreme aspect ratios
-            if (aspectRatio > MAX_ASPECT_RATIO * 1.5f) {
-                return@mapNotNull null
-            }
-            
-            // Score calculation (lower is better)
-            var score = 0f
-            val details = StringBuilder()
-            
-            // 1. Aspect ratio penalty (prefer square)
-            // Perfect square = 0 penalty, 4:3 = small penalty, 16:9 = large penalty
-            val aspectPenalty = (aspectRatio - 1.0f) * 100f
-            score += aspectPenalty
-            details.append("aspect:%.1f ".format(aspectPenalty))
-            
-            // 2. Size difference from ideal
-            // Prefer sizes where the smaller dimension is close to IDEAL_SIZE
-            val sizeDiff = kotlin.math.abs(minDim - IDEAL_SIZE).toFloat()
-            val sizePenalty = sizeDiff * 0.5f
-            score += sizePenalty
-            details.append("size:%.1f ".format(sizePenalty))
-            
-            // 3. Bonus for resolutions that divide evenly into model input
-            // This can help with preprocessing efficiency
-            val modelFit = if (minDim % MODEL_INPUT_SIZE == 0 || MODEL_INPUT_SIZE % minDim == 0) {
-                -20f  // Bonus
-            } else {
-                0f
-            }
-            score += modelFit
-            if (modelFit < 0) details.append("modelFit:bonus ")
-            
-            // 4. Slight preference for common resolutions (often better optimized)
-            val commonBonus = when {
-                (width == 480 && height == 480) -> -30f  // Perfect square!
-                (width == 640 && height == 480) || (width == 480 && height == 640) -> -10f
-                (width == 320 && height == 240) || (width == 240 && height == 320) -> -5f
-                else -> 0f
-            }
-            score += commonBonus
-            if (commonBonus < 0) details.append("common:bonus ")
-            
-            ScoredSize(size, score, details.toString())
+        Log.d(TAG, "Available YUV sizes (max fps from per-size frame duration):")
+        choices.sortedByDescending { it.width * it.height }.forEach { size ->
+            val maxFps = maxFpsForSize(map, size)
+            Log.d(
+                TAG,
+                "  ${size.width}x${size.height} (aspect: %.2f, max: %s)".format(
+                    aspectRatioOf(size),
+                    maxFps?.let { "%.0f fps".format(it) } ?: "unknown",
+                ),
+            )
         }
-        
-        if (scoredSizes.isEmpty()) {
-            // Fallback: just pick the smallest resolution that's >= MIN_SIZE
+
+        // 只考虑 720p 以内、且不小于模型输入级别的尺寸
+        val candidates = choices.filter { size ->
+            minOf(size.width, size.height) >= MIN_SIZE &&
+                size.width * size.height <= MAX_PIXEL_COUNT
+        }
+        if (candidates.isEmpty()) {
             val fallback = choices
                 .filter { minOf(it.width, it.height) >= MIN_SIZE }
                 .minByOrNull { it.width * it.height }
+                ?: choices.minByOrNull { it.width * it.height }
                 ?: choices.first()
-            Log.w(TAG, "No ideal size found, using fallback: ${fallback.width}x${fallback.height}")
+            Log.w(TAG, "No usable size <= 720p, using ${fallback.width}x${fallback.height}")
             return fallback
         }
-        
-        // Sort by score (ascending) and pick the best
-        val sorted = scoredSizes.sortedBy { it.score }
-        
-        Log.d(TAG, "Resolution scores (lower is better):")
-        sorted.take(5).forEach { scored ->
-            Log.d(TAG, "  ${scored.size.width}x${scored.size.height}: score=%.1f (%s)".format(
-                scored.score, scored.details))
+
+        // 1. 精确的 720p（兼容竖屏上报的 720x1280）
+        val target = candidates.firstOrNull {
+            it.width == TARGET_WIDTH && it.height == TARGET_HEIGHT
+        } ?: candidates.firstOrNull {
+            it.width == TARGET_HEIGHT && it.height == TARGET_WIDTH
         }
-        
-        val best = sorted.first().size
-        Log.i(TAG, "✓ Selected optimal resolution: ${best.width}x${best.height}")
-        
+        if (target != null) {
+            val maxFps = maxFpsForSize(map, target)
+            if (maxFps == null || maxFps >= TARGET_FPS - FPS_TOLERANCE) {
+                Log.i(
+                    TAG,
+                    "✓ Selected 720p capture: ${target.width}x${target.height} " +
+                        "(max ${maxFps?.let { "%.1f".format(it) } ?: "unknown"} fps)",
+                )
+            } else {
+                Log.w(
+                    TAG,
+                    ("⚠ 720p (${target.width}x${target.height}) is advertised but this camera " +
+                        "caps it at %.1f fps (< ${TARGET_FPS}); keeping 720p — " +
+                        "the delivered frame rate will follow the camera").format(maxFps),
+                )
+            }
+            return target
+        }
+
+        // 2. 没有 720p：挑 60fps 能力里最大的尺寸
+        Log.w(TAG, "Camera does not advertise 1280x720; picking the largest ${TARGET_FPS}fps size <= 720p")
+        val sixtyFpsSizes = candidates.filter { canDeliverTargetFps(map, it) }
+        val preferred = if (sixtyFpsSizes.isNotEmpty()) sixtyFpsSizes else candidates
+        val best = preferred.sortedWith(
+            compareByDescending<Size> { it.width * it.height }
+                .thenBy { kotlin.math.abs(aspectRatioOf(it) - TARGET_ASPECT) }
+        ).first()
+
+        if (sixtyFpsSizes.isEmpty()) {
+            Log.w(TAG, "⚠ No ${TARGET_FPS}fps-capable size advertised; using ${best.width}x${best.height}")
+        } else {
+            Log.i(TAG, "✓ Selected capture size: ${best.width}x${best.height} (target ${TARGET_FPS}fps, no 720p)")
+        }
         return best
+    }
+
+    /** 尺寸的宽高比，恒 >= 1.0（与上报的横/竖方向无关）。 */
+    private fun aspectRatioOf(size: Size): Float =
+        maxOf(size.width, size.height).toFloat() / minOf(size.width, size.height)
+
+    /**
+     * 该输出尺寸在硬件上能跑到的最高帧率（`null` = 平台没报，无法判断）。
+     *
+     * `getOutputMinFrameDuration` 给的是「这个尺寸下每帧的最短间隔」，也就是这个
+     * 尺寸的真·帧率上限。
+     */
+    private fun maxFpsForSize(map: StreamConfigurationMap?, size: Size): Float? {
+        val durationNs = try {
+            map?.getOutputMinFrameDuration(ImageFormat.YUV_420_888, size) ?: 0L
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to query frame duration for ${size.width}x${size.height}: ${e.message}")
+            0L
+        }
+        return if (durationNs > 0L) 1_000_000_000f / durationNs else null
+    }
+
+    /** 该尺寸是否满足目标 60fps（平台没报时按「可以」处理，交给采集回调验证）。 */
+    private fun canDeliverTargetFps(map: StreamConfigurationMap?, size: Size): Boolean {
+        val maxFps = maxFpsForSize(map, size) ?: return true
+        return maxFps >= TARGET_FPS - FPS_TOLERANCE
     }
     
     private val stateCallback = object : CameraDevice.StateCallback() {
@@ -705,15 +725,15 @@ class Camera2Manager(private val context: Context) {
         // 相机强行拉到它做不到的帧率）。AE 会自动改用 ISO / 降噪去补曝光。
         if (pinFrameRate) {
             val range = chosen
-            if (range != null && range.upper >= PINNED_FPS) {
+            if (range != null && range.upper >= TARGET_FPS) {
                 builder.set(
                     CaptureRequest.SENSOR_FRAME_DURATION,
-                    1_000_000_000L / PINNED_FPS
+                    1_000_000_000L / TARGET_FPS
                 )
                 Log.i(
                     TAG,
-                    "Pinned SENSOR_FRAME_DURATION = ${1_000_000_000L / PINNED_FPS} ns " +
-                        "(${PINNED_FPS} fps, AE range ${range.lower}-${range.upper})"
+                    "Pinned SENSOR_FRAME_DURATION = ${1_000_000_000L / TARGET_FPS} ns " +
+                        "(${TARGET_FPS} fps, AE range ${range.lower}-${range.upper})"
                 )
             }
         }
