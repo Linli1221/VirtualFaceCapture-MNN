@@ -17,10 +17,41 @@
 
 using namespace mediapipe_face;
 
-// Global instances for face detection, landmark detection, and blendshape prediction
-static std::unique_ptr<FaceDetector> g_faceDetector = nullptr;
-static std::unique_ptr<FaceLandmarker> g_faceLandmarker = nullptr;
-static std::unique_ptr<BlendShapePredictor> g_blendshapePredictor = nullptr;
+// ---------------------------------------------------------------------------
+// Multi-engine (CPU + GPU 双通道) support
+//
+// Two independent engines can coexist in one process:
+//
+//   slot 0 — 主引擎。默认跑 Vulkan，负责人脸检测；双通道开启时也负责一路关键点。
+//   slot 1 — 副引擎。跑 CPU 后端，只加载 landmarker（关键点模型），和主引擎
+//             并行消费同一帧队列，让 CPU 大核和 GPU 同时干活。
+//
+// 两个引擎各自的 MNN session、时序滤波状态完全独立，只有模型路径和线程数共享。
+//
+// 引擎按**线程**选择（thread_local）：每个推理线程在启动时 bind 一次自己的槽位，
+// 之后的 per-frame JNI 调用并不需要改签名，宏会把 g_faceDetector 之流落到当前
+// 线程绑定的槽位上。默认槽位是 0，所以单引擎行为与历史版本完全一致。
+// ---------------------------------------------------------------------------
+struct EngineSlot {
+    std::unique_ptr<FaceDetector> detector;
+    std::unique_ptr<FaceLandmarker> landmarker;
+    std::unique_ptr<BlendShapePredictor> blendshape;
+    // 该槽位当前生效的 MNN 后端：true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU
+    std::atomic<bool> useVulkan{true};
+    HeadPose lastHeadPose;
+    bool hasHeadPose = false;
+};
+
+static EngineSlot g_engines[2];
+static thread_local int g_engine_index = 0;
+
+// 兼容旧代码：所有 per-frame 实现都用这几个宏，落到当前线程绑定的槽位。
+#define g_faceDetector        (g_engines[g_engine_index].detector)
+#define g_faceLandmarker      (g_engines[g_engine_index].landmarker)
+#define g_blendshapePredictor (g_engines[g_engine_index].blendshape)
+#define g_use_vulkan          (g_engines[g_engine_index].useVulkan)
+#define g_lastHeadPose        (g_engines[g_engine_index].lastHeadPose)
+#define g_hasHeadPose         (g_engines[g_engine_index].hasHeadPose)
 
 // Model paths / thread count captured in nativeInit so the MNN backend can be
 // rebuilt at runtime without going back to Kotlin for the model files again.
@@ -30,13 +61,20 @@ static std::string g_landmarker_model_path;
 static std::string g_blendshape_model_path;  // empty => blendshape disabled
 static int g_num_threads = 2;
 
-// Currently active MNN backend: true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU.
-static std::atomic<bool> g_use_vulkan{true};
-
 // Serializes model creation. Per-frame inference does NOT take this lock:
 // callers must not switch the backend while the capture pipeline is running
 // (MediaPipeFaceDetector.setBackend() documents and enforces that contract).
 static std::mutex g_model_mutex;
+
+/**
+ * 头部姿态解算用的是**全局**几何管线 + 全局时序滤波（FaceLandmarker 里的
+ * s_geometry_pipeline_ / s_head_pose_*_filter）。双通道下 CPU / GPU 两条线程会
+ * 同时算同一帧的姿态，必须串行化，否则既是数据竞争、也会把滤波状态搅乱。
+ *
+ * 这把锁只覆盖「几何解算 + 滤波」这段（远小于一次推理），不会拖慢两条通道的
+ * 并行推理。
+ */
+static std::mutex g_head_pose_mutex;
 
 // Creates the three models on the requested backend using the cached paths.
 // Caller must hold g_model_mutex. Returns false only when a critical model
@@ -79,9 +117,7 @@ static bool createModelsLocked(bool use_vulkan) {
     return true;
 }
 
-// Cached head pose for compensation
-static HeadPose g_lastHeadPose;
-static bool g_hasHeadPose = false;
+// Cached head pose for compensation lives per engine slot (see EngineSlot).
 
 /**
  * Initialize face detector, landmarker, and blendshape predictor models
@@ -247,6 +283,117 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(
         jobject /* this */) {
     
     return g_use_vulkan.load() ? JNI_TRUE : JNI_FALSE;
+}
+
+// ===========================================================================
+// CPU + GPU 双通道：引擎槽位管理
+//
+// 调用方（推理线程）在启动时调用一次 nativeSelectEngine(1)，之后这个线程上的
+// 所有 per-frame 调用都会落到副引擎上；主线程 / 检测线程保持默认的槽位 0。
+// ===========================================================================
+
+/**
+ * 把**当前线程**绑定到指定引擎槽位（0 = 主引擎，1 = CPU 副引擎）。
+ * 线程本地状态，不影响其它线程。
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSelectEngine(
+        JNIEnv* env,
+        jobject /* this */,
+        jint index) {
+
+    g_engine_index = (index == 1) ? 1 : 0;
+}
+
+/** 当前线程绑定的引擎槽位，仅用于日志 / 断言。 */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetEngineIndex(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    return static_cast<jint>(g_engine_index);
+}
+
+/**
+ * 初始化副引擎（槽位 1）。
+ *
+ * 只加载 landmarker：CPU 通道只负责关键点推理，不需要检测 / blendshape 模型，
+ * 这样可以省掉两份模型的常驻内存。必须在 nativeInit 之后调用（模型路径已缓存）。
+ *
+ * @param useVulkan 期望的后端；失败时自动回退 CPU（副引擎的目的就是吃 CPU 核）
+ * @param numThreads MNN 线程数；<=0 时沿用主引擎的线程数
+ * @return true 表示副引擎可用
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInitSecondary(
+        JNIEnv* env,
+        jobject /* this */,
+        jboolean useVulkan,
+        jint numThreads) {
+
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+
+    EngineSlot& slot = g_engines[1];
+    slot.detector.reset();
+    slot.landmarker.reset();
+    slot.blendshape.reset();
+    slot.hasHeadPose = false;
+
+    if (g_landmarker_model_path.empty()) {
+        LOGE("Cannot init secondary engine: landmarker model path not cached");
+        return JNI_FALSE;
+    }
+
+    const int threads = (numThreads > 0) ? static_cast<int>(numThreads) : g_num_threads;
+    const bool want_vulkan = (useVulkan == JNI_TRUE);
+
+    auto landmarker = std::make_unique<FaceLandmarker>();
+    bool backend = want_vulkan;
+    if (!landmarker->loadModel(g_landmarker_model_path, threads, backend)) {
+        if (backend) {
+            LOGI("Secondary engine Vulkan unavailable, retrying on CPU backend");
+            backend = false;
+            landmarker = std::make_unique<FaceLandmarker>();
+        }
+        if (!landmarker->loadModel(g_landmarker_model_path, threads, backend)) {
+            LOGE("Secondary engine landmarker load failed: %s",
+                 landmarker->lastError().c_str());
+            return JNI_FALSE;
+        }
+    }
+
+    slot.landmarker = std::move(landmarker);
+    slot.useVulkan.store(backend);
+
+    // 相机 FOV / 滤波配置在 FaceLandmarker 里是静态（全局）状态，副引擎自动共享，
+    // 不需要像 session 那样再复制一份。
+    LOGI("Secondary (CPU channel) engine ready: backend=%s, threads=%d",
+         backend ? "Vulkan" : "CPU", threads);
+    return JNI_TRUE;
+}
+
+/** 副引擎是否可用（landmarker 已加载）。 */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeIsSecondaryReady(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    return g_engines[1].landmarker ? JNI_TRUE : JNI_FALSE;
+}
+
+/** 释放副引擎，把内存还给系统（切回单通道 / release 时调用）。 */
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeReleaseSecondary(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+
+    g_engines[1].landmarker.reset();
+    g_engines[1].detector.reset();
+    g_engines[1].blendshape.reset();
+    g_engines[1].hasHeadPose = false;
+    LOGI("Secondary (CPU channel) engine released");
 }
 
 /**
@@ -492,9 +639,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeEstimateHeadP
     
     env->ReleaseFloatArrayElements(landmarks, landmarksData, JNI_ABORT);
     
-    // Estimate head pose
-    HeadPose pose = FaceLandmarker::estimateHeadPose(
-        landmarksVec, imageWidth, imageHeight);
+    // Estimate head pose (geometry pipeline + temporal filter are process-global,
+    // so the CPU / GPU channels must not run this concurrently).
+    HeadPose pose;
+    {
+        std::lock_guard<std::mutex> lock(g_head_pose_mutex);
+        pose = FaceLandmarker::estimateHeadPose(landmarksVec, imageWidth, imageHeight);
+    }
     
     // Return [pitch, yaw, roll]
     jfloatArray poseArray = env->NewFloatArray(3);
@@ -516,11 +667,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeRelease(
     
     std::lock_guard<std::mutex> lock(g_model_mutex);
     
-    g_faceDetector.reset();
-    g_faceLandmarker.reset();
-    g_blendshapePredictor.reset();
-    
-    g_hasHeadPose = false;
+    // 释放全部引擎槽位（主引擎 + 可选的 CPU 副引擎），而不只是当前线程绑定的那个。
+    for (auto& engine : g_engines) {
+        engine.detector.reset();
+        engine.landmarker.reset();
+        engine.blendshape.reset();
+        engine.hasHeadPose = false;
+    }
 }
 
 /**
@@ -568,6 +721,8 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativePredictBlends
     // Update head pose if compensation is enabled
     HeadPose* posePtr = nullptr;
     if (useHeadPoseCompensation && g_faceLandmarker) {
+        // 同 nativeEstimateHeadPose：全局几何管线 + 全局滤波，需要串行化。
+        std::lock_guard<std::mutex> poseLock(g_head_pose_mutex);
         g_lastHeadPose = FaceLandmarker::estimateHeadPose(landmarksVec, imageWidth, imageHeight);
         g_hasHeadPose = g_lastHeadPose.isValid();
         if (g_hasHeadPose) {
@@ -723,8 +878,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetSmoothingE
         jobject /* this */,
         jboolean enabled) {
     
+    // 双通道下两个引擎各有一份滤波状态，配置必须一起改，否则两路的平滑行为不一致。
+    for (auto& engine : g_engines) {
+        if (engine.landmarker) {
+            engine.landmarker->setSmoothingEnabled(enabled);
+        }
+    }
     if (g_faceLandmarker) {
-        g_faceLandmarker->setSmoothingEnabled(enabled);
         LOGI("Landmark smoothing %s", enabled ? "enabled" : "disabled");
     }
 }
@@ -738,8 +898,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeResetSmoothin
         JNIEnv* env,
         jobject /* this */) {
     
+    // 同上：两路的滤波状态都要清，否则重置基线后两路会短暂「不同步」。
+    for (auto& engine : g_engines) {
+        if (engine.landmarker) {
+            engine.landmarker->resetSmoothing();
+        }
+    }
     if (g_faceLandmarker) {
-        g_faceLandmarker->resetSmoothing();
         LOGI("Landmark smoothing filter reset");
     }
     if (g_faceDetector) {
@@ -788,11 +953,14 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetLandmarkFi
         jobject /* this */,
         jint filterType) {
 
-    if (g_faceLandmarker) {
-        auto type = static_cast<mnncv::SmoothingFilterType>(filterType);
-        g_faceLandmarker->setFilterType(type);
-        LOGI("Landmark filter type set to %d", filterType);
+    auto type = static_cast<mnncv::SmoothingFilterType>(filterType);
+    // 双通道：两路引擎的滤波类型保持一致。
+    for (auto& engine : g_engines) {
+        if (engine.landmarker) {
+            engine.landmarker->setFilterType(type);
+        }
     }
+    LOGI("Landmark filter type set to %d", filterType);
 }
 
 /**
@@ -834,20 +1002,23 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeConfigureLand
         jfloat gaussianSigma,
         jfloat emaAlpha) {
 
-    if (g_faceLandmarker) {
-        mnncv::FilterConfig config;
-        config.type = static_cast<mnncv::SmoothingFilterType>(filterType);
-        config.one_euro_min_cutoff = oneEuroMinCutoff;
-        config.one_euro_beta = oneEuroBeta;
-        config.one_euro_derivate_cutoff = oneEuroDerivCutoff;
-        config.time_ema_tau = timeEmaTau;
-        config.gaussian_window_size = gaussianWindowSize;
-        config.gaussian_sigma = gaussianSigma;
-        config.ema_alpha = emaAlpha;
+    mnncv::FilterConfig config;
+    config.type = static_cast<mnncv::SmoothingFilterType>(filterType);
+    config.one_euro_min_cutoff = oneEuroMinCutoff;
+    config.one_euro_beta = oneEuroBeta;
+    config.one_euro_derivate_cutoff = oneEuroDerivCutoff;
+    config.time_ema_tau = timeEmaTau;
+    config.gaussian_window_size = gaussianWindowSize;
+    config.gaussian_sigma = gaussianSigma;
+    config.ema_alpha = emaAlpha;
 
-        g_faceLandmarker->setFilterConfig(config);
-        LOGI("Landmark filter configured: type=%d, tau=%.3f", filterType, timeEmaTau);
+    // 双通道：两路引擎用同一套滤波参数。
+    for (auto& engine : g_engines) {
+        if (engine.landmarker) {
+            engine.landmarker->setFilterConfig(config);
+        }
     }
+    LOGI("Landmark filter configured: type=%d, tau=%.3f", filterType, timeEmaTau);
 }
 
 /**

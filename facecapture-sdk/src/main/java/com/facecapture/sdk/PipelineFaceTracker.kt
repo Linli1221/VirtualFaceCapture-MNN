@@ -55,9 +55,31 @@ class PipelineFaceTracker(private val context: Context) {
 
         // Pipeline configuration
         private const val DETECTION_CHANNEL_CAPACITY = 2
-        private const val LANDMARK_CHANNEL_CAPACITY = 2
+        private const val LANDMARK_CHANNEL_CAPACITY = 3
         private const val PROCESSING_CHANNEL_CAPACITY = 4
         private const val FPS_UPDATE_INTERVAL = 1000L
+
+        /** 乱序关键点结果通道容量（两路推理写入，重排阶段消费）。 */
+        private const val LANDMARK_MERGE_CAPACITY = 8
+
+        /** 重排缓冲最多缓存多少帧，超过就认定缺口补不上、直接跳过。 */
+        private const val REORDER_PENDING_CAPACITY = 8
+
+        /** 等一个缺口（某帧还在另一路上算）的最长时间。 */
+        private const val REORDER_GAP_TIMEOUT_MS = 60L
+
+        /**
+         * CPU + GPU 双通道关键点推理的默认开关。
+         *
+         * 关键点阶段占掉一帧 80% 的推理时间，单路 Vulkan 时 CPU 大核基本闲置。
+         * 打开后额外初始化一套 CPU 后端的 landmark session，两个引擎从同一个
+         * 帧队列里抢帧并行推理，结果按 frameId 重排后送下游。
+         *
+         * 代价：多一份 landmark 模型常驻内存（约几十 MB）+ 更高的 CPU 占用与发热。
+         * 真机上如果反而更卡，把 [PipelineFaceTracker.dualChannelEnabled] 置 false
+         * 即可退回单通道（不需要重新编译原生库）。
+         */
+        private const val DUAL_CHANNEL_DEFAULT = true
 
         /**
          * 稳定追踪时人脸检测的最小间隔（毫秒）。
@@ -146,6 +168,23 @@ class PipelineFaceTracker(private val context: Context) {
     private val landmarkDispatcher: ExecutorCoroutineDispatcher =
         newStageThread("face-landmark").asCoroutineDispatcher()
 
+    /**
+     * 双通道（CPU + GPU 并行推理）的两条关键点线程。
+     *
+     * 每条线程在启动时把自己的 native 线程绑定到不同的引擎槽位（0 = Vulkan、
+     * 1 = CPU），因此两个 MNN session 可以同时跑不同的帧。重排阶段再把两路
+     * 结果按 frameId 拉回时间顺序。
+     */
+    private val landmarkDispatcherGpu: ExecutorCoroutineDispatcher =
+        newStageThread("face-landmark-gpu").asCoroutineDispatcher()
+
+    private val landmarkDispatcherCpu: ExecutorCoroutineDispatcher =
+        newStageThread("face-landmark-cpu").asCoroutineDispatcher()
+
+    /** 乱序结果重排阶段（单线程，保证下游看到的帧序严格递增）。 */
+    private val reorderDispatcher: ExecutorCoroutineDispatcher =
+        newStageThread("face-landmark-merge").asCoroutineDispatcher()
+
     private val processingDispatcher: ExecutorCoroutineDispatcher =
         newStageThread("face-process").asCoroutineDispatcher()
 
@@ -169,6 +208,33 @@ class PipelineFaceTracker(private val context: Context) {
     private var landmarkChannel: Channel<LandmarkData> = newLandmarkChannel()
 
     /**
+     * 双通道模式下，两路关键点推理的原始结果先到这里（**不保证顺序**），
+     * 再由重排阶段按 frameId 排序后写入 [landmarkChannel]。
+     *
+     * 单通道模式下这条路只承担「转发」职责，行为与之前完全一致。
+     */
+    private var landmarkMergeChannel: Channel<LandmarkData> = newLandmarkMergeChannel()
+
+    /** 帧重排缓冲；缺口最多等 [REORDER_GAP_TIMEOUT_MS]。 */
+    private val reorderBuffer = FrameReorderBuffer<LandmarkData>(
+        maxPending = REORDER_PENDING_CAPACITY,
+        gapTimeoutMs = REORDER_GAP_TIMEOUT_MS,
+    )
+
+    /**
+     * 是否启用 CPU + GPU 双通道关键点推理。
+     *
+     * 默认开启；只有在「副引擎初始化成功」且**主引擎跑在 Vulkan 上**时才真正生效
+     * （主引擎本身跑 CPU 时开两路没有意义，反而会互相抢核）。运行前改这个值，
+     * 下次 [start] 生效。
+     */
+    var dualChannelEnabled: Boolean = DUAL_CHANNEL_DEFAULT
+
+    /** 本轮 [start] 是否真的跑起了双通道（供日志 / 诊断）。 */
+    @Volatile
+    private var dualChannelActive = false
+
+    /**
      * 处理完成、等待派发回调的帧。
      *
      * 历史上这一步是「每帧 `pipelineScope.launch(Dispatchers.Default)`」——
@@ -190,6 +256,11 @@ class PipelineFaceTracker(private val context: Context) {
 
     private fun newOutputChannel() = Channel<OutputFrame>(
         capacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    private fun newLandmarkMergeChannel() = Channel<LandmarkData>(
+        capacity = LANDMARK_MERGE_CAPACITY,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
@@ -354,6 +425,20 @@ class PipelineFaceTracker(private val context: Context) {
         val dumpDir = context.cacheDir.absolutePath
         faceDetector.setDumpDirectory(dumpDir)
 
+        // CPU 副引擎（双通道的第二条腿）：只加载 landmarker，跑 CPU 后端。
+        // 这里失败不影响主通道，start() 会自动退回单路。
+        if (dualChannelEnabled) {
+            val secondaryOk = faceDetector.initializeSecondaryEngine(
+                useVulkan = false,
+                numThreads = threads,
+            )
+            if (secondaryOk) {
+                Log.i(TAG, "Dual-channel CPU engine ready (landmarker only, $threads threads)")
+            } else {
+                Log.w(TAG, "Dual-channel CPU engine unavailable, will run single channel")
+            }
+        }
+
         isInitialized = true
         Log.i(TAG, "Pipeline face tracker initialized with parallel stages")
         return true
@@ -373,6 +458,8 @@ class PipelineFaceTracker(private val context: Context) {
         frameChannel = newFrameChannel()
         landmarkFrameChannel = newFrameChannel()
         landmarkChannel = newLandmarkChannel()
+        landmarkMergeChannel = newLandmarkMergeChannel()
+        reorderBuffer.reset()
         outputChannel = newOutputChannel()
         yuvFrameChannel = newYuvChannel(DETECTION_CHANNEL_CAPACITY)
         yuvLandmarkFrameChannel = newYuvChannel(LANDMARK_CHANNEL_CAPACITY)
@@ -380,13 +467,27 @@ class PipelineFaceTracker(private val context: Context) {
         // Drop any stale face box from a previous session.
         synchronized(faceBoxLock) { lastFaceBox = null }
 
+        // 双通道只在「YUV 直通 + 主引擎 Vulkan + 副引擎就绪」时启用：
+        // 主引擎本来就是 CPU 时再开一路 CPU，只会在同一批核心上互相抢时间。
+        dualChannelActive = useDirectYuvMode &&
+            dualChannelEnabled &&
+            faceDetector.getBackend() == MnnBackend.VULKAN &&
+            faceDetector.isSecondaryEngineReady()
+        val channelDesc = if (dualChannelActive) {
+            "CPU + GPU (dual channel)"
+        } else {
+            "single channel (backend=${faceDetector.getBackend()})"
+        }
+        Log.i(TAG, "Landmark channels: $channelDesc")
+
         if (useDirectYuvMode) {
             startYuvFaceDetectionStage()
-            startYuvLandmarkStage()
+            startYuvLandmarkStages()
         } else {
             startFaceDetectionStage()
             startLandmarkStage()
         }
+        startLandmarkReorderStage()
         startProcessingStage()
         startOutputStage()
 
@@ -472,6 +573,8 @@ class PipelineFaceTracker(private val context: Context) {
         frameChannel.close()
         landmarkFrameChannel.close()
         landmarkChannel.close()
+        landmarkMergeChannel.close()
+        reorderBuffer.reset()
         outputChannel.close()
         yuvFrameChannel.close()
         yuvLandmarkFrameChannel.close()
@@ -598,6 +701,19 @@ class PipelineFaceTracker(private val context: Context) {
 
         val switched = faceDetector.setBackend(backend)
 
+        // 主引擎都跑 CPU 时双通道没有意义，把副引擎模型放掉省内存；
+        // 切回 Vulkan 时再按需重建，双通道才能继续生效。
+        if (switched) {
+            if (backend == MnnBackend.CPU) {
+                faceDetector.releaseSecondaryEngine()
+            } else if (dualChannelEnabled && !faceDetector.isSecondaryEngineReady()) {
+                faceDetector.initializeSecondaryEngine(
+                    useVulkan = false,
+                    numThreads = mnnThreadCount,
+                )
+            }
+        }
+
         // 切换期间外部又调用了 stop()（例如 Activity 进入后台）时不要再自动 start，
         // 否则相机会在后台被重新打开。start()/stop() 本身都是幂等的，这里只是判断
         // 「我这次 stop() 之外是否还有别人要求停止」。
@@ -613,6 +729,44 @@ class PipelineFaceTracker(private val context: Context) {
 
     /** 当前生效的 MNN 推理后端。 */
     fun getMnnBackend(): MnnBackend = faceDetector.getBackend()
+
+    /** 当前这一轮是否真的跑在 CPU + GPU 双通道上。 */
+    fun isDualChannelActive(): Boolean = dualChannelActive
+
+    /**
+     * 运行时开关「CPU + GPU 双通道关键点推理」。
+     *
+     * 关闭后立即退回单路 Vulkan（省 CPU / 省电 / 降发热）；
+     * 打开时若副引擎还没初始化会顺手初始化它。
+     *
+     * 切换需要重启管线（关键点线程在 start() 里拉起），相机会短暂中断，
+     * 所以只适合在设置面板里点，不要放在每帧路径上。
+     *
+     * @return 切换后是否处于双通道
+     */
+    fun setDualChannelEnabled(enabled: Boolean): Boolean {
+        if (!isInitialized) {
+            Log.w(TAG, "setDualChannelEnabled($enabled) ignored: pipeline not initialized")
+            return false
+        }
+        if (dualChannelEnabled == enabled) return dualChannelActive
+
+        if (enabled && !faceDetector.isSecondaryEngineReady()) {
+            faceDetector.initializeSecondaryEngine(useVulkan = false, numThreads = mnnThreadCount)
+        }
+        dualChannelEnabled = enabled
+
+        val wasRunning = isRunning.get()
+        val stopsBefore = stopRequestCount.get()
+        if (wasRunning) stop()
+
+        // 与 setMnnBackend 一致：切换期间若外部又要求停止，就不要自动重启相机。
+        val externalStopRequested = stopRequestCount.get() > stopsBefore + 1
+        if (wasRunning && !externalStopRequested) start()
+
+        Log.i(TAG, "Dual channel -> $dualChannelActive (enabled=$enabled)")
+        return dualChannelActive
+    }
 
     /**
      * Reset adaptive baseline for BlendShape extraction.
@@ -758,10 +912,47 @@ class PipelineFaceTracker(private val context: Context) {
         }
     }
 
-    private fun startYuvLandmarkStage() {
-        pipelineScope.launch(landmarkDispatcher) {
-            Log.i(TAG, "YUV Landmark detection stage started")
-            for (frame in yuvLandmarkFrameChannel) {
+    /**
+     * 启动关键点阶段：单通道 1 路，双通道 2 路（CPU + GPU）。
+     *
+     * 两路共用同一个 `yuvLandmarkFrameChannel`：kotlinx 的 Channel 在多个
+     * 消费者之间是「分派」语义（一帧只会被一个消费者取走），于是哪一路空下来
+     * 就接下一帧，天然是负载均衡的抢帧模型，不需要额外的调度器。
+     */
+    private fun startYuvLandmarkStages() {
+        startYuvLandmarkWorker(
+            label = if (dualChannelActive) "gpu" else "single",
+            engineIndex = 0,
+            dispatcher = if (dualChannelActive) landmarkDispatcherGpu else landmarkDispatcher,
+            runConfidenceCheck = true,
+        )
+        if (dualChannelActive) {
+            startYuvLandmarkWorker(
+                label = "cpu",
+                engineIndex = 1,
+                dispatcher = landmarkDispatcherCpu,
+                // 追踪置信度检测是有状态的（连续低置信度才触发重检），两路都更新
+                // 会把它的判定节奏打乱，所以只让主通道负责。
+                runConfidenceCheck = false,
+            )
+        }
+    }
+
+    private fun startYuvLandmarkWorker(
+        label: String,
+        engineIndex: Int,
+        dispatcher: CoroutineDispatcher,
+        runConfidenceCheck: Boolean,
+    ) {
+        pipelineScope.launch(dispatcher) {
+            // 把当前线程绑定到对应的原生引擎槽位（线程本地状态，绑一次即可）。
+            val bound = faceDetector.bindEngine(engineIndex)
+            Log.i(TAG, "YUV Landmark worker '$label' started on engine slot $bound")
+            // 捕获本轮 start() 的通道实例：万一 stop()/start() 期间这个协程还没退出，
+            // 也不会把上一轮的帧塞进新一轮的通道里。
+            val inputChannel = yuvLandmarkFrameChannel
+            val mergeChannel = landmarkMergeChannel
+            for (frame in inputChannel) {
                 if (!isRunning.get()) break
                 try {
                     val box = synchronized(faceBoxLock) { lastFaceBox }
@@ -780,15 +971,17 @@ class PipelineFaceTracker(private val context: Context) {
                         val landmarks = landmarkResult.landmarks
                         val presenceScore = landmarkResult.presenceScore
 
-                        val trackingStatus = trackingConfidenceDetector.updateAndCheck(
-                            currentLandmarks = landmarks,
-                            presenceScore = presenceScore,
-                        )
-                        if (trackingStatus.shouldRedetect) {
-                            Log.d(TAG, "Tracking confidence low, triggering re-detection: ${trackingStatus.reason}")
-                            synchronized(faceBoxLock) { lastFaceBox = null }
-                            synchronized(perfLock) { redetectTriggerCount++ }
-                            trackingConfidenceDetector.onDetectionPerformed()
+                        if (runConfidenceCheck) {
+                            val trackingStatus = trackingConfidenceDetector.updateAndCheck(
+                                currentLandmarks = landmarks,
+                                presenceScore = presenceScore,
+                            )
+                            if (trackingStatus.shouldRedetect) {
+                                Log.d(TAG, "Tracking confidence low, triggering re-detection: ${trackingStatus.reason}")
+                                synchronized(faceBoxLock) { lastFaceBox = null }
+                                synchronized(perfLock) { redetectTriggerCount++ }
+                                trackingConfidenceDetector.onDetectionPerformed()
+                            }
                         }
 
                         val headPose = faceDetector.estimateHeadPose(
@@ -813,7 +1006,8 @@ class PipelineFaceTracker(private val context: Context) {
                             landmarkOutputCount.set(0)
                             lastLandmarkFpsTime = now
                         }
-                        landmarkChannel.trySend(landmarkData)
+                        // 结果先交给重排阶段：双通道下到达顺序不等于采集顺序。
+                        mergeChannel.trySend(landmarkData)
                     }
                     if (ENABLE_PERF_PROFILING) {
                         synchronized(perfLock) {
@@ -824,7 +1018,43 @@ class PipelineFaceTracker(private val context: Context) {
                     Log.e(TAG, "YUV Landmark detection error", e)
                 }
             }
-            Log.i(TAG, "YUV Landmark detection stage stopped")
+            Log.i(TAG, "YUV Landmark worker '$label' stopped")
+        }
+    }
+
+    /**
+     * 乱序结果重排阶段：把两路推理的结果按 frameId 还原成时间顺序，再交给后处理。
+     *
+     * 单通道时帧本来就是顺序到达的，这一级只做转发，行为与之前完全一致；
+     * 双通道时才会临时缓存等待另一路，等待上限 [REORDER_GAP_TIMEOUT_MS]。
+     */
+    private fun startLandmarkReorderStage() {
+        pipelineScope.launch(reorderDispatcher) {
+            Log.i(TAG, "Landmark reorder stage started (dual=$dualChannelActive)")
+            // 同 worker：绑定本轮 start() 创建的通道实例。
+            val mergeChannel = landmarkMergeChannel
+            val outChannel = landmarkChannel
+            while (isRunning.get()) {
+                val waitingForGap = reorderBuffer.size > 0
+                val next: LandmarkData? = if (!waitingForGap) {
+                    mergeChannel.receiveCatching().getOrNull()
+                } else {
+                    // 有帧在等缺口：最多等一个超时，然后放行手里已有的帧。
+                    withTimeoutOrNull(REORDER_GAP_TIMEOUT_MS) {
+                        mergeChannel.receiveCatching().getOrNull()
+                    }
+                }
+
+                if (next != null) {
+                    val ready = reorderBuffer.offer(next.frameId, next, System.currentTimeMillis())
+                    for (item in ready) outChannel.trySend(item)
+                } else {
+                    val ready = reorderBuffer.poll(System.currentTimeMillis())
+                    for (item in ready) outChannel.trySend(item)
+                }
+            }
+            reorderBuffer.reset()
+            Log.i(TAG, "Landmark reorder stage stopped")
         }
     }
 

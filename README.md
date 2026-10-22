@@ -111,6 +111,33 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
 `mini_linalg` + `neon_intrinsics`，针对 3×N 关键点这种典型 shape 做了
 向量化，加载和首帧推理耗时相比标量实现有明显下降。
 
+### CPU + GPU 双通道关键点推理
+
+关键点阶段占掉一帧 80% 的推理时间，单路 Vulkan 时 CPU 大核基本闲着。
+`PipelineFaceTracker` 因此额外初始化一套 **CPU 后端的 landmark session**，
+两路从同一个帧队列里抢帧、并行推理：
+
+```
+                    ┌──────────────► [ GPU 引擎 (Vulkan) ] ──┐
+yuvLandmarkFrame ───┤                                        ├──► 重排 ──► 后处理
+      Channel       └──────────────► [ CPU 引擎 (CPU)    ] ──┘  (按 frameId 排序)
+```
+
+- 两路的 MNN session 完全独立：原生侧用 `EngineSlot[2]` + `thread_local`
+  选择引擎，每个推理线程启动时绑定一次自己的槽位，per-frame JNI 签名不用改；
+- 结果按 `frameId` 重排后再交给后处理，下游看到的帧序仍然严格递增
+  （校准基线、眨眼曲线、发给 PC 的 `seq` 都依赖这个前提）；
+- 缺口最多等 60 ms（`REORDER_GAP_TIMEOUT_MS`），超时就接受丢帧继续跑，
+  不会为了等某一帧把整条链路拖慢；
+- 只在「YUV 直通 + 主引擎 Vulkan + 副引擎就绪」时启用；主引擎切到 CPU 后自动
+  退回单路（两个 CPU session 只会互相抢核）；
+- 时序滤波（landmark / 头姿）是**按通道**喂的：每路只看得到约一半的帧，滤波的
+  时间常数不变、只是响应略慢一点；头姿解算用的全局几何管线 + 全局滤波已经加锁
+  串行化，不会数据竞争；
+- 代价是**多一份 landmark 模型常驻内存**，以及更高的 CPU 占用与发热。
+  设置面板的 **「关键点: CPU+GPU 双通道」** 按钮可以随时开关（会短暂重启管线），
+  也可以改 `PipelineFaceTracker.dualChannelEnabled` / `DUAL_CHANNEL_DEFAULT`。
+
 ---
 
 ## 📦 目录与模块
@@ -204,6 +231,7 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 | **网络输出** | 打开对话框：启动 / 停止追踪服务、复制 `ws://` 地址、查看客户端数与输出帧率、当前帧缓冲时长、打开 `/status` 状态页 |
 | **Camera: 前置 / 后置 / 外接** | 枚举并切换摄像头，切换后自动重做基线；选择会记住 |
 | **Backend: Vulkan / CPU** | 运行时切换 MNN 推理后端（会重建 session，画面中断一帧左右） |
+| **关键点: CPU+GPU 双通道** | 再开一套 CPU 后端的 landmark session 与 Vulkan 并行抢帧（会短暂重启管线）；关掉即退回单路 |
 | **眨眼曲线 / 眨眼速度** | 是否把眨眼整形为更自然的 230 ms 曲线，以及曲线速度 |
 | **眼睛灵敏度** | 眼部 EAR 阈值灵敏度（0.5x ～ 2.0x），下方实时显示生效的 `closed / open` 阈值 |
 | **显示调试 / 关键点** | 顶栏调试 HUD（fps、帧耗时、pitch/yaw/roll + 条形图、ARKit 数值）与相机画面上的关键点 / 检测框叠加 |
@@ -224,7 +252,8 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 断线会自动重连（0.5 s → 1 s → 2 s → 5 s 封顶），状态栏会显示当前阶段；
 断开时形象回到默认姿态，不会定格在最后一帧的鬼脸上。
 渲染目标帧率固定 **60 fps**（高刷屏不再按屏幕刷新率空转）；手机输入帧率低于 60 时自动做时间轴插值，
-画面仍是均匀的 60 fps 运动。细节与 `?fps=<n>` 参数见 [`windows-client/README.md`](windows-client/README.md)。
+输入到达间隔不稳定（Wi-Fi 排队 / PC 调度 / 推理卡顿）时抖动缓冲自适应放宽，画面仍是均匀的
+60 fps 运动。细节与 `?fps=<n>` 参数见 [`windows-client/README.md`](windows-client/README.md)。
 
 ---
 

@@ -116,6 +116,38 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
 All matrix math / affine transforms / SVD / Jacobi rotations / point-cloud transforms use
 the local `mini_linalg` + `neon_intrinsics` (vectorized for the typical 3×N landmark shape).
 
+### CPU + GPU dual-channel landmark inference
+
+The landmark stage eats ~80% of the per-frame inference budget, so a single Vulkan
+channel leaves the phone's CPU cores idle. `PipelineFaceTracker` therefore spins up a
+second MNN session on the **CPU backend** and both engines pull frames from the same
+queue:
+
+```
+                    ┌──────────────► [ GPU engine (Vulkan) ] ──┐
+yuvLandmarkFrame ───┤                                          ├──► reorder ──► post-process
+      Channel       └──────────────► [ CPU engine (CPU)    ] ──┘   (by frameId)
+```
+
+- The two MNN sessions are fully independent: natively each engine is an `EngineSlot`,
+  selected per thread (`thread_local`) once per inference thread, so no per-frame JNI
+  signature had to change.
+- Results are re-ordered by `frameId` before post-processing, so downstream still sees a
+  strictly increasing stream (calibration baseline, blink curve and the `seq` sent to the
+  PC all rely on it).
+- A missing frame is waited for at most 60 ms (`REORDER_GAP_TIMEOUT_MS`); after that the
+  gap is accepted and the pipeline keeps moving instead of stalling.
+- It only engages with "direct YUV mode + Vulkan primary + secondary engine ready". If the
+  primary is switched to CPU it falls back to a single channel automatically (two CPU
+  sessions would just fight over the same cores).
+- Temporal smoothing (landmarks / head pose) is fed **per channel**: each engine sees only
+  ~half the frames, so the filter time constant is unchanged but the response is slightly
+  slower. Head-pose estimation touches a process-global geometry pipeline + filter, so that
+  path is serialized behind a mutex (no data race).
+- Cost: one extra resident landmark model + higher CPU usage and heat. Toggle it in the
+  settings sheet (**"Landmark: CPU+GPU dual channel"**, restarts the pipeline briefly) or
+  change `PipelineFaceTracker.dualChannelEnabled` / `DUAL_CHANNEL_DEFAULT`.
+
 ---
 
 ## 📦 Layout
@@ -201,6 +233,7 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 | **Network output** | start/stop the tracking server, copy the `ws://` address, see client count, output fps and the active frame-buffer length, open the `/status` page |
 | **Camera: front / back / external** | enumerate and switch cameras; re-calibrates after switching, remembers the choice |
 | **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |
+| **Landmark: CPU+GPU dual channel** | adds a CPU-backend landmark session that steals frames in parallel with Vulkan (restarts the pipeline briefly); turn it off to go back to a single channel |
 | **Blink curve / speed** | shape blinks into a natural 230 ms curve, adjustable speed |
 | **Eye sensitivity** | eye EAR threshold sensitivity (0.5x–2.0x) with live closed/open thresholds |
 | **Debug / landmarks** | fps, frame cost, pitch/yaw/roll with bars, raw ARKit values, landmark + bbox overlay |
@@ -222,8 +255,9 @@ Disconnects reconnect automatically (0.5 s → 1 s → 2 s → 5 s, capped) and 
 its default pose instead of freezing on the last frame.
 Rendering is capped at a **60 fps** target (high-refresh displays no longer spin at their refresh
 rate); when the phone delivers fewer than 60 fps, the client interpolates the recent input frames on
-a timeline so the motion stays smooth. See [`windows-client/README.md`](windows-client/README.md)
-and `?fps=<n>`.
+a timeline so the motion stays smooth, and the jitter buffer widens adaptively when arrivals are
+uneven (Wi-Fi queueing, PC scheduling, inference hiccups). See
+[`windows-client/README.md`](windows-client/README.md) and `?fps=<n>`.
 
 ---
 

@@ -258,6 +258,8 @@ fun FaceCaptureScreen(
     // MNN 推理后端（Vulkan ⇄ CPU）：让用户在真机上实测哪一个能稳住 60 帧
     var mnnBackend by remember { mutableStateOf(faceTracker.getMnnBackend()) }
     var backendSwitching by remember { mutableStateOf(false) }
+    // CPU + GPU 双通道关键点推理：关掉就退回单路 Vulkan（省电、降发热）
+    var dualChannel by remember { mutableStateOf(faceTracker.isDualChannelActive()) }
 
     var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
 
@@ -474,6 +476,7 @@ fun FaceCaptureScreen(
                     drawDetectionBox = drawDetectionBox,
                     mnnBackend = mnnBackend,
                     backendSwitching = backendSwitching,
+                    dualChannel = dualChannel,
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
@@ -486,6 +489,8 @@ fun FaceCaptureScreen(
                                 faceTracker.start()
                                 isTracking.value = true
                                 trackingOutput.setTrackingActive(true)
+                                // 双通道是否真的跑起来要等 start() 之后才知道
+                                dualChannel = faceTracker.isDualChannelActive()
                             }
                         }
                     },
@@ -551,6 +556,22 @@ fun FaceCaptureScreen(
                                     "MNN backend switch (ok=" + ok + ") -> " + faceTracker.getMnnBackend()
                                 )
                             }
+                        }
+                    },
+                    onToggleDualChannel = {
+                        // 双通道的开关要在 start() 里拉起/收起关键点线程，属于管线重启，
+                        // 和切后端一样放 IO 线程，避免主线程卡顿。
+                        val target = !dualChannel
+                        Log.i("FaceCapturePipeline", "Switching dual channel to " + target + " ...")
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                faceTracker.setDualChannelEnabled(target)
+                            } catch (t: Throwable) {
+                                Log.e("FaceCapturePipeline", "Switching dual channel failed", t)
+                            }
+                            // 以 SDK 真实状态为准：副引擎不可用时会自动停在单通道
+                            dualChannel = faceTracker.isDualChannelActive()
+                            Log.i("FaceCapturePipeline", "Dual channel now " + dualChannel)
                         }
                     }
                 )
@@ -880,6 +901,7 @@ fun ControlPanel(
     drawDetectionBox: Boolean,
     mnnBackend: MnnBackend,
     backendSwitching: Boolean,
+    dualChannel: Boolean,
     onToggleTracking: () -> Unit,
     onResetBaseline: () -> Unit,
     onToggleDebug: () -> Unit,
@@ -890,6 +912,7 @@ fun ControlPanel(
     onToggleLandmarks: () -> Unit,
     onToggleDetectionBox: () -> Unit,
     onToggleMnnBackend: () -> Unit,
+    onToggleDualChannel: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -1073,6 +1096,25 @@ fun ControlPanel(
                         mnnBackend == MnnBackend.VULKAN -> "推理后端: Vulkan (点击切 CPU)"
                         else -> "推理后端: CPU (点击切 Vulkan)"
                     },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            // 第五行之后：CPU + GPU 双通道关键点推理
+            // 关键点推理是整条管线的瓶颈，单路 Vulkan 时 CPU 大核基本闲置；
+            // 打开后额外起一路 CPU 引擎，两路从同一个帧队列抢帧并行推理。
+            Button(
+                onClick = onToggleDualChannel,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (dualChannel) Color(0xFF3949AB)
+                    else MaterialTheme.colorScheme.secondary
+                )
+            ) {
+                Text(
+                    text = if (dualChannel) "关键点: CPU+GPU 双通道 (点击关)"
+                    else "关键点: 单路 (点击开双通道)",
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )

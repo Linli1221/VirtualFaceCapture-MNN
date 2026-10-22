@@ -87,6 +87,10 @@ class MediaPipeFaceDetector(private val context: Context) {
     
     private var isInitialized = false
     
+    /** CPU 副引擎（双通道）是否已就绪。 */
+    @Volatile
+    private var secondaryReady = false
+    
     companion object {
         private const val TAG = "MediaPipeFaceDetector"
         
@@ -245,6 +249,30 @@ class MediaPipeFaceDetector(private val context: Context) {
     
     private external fun nativeRelease()
     
+    // ========== CPU + GPU 双通道（多引擎）原生接口 ==========
+    // 引擎按线程绑定：每个推理线程调用一次 nativeSelectEngine 选定槽位，
+    // 之后该线程上的所有 per-frame 调用都会落到选定槽位的 MNN session 上。
+    
+    /** 把当前线程绑定到引擎槽位（0 = 主引擎，1 = CPU 副引擎）。 */
+    private external fun nativeSelectEngine(index: Int)
+    
+    /** 当前线程绑定的引擎槽位（调试用）。 */
+    private external fun nativeGetEngineIndex(): Int
+    
+    /**
+     * 初始化 CPU 副引擎（只加载 landmarker）。须在 [initialize] 之后调用。
+     * @param useVulkan 期望后端；失败会自动回退 CPU
+     * @param numThreads MNN 线程数，<=0 沿用主引擎线程数
+     */
+    private external fun nativeInitSecondary(useVulkan: Boolean, numThreads: Int): Boolean
+    
+    /** 副引擎是否就绪。 */
+    private external fun nativeIsSecondaryReady(): Boolean
+    
+    /** 释放副引擎占用的模型内存。 */
+    private external fun nativeReleaseSecondary()
+    
+
     private external fun nativeSetDumpDirectory(dumpDir: String?)
     
     // Smoothing control native methods
@@ -621,6 +649,66 @@ class MediaPipeFaceDetector(private val context: Context) {
             Log.e(TAG, "Error initializing detector", e)
             return false
         }
+    }
+    
+    /**
+     * 初始化 CPU 副引擎（CPU + GPU 双通道）。
+     *
+     * 副引擎只加载 landmarker：它唯一的职责是从帧队列里抢下关键点推理，让 CPU
+     * 和 GPU 同时干活。检测 / blendshape 仍由主引擎负责，因此副引擎的常驻内存
+     * 只有一份 landmark 模型。
+     *
+     * 必须在 [initialize] 成功后调用；调用是阻塞的（加载模型约几百毫秒），
+     * 通常放在 SDK 的初始化流程里，不要放在每帧路径上。
+     *
+     * @param useVulkan 期望后端。默认 false（就是要吃 CPU 核）；传 true 时若
+     *        Vulkan 创建失败会自动回退 CPU。
+     * @param numThreads MNN 线程数，<=0 表示沿用 [initialize] 时的线程数
+     * @return 副引擎是否可用；失败时主引擎照常工作，管线退回单通道
+     */
+    fun initializeSecondaryEngine(useVulkan: Boolean = false, numThreads: Int = 0): Boolean {
+        if (!isInitialized) {
+            Log.e(TAG, "Cannot init secondary engine: detector not initialized")
+            return false
+        }
+        return try {
+            val ok = nativeInitSecondary(useVulkan, numThreads)
+            secondaryReady = ok
+            Log.i(TAG, if (ok) "Secondary engine ready (CPU channel)" else "Secondary engine unavailable")
+            ok
+        } catch (t: Throwable) {
+            secondaryReady = false
+            Log.e(TAG, "Error initializing secondary engine", t)
+            false
+        }
+    }
+
+    /** 副引擎（CPU 通道）是否可用。 */
+    fun isSecondaryEngineReady(): Boolean = secondaryReady
+
+    /** 释放副引擎的模型内存；之后该引擎上的调用会返回 null。 */
+    fun releaseSecondaryEngine() {
+        if (!secondaryReady) return
+        try {
+            nativeReleaseSecondary()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error releasing secondary engine", t)
+        }
+        secondaryReady = false
+    }
+
+    /**
+     * 把**当前线程**绑定到指定的引擎槽位。
+     *
+     * 底层模型是线程本地选择的：一个推理线程只绑定一次，之后同一线程上的
+     * `detectLandmarksFromYuvWithScore` / `estimateHeadPose` 等调用都会落到该引擎。
+     * 默认槽位 0（主引擎），所以不调用它的单线程代码行为不变。
+     *
+     * @return 绑定后该线程实际生效的槽位
+     */
+    fun bindEngine(index: Int): Int {
+        nativeSelectEngine(index)
+        return nativeGetEngineIndex()
     }
     
     /**
@@ -1135,6 +1223,9 @@ class MediaPipeFaceDetector(private val context: Context) {
      */
     fun release() {
         if (isInitialized) {
+            // 副引擎先放：它只持有 landmarker，但两份模型同时在内存里时
+            // 释放顺序反过来会让峰值内存多撑一会儿。
+            releaseSecondaryEngine()
             nativeRelease()
             isInitialized = false
             Log.i(TAG, "MediaPipe face detector released")
