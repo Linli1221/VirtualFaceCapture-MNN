@@ -62,7 +62,7 @@ Camera2 YUV ──► 人脸检测(MNN) ──► Landmark(MNN) ──► 后处
 |---|---|
 | 预览 RGB 帧默认关闭 + `@Volatile` | `enablePreviewInYuvMode` 默认 `false`，由上层按需开关（见 2.2） |
 | `willProducePreviewFrames` | 「开关打开 && 有订阅者」才真的转 RGB |
-| 新增 `MAX_PIXEL_COUNT` 整帧像素上限 | 人脸检测只吃 128/192 输入、landmark 只吃 192 的 ROI，整帧再大纯属浪费，大尺寸 YUV 也常常拿不到 60fps（初版 640×480；后续采集目标改为 720p，见 §8） |
+| 新增 `MAX_PIXEL_COUNT = 640*480` 硬上限 | 人脸检测只吃 128/192 输入、landmark 只吃 192 的 ROI，整帧再大纯属浪费，大尺寸 YUV 也常常拿不到 60fps |
 | `chooseTargetFpsRange()` | 优先 `(60,60)` → 天花板≥60 且地板≤30（典型 `(30,60)`）→ 地板≤30 里最高 → 最高天花板 |
 | `ImageReader` 2 → 3 个 buffer | 处理端偶发慢一拍时相机可以继续出帧（配合 `acquireLatestImage` 不积压延迟） |
 | `windowManager` 缓存 | `getRotationDegrees()` 在相机线程**每帧**跑，之前每帧一次 `getSystemService` |
@@ -334,51 +334,14 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 那就不是 AE 的问题了，按顺序排查：
 
 1. `Camera delivered` < 60 且 `applied frameDuration` 仍是 33.3ms → 该机型在该分辨率下
-   就不会给 60fps。可以试：把 `MAX_PIXEL_COUNT` 降到该机型能跑 60fps 的尺寸（例如
-   640×480），或改用 `(60,60)` 广播的尺寸（部分机型 720p 支持 60、480p 反而只到 30）。
+   就不会给 60fps。可以试：把 `MAX_PIXEL_COUNT` 降到 `640*360`，或换 `(60,60)` 广播的
+   分辨率（部分机型 720p 支持 60、480p 反而只到 30）。
 2. `Camera delivered` ≈ 60 但输出 FPS 低 → 瓶颈在推理：先点 **Backend 切到 CPU** A/B，
    再看 `Landmark Detection` 耗时。
 3. 两者都正常但画面看着不 60 → 渲染侧：高刷屏节流、Live2D 参数更新频率、OBS 抓帧。
-
 ---
 
-## 8. 采集尺寸：480p 级 → 720p @ 60fps
-
-### 目标
-
-采集端从「优先方形、480 级」改为 **1280×720（720p）@ 60fps**：预览与关键点 ROI 的
-源分辨率更高（远景 / 小脸更稳），同时保持面捕最关键的 60fps。
-
-### 实现（`Camera2Manager.kt`）
-
-| 改动 | 说明 |
-|---|---|
-| `TARGET_WIDTH / TARGET_HEIGHT = 1280×720` | 采集目标写死为 720p，替代原来「优先 1:1、优先 480」的打分逻辑 |
-| `MAX_PIXEL_COUNT = 1280*720` | 像素上限跟着抬到 720p；1080p 这类更大尺寸依然被排除 |
-| `chooseCaptureSize()` | ① 设备上报 1280×720（含竖屏 720×1280）→ 直接用；② 没有 720p → 在 ≤720p 且能跑满 60fps 的尺寸里取最大；③ 整台相机都没有 60fps 尺寸 → 取 ≤720p 最大尺寸并告警 |
-| `maxFpsForSize()` / `canDeliverTargetFps()` | 用 `StreamConfigurationMap.getOutputMinFrameDuration(YUV_420_888, size)` 判断**该尺寸**的帧率上限（`CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` 只代表 sensor 能力，不代表 720p 的带宽也够） |
-| 启动日志 | 打印每个尺寸的宽高比 + 最高帧率、最终选中的尺寸；720p 跑不满 60fps 时明确告警 |
-| `startCamera()` | 重开相机时把 `pinFrameRate` 复位为 `true`：上一轮被 HAL 拒绝而回退后，不再让之后每次采集都停在 30fps |
-
-配套（`app/.../CameraPreviewView.kt`）：
-
-| 改动 | 说明 |
-|---|---|
-| 预览 RGB→ARGB 改为整块拷贝 | 先把 direct buffer 一次 `get(ByteArray)` 拷出来再单循环打包；720p 下不再有每帧 270 万次逐字节 `get()` 的边界检查开销 |
-| `uiDrawing` 判断提前 | UI 正在绘制时在转换之前就丢帧，720p 下不会为一张注定丢弃的帧白做 RGB→ARGB |
-
-### 代价与验证
-
-- 720p 的整帧 YUV→RGB（仅调试预览开启时）约 **2.7 MB/帧**；YUV 打包 / 旋转的
-  memcpy 量约为 480 级的 4 倍。默认走 YUV 直通 + 检测 10Hz，增量主要在相机线程的
-  打包与 MNN-CV 缩放上，仍需盯住 `Camera delivered` 是否稳在 60。
-- 验证看两行日志：`✓ Selected 720p capture: 1280x720` 与 `Camera delivered: 59.x FPS`。
-  若机型 720p 只支持 30fps，会打印 `⚠ 720p ... caps it at 30.0 fps`，此时要么换支持
-  720p60 的摄像头，要么把 `MAX_PIXEL_COUNT` 降到相机能跑 60fps 的尺寸（会落到策略 ②）。
-
----
-
-## 9. 摄像头：物理超广角 + 横竖屏
+## 8. 摄像头：物理超广角 + 横竖屏
 
 ### 目标
 
@@ -405,10 +368,11 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 
 ### 代价与验证
 
-- 物理镜头只保证「能出流」，不保证 720p60：超广角 sensor 往往只有 30fps，以
-  `Camera delivered` 为准；若 720p 物理流被 HAL 拒绝，日志会打印
+- 物理镜头只保证「能出流」，不保证 60fps：超广角 sensor 往往只有 30fps，以
+  `Camera delivered` 为准；若物理流被 HAL 拒绝，日志会打印
   `HAL rejects physical stream ...` 并自动回退到逻辑相机。
-- 横屏旋转时帧尺寸在 1280×720 / 720×1280 之间切换，预览与关键点按新尺寸重建位图，属预期。
+- 横屏旋转时帧尺寸随设备上报的横/竖尺寸切换（如 640×480 / 480×640），预览与关键点按新尺寸重建位图，属预期。
 - 验证日志：`Camera selected: Back 超广角 (id=0 · physical 2), sensor=90°, fov=...`；
   旋转屏幕时 logcat 不应再出现新的 `MainActivity onCreate`（Activity 不重建）。
+
 

@@ -25,7 +25,7 @@ class CameraPreviewView @JvmOverloads constructor(
     
     // ---- 双缓冲：不再每帧 Bitmap.copy() --------------------------------------
     // 相机线程只写「当前没在展示」的那一块 Bitmap，写完再原子发布；UI 线程只读发布出去
-    // 的那一块。每帧只有一次 setPixels，不再有整帧 ARGB_8888 拷贝（720p ≈ 3.7MB/帧）。
+    // 的那一块。每帧只有一次 setPixels，不再有整帧 ARGB_8888 拷贝（480x480 ≈ 900KB/帧）。
     private val displayBitmap = AtomicReference<Bitmap?>(null)
 
     // 后台缓冲（相机线程写，UI 线程不读），始终不等于 displayBitmap
@@ -47,10 +47,6 @@ class CameraPreviewView @JvmOverloads constructor(
     
     // Reusable pixel array（只有相机线程访问）
     private var pixelBuffer: IntArray? = null
-
-    // Reusable RGB scratch buffer（只有相机线程访问）——720p 下每帧 2.7 MB，
-    // 逐字节 ByteBuffer.get() 会做上百万次边界检查，改成一整块拷进数组再打包。
-    private var rgbBytesBuffer: ByteArray? = null
     
     private val bitmapPaint = Paint().apply {
         isFilterBitmap = true
@@ -209,14 +205,7 @@ class CameraPreviewView @JvmOverloads constructor(
     fun updateCameraFrame(rgbBuffer: ByteBuffer, width: Int, height: Int) {
         if (width <= 0 || height <= 0) return
         val pixelCount = width * height
-        val byteCount = pixelCount * 3
-        // 防御：尺寸和 buffer 对不上时直接丢帧，避免越界读
-        if (rgbBuffer.capacity() < byteCount) return
-
-        // UI 正在绘制：这一帧直接丢掉（转换也一起省掉），保证下面要写的那块位图
-        // 一定没人在读。720p 下一帧转换不便宜，能省就省。
-        if (uiDrawing) return
-
+        
         // Reuse pixel buffer（尺寸不变时零分配）
         val cached = pixelBuffer
         val pixels = if (cached != null && cached.size == pixelCount) {
@@ -225,28 +214,19 @@ class CameraPreviewView @JvmOverloads constructor(
             IntArray(pixelCount).also { pixelBuffer = it }
         }
         
-        // Convert RGB to ARGB（写的是相机线程私有数组，不需要加锁）。
-        // 先整块 memcpy 进 ByteArray，再按像素打包：直接对 direct ByteBuffer
-        // 逐字节 get() 在 720p 下就是每帧 270 万次调用，光边界检查就能把相机
-        // 线程的帧预算吃掉。
-        val cachedBytes = rgbBytesBuffer
-        val rgbBytes = if (cachedBytes != null && cachedBytes.size == byteCount) {
-            cachedBytes
-        } else {
-            ByteArray(byteCount).also { rgbBytesBuffer = it }
-        }
-        rgbBuffer.clear()
-        rgbBuffer.get(rgbBytes)
-        var src = 0
-        for (i in 0 until pixelCount) {
-            val r = rgbBytes[src].toInt() and 0xFF
-            val g = rgbBytes[src + 1].toInt() and 0xFF
-            val b = rgbBytes[src + 2].toInt() and 0xFF
+        // Convert RGB to ARGB（写的是相机线程私有数组，不需要加锁）
+        rgbBuffer.rewind()
+        for (i in pixels.indices) {
+            val r = rgbBuffer.get().toInt() and 0xFF
+            val g = rgbBuffer.get().toInt() and 0xFF
+            val b = rgbBuffer.get().toInt() and 0xFF
             pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            src += 3
         }
+        rgbBuffer.rewind()
         
-        // UI 正在绘制时会在上一段提前丢帧，走到这里说明可以安全发布
+        // UI 正在绘制：这一帧直接丢掉，保证下面要写的那块位图一定没人在读
+        if (uiDrawing) return
+        
         synchronized(bitmapLock) {
             // 尺寸变了：摘掉发布出去的引用，旧图交给主线程回收后重建
             if (frameWidth != width || frameHeight != height) {
@@ -319,7 +299,6 @@ class CameraPreviewView @JvmOverloads constructor(
         }
         visualizationDataRef.set(null)
         pixelBuffer = null
-        rgbBytesBuffer = null
         postInvalidate()
     }
     
