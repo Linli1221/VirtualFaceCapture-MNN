@@ -976,6 +976,105 @@ async function main() {
     info('realpath: window.__vfc.applyTrack/freeze not exposed; injection phase skipped', {});
   }
 
+  // ---------- 5b-2) 本地姿态校准（镜头没正对你时的「一键校准」） ----------
+  if (vfcApi) {
+    const calib = await page.evaluate(async () => {
+      const vfc = window.__vfc;
+      const api = {
+        align: typeof vfc.align === 'function',
+        setPoseOffset: typeof vfc.setPoseOffset === 'function',
+        poseOffset: !!vfc.poseOffset,
+        ui: !!document.getElementById('btn-align'),
+        sliders: ['cal-yaw', 'cal-pitch', 'cal-roll'].filter((id) => !!document.getElementById(id)).length,
+      };
+      if (!api.align || !api.setPoseOffset || !vfc.applyTrack) return { api, ok: false, reason: 'align API missing' };
+      const bs = new Array(52).fill(0);
+      const pose = [4, 12, -6]; // 模拟「镜头斜着架」造成的固定头姿偏移
+      vfc.freeze(true);
+      vfc.setPoseOffset({ pitch: 0, yaw: 0, roll: 0 });
+      const alignment = vfc.align(0.6);
+      const activeUi = { active: vfc.calibration.active, label: document.getElementById('btn-align').textContent };
+      for (let i = 0; i < 40; i++) {
+        vfc.applyTrack({ bs, pose, face: true, seq: i, t: Date.now() });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const result = await alignment;
+      const offset = vfc.poseOffset;
+      const stored = (() => { try { return window.localStorage.getItem('vfc.poseOffset'); } catch { return null; } })();
+      // 校准后同一姿势应映射到 0 角度；清零后再喂同一姿势应重新偏出去
+      const after = vfc.applyTrack({ bs, pose, face: true, seq: 999, t: Date.now() });
+      vfc.setPoseOffset({ pitch: 0, yaw: 0, roll: 0 });
+      const cleared = vfc.applyTrack({ bs, pose, face: true, seq: 1000, t: Date.now() });
+      const calibrationDebug = JSON.parse(JSON.stringify(window.__vfcDebug.calibration || null));
+      // 手动微调：input 即时生效、change 落盘、标签同步
+      const yawSlider = document.getElementById('cal-yaw');
+      yawSlider.value = '7.5';
+      yawSlider.dispatchEvent(new Event('input', { bubbles: true }));
+      const liveOffset = vfc.poseOffset;
+      yawSlider.dispatchEvent(new Event('change', { bubbles: true }));
+      const sliderStored = (() => { try { return JSON.parse(window.localStorage.getItem('vfc.poseOffset') || 'null'); } catch { return null; } })();
+      const sliderLabel = document.getElementById('cal-yaw-val').textContent;
+      vfc.setPoseOffset({ pitch: 0, yaw: 0, roll: 0 });
+      yawSlider.value = '0';
+      yawSlider.dispatchEvent(new Event('input', { bubbles: true }));
+      yawSlider.dispatchEvent(new Event('change', { bubbles: true }));
+      // 手机重做基线（calib active:false）→ 本地偏移应自动清零，避免双重校准
+      vfc.setPoseOffset({ pitch: 2, yaw: 5, roll: -1 });
+      vfc.client.handleMessage(JSON.stringify({ type: 'calib', active: true }));
+      vfc.client.handleMessage(JSON.stringify({ type: 'calib', active: false }));
+      const afterPhoneCalib = { offset: vfc.poseOffset, hint: document.getElementById('calib-hint').textContent };
+      vfc.freeze(false);
+      return {
+        api,
+        activeUi,
+        ok: !!(result && result.ok),
+        result,
+        offset,
+        stored,
+        afterParams: after ? after.params : null,
+        clearedParams: cleared ? cleared.params : null,
+        calibrationDebug,
+        slider: { live: liveOffset, stored: sliderStored, label: sliderLabel },
+        afterPhoneCalib,
+      };
+    });
+    RESULT.calibration = calib;
+    check('calib: 校准 API / UI 就位（按钮 + 3 个滑块）', calib.api.ui && calib.api.sliders === 3 && calib.api.align && calib.api.setPoseOffset, calib.api);
+    check('calib: 一键校准成功采样（>=12 帧）', !!(calib.result && calib.result.ok && calib.result.samples >= 12), calib.result);
+    check('calib: 采样中按钮变「取消校准」且 calibration.active=true',
+      !!calib.activeUi && calib.activeUi.active === true && calib.activeUi.label === '取消校准', calib.activeUi);
+    const offsetClose = (a, b) => typeof a === 'number' && Math.abs(a - b) <= 1.5;
+    check('calib: offset ≈ [-4,-12,+6]（把固定偏移取反）',
+      !!calib.offset && offsetClose(calib.offset.pitch, -4) && offsetClose(calib.offset.yaw, -12) && offsetClose(calib.offset.roll, 6),
+      calib.offset);
+    check('calib: 校准后同一姿势 → ParamAngleX/Y/Z ≈ 0',
+      !!calib.afterParams && ['ParamAngleX', 'ParamAngleY', 'ParamAngleZ'].every((k) => Math.abs(calib.afterParams[k] ?? 99) < 0.01),
+      calib.afterParams && { x: calib.afterParams.ParamAngleX, y: calib.afterParams.ParamAngleY, z: calib.afterParams.ParamAngleZ });
+    check('calib: 清零后同一姿势重新偏出去（offset 真的作用在映射前）',
+      !!calib.clearedParams && Math.abs(calib.clearedParams.ParamAngleX ?? 0) + Math.abs(calib.clearedParams.ParamAngleY ?? 0) + Math.abs(calib.clearedParams.ParamAngleZ ?? 0) > 1,
+      calib.clearedParams && { x: calib.clearedParams.ParamAngleX, y: calib.clearedParams.ParamAngleY, z: calib.clearedParams.ParamAngleZ });
+    check('calib: offset 持久化到 localStorage',
+      !!calib.stored && Math.abs(JSON.parse(calib.stored).yaw - (-12)) <= 1.5,
+      calib.stored);
+    check('calib: 滑块 input 即时生效 / change 落盘 / 数值标签同步',
+      !!calib.slider && Math.abs(calib.slider.live.yaw - 7.5) < 1e-9 &&
+        !!calib.slider.stored && Math.abs(calib.slider.stored.yaw - 7.5) < 1e-9 &&
+        String(calib.slider.label).includes('+7.5'),
+      calib.slider);
+    check('calib: __vfcDebug.calibration 暴露状态（stored=false + lastAlign 采样数）',
+      !!calib.calibrationDebug && calib.calibrationDebug.stored === false &&
+        calib.calibrationDebug.lastAlignSamples >= 12,
+      calib.calibrationDebug);
+    const pc = calib.afterPhoneCalib;
+    check('calib: 手机重做基线后本地偏移自动清零（避免双重校准）',
+      !!pc && Math.abs(pc.offset.pitch) < 1e-9 && Math.abs(pc.offset.yaw) < 1e-9 && Math.abs(pc.offset.roll) < 1e-9 &&
+        String(pc.hint).includes('已清零'),
+      pc);
+    await sleep(300);
+  } else {
+    info('calib: window.__vfc.align 不可用，跳过本地姿态校准检查（advisory）', {});
+  }
+
   // ---------- 5c) extra acceptance: models list / model switch / reconnect / transparency ----------
   // (a) /api/models
   try {

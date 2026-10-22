@@ -10,6 +10,18 @@
  *   window.__vfcDebug = { version, ready, model, wsUrl, connected, frames, seq, fps, latencyMs, lastTrack, params, angles, ... }
  */
 import { createMapper, BS_INDEX } from "./mapping.js";
+import {
+  ALIGN_DURATION_MS,
+  DEFAULT_POSE_OFFSET,
+  POSE_OFFSET_STORAGE_KEY,
+  PoseOffsetCollector,
+  applyPoseOffset,
+  decodePoseOffset,
+  encodePoseOffset,
+  formatPoseOffset,
+  isNeutralOffset,
+  sanitizePoseOffset,
+} from "./calibrate.js";
 import { Live2DStage, checkEnvironment } from "./live2d.js";
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws";
@@ -17,6 +29,13 @@ const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
 const HEARTBEAT_INTERVAL_MS = 5000;
 const STALE_TIMEOUT_MS = 20000;
 const SMOOTHING = 0.6;
+
+/** 一键校准期间进度提示的刷新间隔（ms）。 */
+const ALIGN_TICK_MS = 100;
+
+/** 三轴偏移的展示顺序 / 标签（滑块、提示共用）。 */
+const POSE_AXES = ["yaw", "pitch", "roll"];
+const POSE_AXIS_LABELS = { yaw: "左右", pitch: "上下", roll: "歪头" };
 
 /** PC 端渲染目标帧率（协议 §9：60 FPS @ 1080p）；0 = 不限制，交给 vsync。 */
 const DEFAULT_TARGET_FPS = 60;
@@ -71,7 +90,21 @@ const ui = {
   tgOnTop: document.getElementById("tg-ontop"),
   tgThrough: document.getElementById("tg-through"),
   nativeHint: document.getElementById("native-hint"),
+  btnAlign: document.getElementById("btn-align"),
   btnRecalib: document.getElementById("btn-recalib"),
+  btnCalibReset: document.getElementById("btn-calib-reset"),
+  calibBox: document.getElementById("calib-box"),
+  calibHint: document.getElementById("calib-hint"),
+  calibSliders: {
+    yaw: document.getElementById("cal-yaw"),
+    pitch: document.getElementById("cal-pitch"),
+    roll: document.getElementById("cal-roll"),
+  },
+  calibValues: {
+    yaw: document.getElementById("cal-yaw-val"),
+    pitch: document.getElementById("cal-pitch-val"),
+    roll: document.getElementById("cal-roll-val"),
+  },
   btnHide: document.getElementById("btn-hide"),
   btnQuit: document.getElementById("btn-quit"),
   debugBox: document.getElementById("debug-box"),
@@ -104,6 +137,14 @@ const state = {
   phoneFps: null,
   fpsWindowFrames: 0,
   fpsWindowStart: performance.now(),
+  /** 本地姿态偏移（镜头没正对你时的校准量，会持久化）。 */
+  poseOffset: decodePoseOffset(storeGet(POSE_OFFSET_STORAGE_KEY)),
+  /** 正在跑的一键校准：{collector, startedAt, durationMs, timer, promise, resolve}。 */
+  align: null,
+  /** 最近一次成功校准的报告（调试 / 提示用）。 */
+  lastAlign: null,
+  /** 最近一帧「叠加偏移后」的 pose（调试面板显示）。 */
+  lastAppliedPose: null,
 };
 
 const mapper = createMapper();
@@ -466,8 +507,16 @@ const client = new TrackerClient({
       mapper.reset();
       setStatus("手机正在校准（已重置姿态归一化）…", "connecting");
     } else {
+      // 手机重做基线后，pose 的零点已经由手机重新定义：本地偏移再叠上去会「双重校准」，
+      // 模型反而朝反方向偏。calib 之后基线一定变了，无条件清掉本地偏移；
+      // 需要更细的对齐再点「一键校准」。
+      if (!isNeutralOffset(state.poseOffset)) {
+        applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true });
+        setCalibHint("手机端基线已更新，本地对齐偏移已清零。如果模型还是歪的，点「一键校准」再对齐一次。", "warn");
+      }
       setStatus(state.device ? `已连接 · ${state.device}` : "已连接", "connected");
     }
+    publishDebug();
   },
   onPong(rttMs) {
     state.rttMs = state.rttMs == null ? rttMs : state.rttMs * 0.7 + rttMs * 0.3;
@@ -503,10 +552,16 @@ function feedTrack(track) {
   if (!track || typeof track !== "object") return false;
 
   const now = performance.now();
-  const result = mapper.apply(track.bs ?? [], track.pose ?? [0, 0, 0]);
+  // 本地姿态校准：镜头没正对你时，收到的 pose 会带一个固定偏移，先叠加本地 offset 再映射。
+  const pose = applyPoseOffset(track.pose, state.poseOffset);
+  const result = mapper.apply(track.bs ?? [], pose);
   state.lastTrack = track;
   state.lastResult = result;
+  state.lastAppliedPose = { pitch: pose[0], yaw: pose[1], roll: pose[2] };
   state.frames += 1;
+
+  // 一键校准进行中：把这一帧收进采样器（只收 face !== false 的合法 pose）。
+  if (state.align) state.align.collector.addTrack(track);
 
   if (Number.isFinite(Number(track.seq))) state.seq = Number(track.seq);
   if (track.fps != null && Number.isFinite(Number(track.fps))) state.phoneFps = Number(track.fps);
@@ -547,6 +602,19 @@ function publishDebug() {
   debugState.params = params;
   debugState.normalized = result?.normalized ?? null;
   debugState.raw = result?.raw ?? null;
+  debugState.poseOffset = { ...state.poseOffset };
+  debugState.calibratedPose = state.lastAppliedPose ? { ...state.lastAppliedPose } : null;
+  debugState.calibration = {
+    active: !!state.align,
+    samples: state.align ? state.align.collector.count : 0,
+    remainingMs: state.align
+      ? Math.max(0, Math.round(state.align.startedAt + state.align.durationMs - performance.now()))
+      : 0,
+    stored: !isNeutralOffset(state.poseOffset),
+    lastAlignAt: state.lastAlign ? state.lastAlign.at : null,
+    lastAlignSamples: state.lastAlign ? state.lastAlign.samples : null,
+    lastAlignSpread: state.lastAlign ? state.lastAlign.spread : null,
+  };
   debugState.angles = {
     x: params?.ParamAngleX ?? 0,
     y: params?.ParamAngleY ?? 0,
@@ -566,6 +634,153 @@ function publishDebug() {
   debugState.frozen = state.frozen;
   debugState.error = state.error;
   debugState.missingParams = stage.missingParams ?? [];
+}
+
+// ---------------------------------------------------------------- 姿态校准（镜头没正对你）
+
+function signedDeg(value) {
+  const n = Number(value);
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${(Number.isFinite(n) ? n : 0).toFixed(1)}°`;
+}
+
+function setCalibHint(text, tone = "muted") {
+  if (!ui.calibHint) return;
+  ui.calibHint.textContent = text;
+  ui.calibHint.dataset.tone = tone;
+}
+
+/** 把 offset 落到 state / localStorage / 归一化窗口，并刷新校准 UI。 */
+function applyPoseCalibration(offset, { persist = true, resetNormalizers = true } = {}) {
+  state.poseOffset = sanitizePoseOffset(offset);
+  // 旧的自适应量程是按旧零点观察到的：换零点后重来，否则前几秒模型会「不跟手」。
+  if (resetNormalizers) mapper.reset();
+  if (persist) storeSet(POSE_OFFSET_STORAGE_KEY, encodePoseOffset(state.poseOffset));
+  renderCalibUi();
+  publishDebug();
+  return { ...state.poseOffset };
+}
+
+function renderCalibUi() {
+  const offset = state.poseOffset;
+  for (const axis of POSE_AXES) {
+    const input = ui.calibSliders[axis];
+    const label = ui.calibValues[axis];
+    if (!input || !label) continue;
+    // 拖动中不要回写 value，否则滑块会被拽回去。
+    if (document.activeElement !== input) input.value = String(offset[axis]);
+    label.textContent = signedDeg(offset[axis]);
+  }
+  if (ui.btnCalibReset) ui.btnCalibReset.disabled = isNeutralOffset(offset);
+  const summary = ui.calibBox?.querySelector("summary");
+  if (summary) {
+    summary.textContent = isNeutralOffset(offset)
+      ? "手动微调姿态（未校准）"
+      : `手动微调姿态（已校准 ${formatPoseOffset(offset)}）`;
+  }
+  if (ui.btnAlign) {
+    ui.btnAlign.classList.toggle("active", !!state.align);
+    ui.btnAlign.title = state.align ? "点击取消本次校准" : "保持坐姿 3 秒，把当前头姿记为中性（镜头不正对你时用）";
+    ui.btnAlign.textContent = state.align ? "取消校准" : "一键校准";
+  }
+}
+
+/**
+ * 一键校准：接下来 durationMs 内收到的 pose 取「截尾平均」并取反，作为新的中性零点。
+ * 返回的 Promise 在采样结束 / 取消 / 帧数不足时 resolve，便于端到端测试。
+ */
+function startAlign(durationMs = ALIGN_DURATION_MS) {
+  if (state.align) return state.align.promise;
+  if (!state.connected && !state.frozen) {
+    setStatus("未连接，无法校准", "error");
+    setCalibHint("还没连上手机，先连接再校准。", "warn");
+    return Promise.resolve({ ok: false, reason: "not-connected" });
+  }
+
+  const totalMs = Math.max(300, Number(durationMs) || ALIGN_DURATION_MS);
+  const collector = new PoseOffsetCollector();
+  let resolveFn;
+  const promise = new Promise((resolve) => {
+    resolveFn = resolve;
+  });
+  state.align = {
+    collector,
+    startedAt: performance.now(),
+    durationMs: totalMs,
+    timer: null,
+    promise,
+    resolve: resolveFn,
+  };
+  setCalibHint(`保持自然坐姿，看向屏幕：${(totalMs / 1000).toFixed(1)} 秒后把当前头姿记为中性…`, "active");
+  setStatus("校准中：保持自然坐姿…", "connecting");
+  renderCalibUi();
+  state.align.timer = setInterval(() => tickAlign(false), ALIGN_TICK_MS);
+  tickAlign(false);
+  return promise;
+}
+
+function tickAlign(cancelled) {
+  const align = state.align;
+  if (!align) return;
+  const remaining = Math.max(0, align.durationMs - (performance.now() - align.startedAt));
+  if (!cancelled) {
+    setCalibHint(
+      `保持当前坐姿：剩余 ${(remaining / 1000).toFixed(1)} s · 已采集 ${align.collector.count} 帧`,
+      "active",
+    );
+  }
+  if (cancelled || remaining <= 0) finishAlign(cancelled);
+}
+
+function finishAlign(cancelled) {
+  const align = state.align;
+  if (!align) return null;
+  state.align = null;
+  clearInterval(align.timer);
+
+  const report = align.collector.report();
+  let outcome;
+  if (cancelled) {
+    setCalibHint("已取消校准，偏移未改变。", "muted");
+    setStatus(state.connected ? (state.device ? `已连接 · ${state.device}` : "已连接") : "未连接", connPhase());
+    outcome = { ok: false, reason: "cancelled", report };
+  } else if (!report.ready) {
+    setCalibHint(
+      `只收到 ${report.samples} 帧有效人脸（至少要 12 帧）。确认手机还在推流、画面里能看到脸，再试一次。`,
+      "warn",
+    );
+    setStatus("校准失败：没有足够的人脸帧", "error");
+    outcome = { ok: false, reason: "no-samples", report };
+  } else {
+    const applied = applyPoseCalibration(report.offset, { persist: true });
+    const steady = report.stable;
+    state.lastAlign = {
+      at: Date.now(),
+      samples: report.samples,
+      spread: report.spread,
+      offset: applied,
+    };
+    setCalibHint(
+      `已校准：偏移 ${formatPoseOffset(applied)}，${report.samples} 帧，抖动 ${report.spread.toFixed(1)}°。` +
+        (steady ? "下次换座位 / 重新架手机后再点一次即可。" : "刚才头在动，建议坐定后再点一次更准。"),
+      steady ? "ok" : "warn",
+    );
+    setStatus(
+      steady ? "校准完成：已把当前头姿记为中性" : "校准完成（刚才头在动，可能不够准）",
+      "connected",
+    );
+    outcome = { ok: true, offset: applied, samples: report.samples, spread: report.spread, report };
+  }
+
+  renderCalibUi();
+  publishDebug();
+  align.resolve(outcome);
+  return outcome;
+}
+
+function cancelAlign() {
+  if (!state.align) return { ok: false, reason: "idle" };
+  return finishAlign(true);
 }
 
 // ---------------------------------------------------------------- 模型
@@ -664,6 +879,10 @@ function renderDebugGrid() {
     ["pose pitch", fmt(pose[0], 2)],
     ["pose yaw", fmt(pose[1], 2)],
     ["pose roll", fmt(pose[2], 2)],
+    ["偏移 p/y/r", formatPoseOffset(state.poseOffset)],
+    ["校准后 pose", state.lastAppliedPose
+      ? `${fmt(state.lastAppliedPose.pitch, 2)} / ${fmt(state.lastAppliedPose.yaw, 2)} / ${fmt(state.lastAppliedPose.roll, 2)}`
+      : "-"],
     ["norm pitch", fmt(result?.normalized?.pitch, 3)],
     ["norm yaw", fmt(result?.normalized?.yaw, 3)],
     ["norm roll", fmt(result?.normalized?.roll, 3)],
@@ -806,8 +1025,46 @@ function wireUi() {
       setStatus("未连接，无法发送重新校准命令", "error");
       return;
     }
+    // 手机校准期间 pose 是「未归零」的原始值，正在采样的一键校准会被污染。
+    cancelAlign();
     mapper.reset();
     setStatus("已发送重新校准命令，等待手机 ack…", "connecting");
+    setCalibHint("已让手机重做中性脸基线：校准完成后本地对齐偏移会自动清零，需要再点「一键校准」做最后的对齐。", "active");
+  });
+
+  // ---- 姿态校准：一键对齐 + 手动微调 ----
+
+  ui.btnAlign.addEventListener("click", () => {
+    if (state.align) cancelAlign();
+    else startAlign();
+  });
+
+  for (const axis of POSE_AXES) {
+    const input = ui.calibSliders[axis];
+    if (!input) continue;
+    input.min = String(-45);
+    input.max = String(45);
+    input.step = "0.5";
+    input.addEventListener("input", () => {
+      const next = { ...state.poseOffset, [axis]: Number(input.value) };
+      applyPoseCalibration(next, { persist: false });
+      setCalibHint(
+        `正在微调「${POSE_AXIS_LABELS[axis]}」${signedDeg(state.poseOffset[axis])}：拖到模型正对镜头，松手后自动保存。`,
+        "muted",
+      );
+    });
+    input.addEventListener("change", () => {
+      storeSet(POSE_OFFSET_STORAGE_KEY, encodePoseOffset(state.poseOffset));
+      setCalibHint(
+        `已保存偏移 ${formatPoseOffset(state.poseOffset)}。换座位 / 重新架手机后点一次「一键校准」更省事。`,
+        "ok",
+      );
+    });
+  }
+
+  ui.btnCalibReset?.addEventListener("click", () => {
+    applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true });
+    setCalibHint("已清零：模型重新按手机端基线驱动。", "muted");
   });
 
   ui.btnHide.addEventListener("click", () => toggleUiHidden());
@@ -873,6 +1130,40 @@ window.__vfc = {
     return state.lastResult;
   },
 
+  /** 本地姿态偏移（镜头没正对你时的校准量，度）。 */
+  get poseOffset() {
+    return { ...state.poseOffset };
+  },
+  /** 直接设置三轴偏移（度），立即生效并持久化。 */
+  setPoseOffset(offset) {
+    return applyPoseCalibration(offset, { persist: true });
+  },
+  /** 一键校准状态（verifier / 调试用）。 */
+  get calibration() {
+    return {
+      active: !!state.align,
+      samples: state.align ? state.align.collector.count : 0,
+      remainingMs: state.align
+        ? Math.max(0, Math.round(state.align.startedAt + state.align.durationMs - performance.now()))
+        : 0,
+      offset: { ...state.poseOffset },
+      neutral: isNeutralOffset(state.poseOffset),
+      lastAlign: state.lastAlign ? { ...state.lastAlign } : null,
+    };
+  },
+  /**
+   * 一键校准：接下来 seconds 秒内采样收到的 pose，取反后作为新的中性零点。
+   * @returns {Promise<{ok:boolean, offset?:object, samples?:number, spread?:number, reason?:string}>}
+   */
+  align(seconds = ALIGN_DURATION_MS / 1000) {
+    const value = Number(seconds);
+    const durationMs = Number.isFinite(value) ? Math.max(0.3, value) * 1000 : ALIGN_DURATION_MS;
+    return startAlign(durationMs);
+  },
+  cancelAlign() {
+    return cancelAlign();
+  },
+
   /** 把当前 canvas 缩略成小图并算像素统计（自测 / 截图前后对比用，证明画面真的变了）。 */
   pixelStats(size = 192) {
     const canvas = stage.app?.view;
@@ -912,6 +1203,14 @@ window.__vfc = {
   state() {
     return {
       ...state,
+      align: state.align
+        ? {
+            active: true,
+            samples: state.align.collector.count,
+            remainingMs: Math.max(0, Math.round(state.align.startedAt + state.align.durationMs - performance.now())),
+          }
+        : null,
+      poseOffset: { ...state.poseOffset },
       params: state.lastResult?.params ?? null,
       normalized: state.lastResult?.normalized ?? null,
       ready: stage.ready,
@@ -961,6 +1260,7 @@ window.__vfc = {
 
 async function boot() {
   wireUi();
+  renderCalibUi(); // 把 localStorage 里保存的本地姿态偏移回填到滑块 / 提示
   await initNativeControls();
   ui.renderFps.title =
     stage.targetFps > 0 ? `目标 ${stage.targetFps} fps（URL ?fps=<n> 可改，0 = 不限）` : "不限制帧率（跟随 vsync）";

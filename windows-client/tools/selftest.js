@@ -9,6 +9,15 @@
  */
 import assert from "node:assert/strict";
 import { createMapper, mapBshapes, mapTrackToParams, AdaptiveAngleNormalizer, BS_INDEX, BS_COUNT, PARAM_IDS } from "../renderer/mapping.js";
+import {
+  PoseOffsetCollector,
+  applyPoseOffset,
+  decodePoseOffset,
+  encodePoseOffset,
+  formatPoseOffset,
+  isNeutralOffset,
+  sanitizePoseOffset,
+} from "../renderer/calibrate.js";
 import { ParamTimeline } from "../renderer/interp.js";
 import { discoverModels, startServer } from "../server.js";
 
@@ -160,6 +169,92 @@ await test("AdaptiveAngleNormalizer 负向量程独立自适应", () => {
   normalizer.reset();
   assert.equal(normalizer.samples, 0);
   near(normalizer.normalize(-5), -5 / (20 * 0.99 + 0.5 * 0.01), 1e-9);
+});
+
+console.log("[selftest] calibrate.js · 本地姿态校准（镜头没正对你时）");
+
+await test("applyPoseOffset：三轴相加、返回长度 3、不修改输入", () => {
+  const pose = [2, 8, -3];
+  const out = applyPoseOffset(pose, { pitch: -2, yaw: -8, roll: 3 });
+  assert.deepEqual(out, [0, 0, 0]);
+  assert.deepEqual(pose, [2, 8, -3], "不应修改调用方的 pose 数组");
+  assert.equal(out.length, 3);
+});
+
+await test("applyPoseOffset：坏数据 / 缺字段按 0 处理，不抛异常", () => {
+  assert.deepEqual(applyPoseOffset(undefined, { yaw: 5 }), [0, 5, 0]);
+  assert.deepEqual(applyPoseOffset([NaN, "x", null], null), [0, 0, 0]);
+  assert.deepEqual(applyPoseOffset({}, { pitch: 1 }), [1, 0, 0]);
+});
+
+await test("sanitizePoseOffset：±45° 截断 + 非数字归零 + 接受数组", () => {
+  assert.deepEqual(sanitizePoseOffset({ pitch: 90, yaw: -90, roll: "x" }), { pitch: 45, yaw: -45, roll: 0 });
+  assert.deepEqual(sanitizePoseOffset([1, 2, 3]), { pitch: 1, yaw: 2, roll: 3 });
+  assert.deepEqual(sanitizePoseOffset(null), { pitch: 0, yaw: 0, roll: 0 });
+});
+
+await test("encode / decode：坏 JSON / 空值回落到 0，合法值往返一致", () => {
+  const offset = { pitch: -2.5, yaw: 8, roll: 0.5 };
+  assert.deepEqual(decodePoseOffset(encodePoseOffset(offset)), offset);
+  assert.deepEqual(decodePoseOffset("not json"), { pitch: 0, yaw: 0, roll: 0 });
+  assert.deepEqual(decodePoseOffset(null), { pitch: 0, yaw: 0, roll: 0 });
+  assert.deepEqual(decodePoseOffset('{"yaw":999}'), { pitch: 0, yaw: 45, roll: 0 });
+});
+
+await test("isNeutralOffset / formatPoseOffset", () => {
+  assert.equal(isNeutralOffset({ pitch: 0.01, yaw: -0.02, roll: 0 }), true);
+  assert.equal(isNeutralOffset({ pitch: 0, yaw: 0.2, roll: 0 }), false);
+  assert.equal(formatPoseOffset({ pitch: 2.5, yaw: -8, roll: 0 }), "+2.5° / -8.0° / 0.0°");
+});
+
+await test("PoseOffsetCollector：face=false / 非有限 pose 不计入，帧数够才 ready", () => {
+  const collector = new PoseOffsetCollector({ minSamples: 3 });
+  assert.equal(collector.addTrack({ face: false, pose: [1, 2, 3] }), false);
+  assert.equal(collector.addTrack({ face: true, pose: [NaN, 0, 0] }), false);
+  assert.equal(collector.addPose([500, 0, 0]), false, "超出 ±100° 的坏帧应丢弃");
+  assert.equal(collector.ready, false);
+  collector.addTrack({ face: true, pose: [2, 8, -3] });
+  collector.addTrack({ face: true, pose: [2, 8, -3] });
+  assert.equal(collector.ready, false);
+  collector.addTrack({ face: true, pose: [2, 8, -3] });
+  assert.equal(collector.ready, true);
+  assert.deepEqual(collector.report().offset, { pitch: -2, yaw: -8, roll: 3 });
+  assert.equal(collector.rejectedFrames, 3);
+});
+
+await test("PoseOffsetCollector：截尾平均忽略偶发极值（抖一帧不会把零点带歪）", () => {
+  const collector = new PoseOffsetCollector({ minSamples: 6, outlierFraction: 0.2 });
+  for (let i = 0; i < 6; i++) collector.addPose([4, 10, -2]);
+  collector.addPose([40, 60, -40]);
+  collector.addPose([4, 10, -2]);
+  collector.addPose([4, 10, -2]);
+  const report = collector.report();
+  assert.deepEqual(report.offset, { pitch: -4, yaw: -10, roll: 2 });
+  assert.ok(report.spread > 5, "应能看出抖动，实际 " + report.spread);
+  assert.equal(report.stable, false);
+});
+
+await test("PoseOffsetCollector：maxSamples 上限 + reset + 稳定判定", () => {
+  const collector = new PoseOffsetCollector({ minSamples: 2, maxSamples: 5 });
+  for (let i = 0; i < 10; i++) collector.addPose([1, 2, 3]);
+  assert.equal(collector.count, 5);
+  const report = collector.report();
+  assert.deepEqual(report.offset, { pitch: -1, yaw: -2, roll: -3 });
+  assert.equal(report.stable, true);
+  assert.equal(report.spread, 0);
+  collector.reset();
+  assert.equal(collector.count, 0);
+  assert.equal(collector.ready, false);
+});
+
+await test("校准后零姿态映射到 ParamAngle 0（本地偏移抵消固定角度）", () => {
+  const offset = { pitch: -2, yaw: -8, roll: 3 };
+  const mapper = createMapper();
+  const result = mapper.apply(makeBs(), applyPoseOffset([2, 8, -3], offset));
+  near(result.params.ParamAngleX, 0, 1e-12);
+  near(result.params.ParamAngleY, 0, 1e-12);
+  near(result.params.ParamAngleZ, 0, 1e-12);
+  near(result.params.ParamBodyAngleX, 0, 1e-12);
 });
 
 console.log("[selftest] interp.js · 输入帧率低 / 间隔不稳定时的插值与抖动缓冲");

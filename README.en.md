@@ -252,7 +252,8 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 | **Borderless** | no title bar — combine with transparent for a "character only" overlay |
 | **Always on top** | keep the avatar above other windows |
 | **Click-through** | mouse passes through the window; **press `Ctrl + Alt + T` to undo** (global hotkey) |
-| **Recalibrate** | ask the phone to redo the neutral baseline and reset the adaptive ranges |
+| **One-click calibration + fine-tune** | when the phone camera is not facing you (mounted to the side, new seat), hold still for 3 s to treat the current head pose as neutral, then nudge yaw / pitch / roll with sliders. The offset is saved and survives restarts |
+| **Redo phone baseline** | asks the phone to recapture its neutral face baseline (expression + head pose) and resets the PC adaptive ranges; the local pose offset is cleared afterwards to avoid double calibration |
 | **Hide UI / Debug** | `H` hides every panel (avatar only), `D` toggles the live parameter grid |
 
 Disconnects reconnect automatically (0.5 s → 1 s → 2 s → 5 s, capped) and the avatar returns to

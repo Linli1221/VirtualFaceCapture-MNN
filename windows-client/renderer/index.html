@@ -51,10 +51,35 @@
         <div class="hint" id="native-hint" hidden>窗口开关需要 Electron（npm start）才生效；浏览器里请用 ?transparent=1 测试透明底。</div>
 
         <div class="actions">
-          <button id="btn-recalib" title="让手机重做中性脸基线校准">重新校准</button>
+          <button id="btn-align" class="primary" title="保持坐姿 3 秒，把当前头姿记为中性（镜头不正对你时用）">一键校准</button>
           <button id="btn-hide" title="隐藏面板（快捷键 H）">隐藏面板</button>
           <button id="btn-quit" hidden>退出</button>
         </div>
+
+        <details id="calib-box" class="debug calib">
+          <summary>手动微调姿态（未校准）</summary>
+          <div class="calib-grid">
+            <label for="cal-yaw">左右</label>
+            <input id="cal-yaw" type="range" min="-45" max="45" step="0.5" value="0" />
+            <b id="cal-yaw-val">0.0°</b>
+
+            <label for="cal-pitch">上下</label>
+            <input id="cal-pitch" type="range" min="-45" max="45" step="0.5" value="0" />
+            <b id="cal-pitch-val">0.0°</b>
+
+            <label for="cal-roll">歪头</label>
+            <input id="cal-roll" type="range" min="-45" max="45" step="0.5" value="0" />
+            <b id="cal-roll-val">0.0°</b>
+          </div>
+          <div class="calib-actions">
+            <button id="btn-recalib" title="让手机重做中性脸基线（表情 + 头姿）">手机重做基线</button>
+            <button id="btn-calib-reset" title="把三轴偏移清零">清零</button>
+          </div>
+          <div class="hint" id="calib-hint">
+            手机摄像头没正对你（斜着架 / 放在屏幕旁边 / 换了座位）时，模型会一直朝一个方向歪。
+            点「一键校准」保持自然坐姿 3 秒即可；还差一点就拖上面的滑块，直到模型正对镜头。偏移自动保存。
+          </div>
+        </details>
 
         <details id="debug-box" class="debug">
           <summary>调试参数</summary>
