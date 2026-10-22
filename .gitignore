@@ -7,6 +7,13 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Release 签名：私钥与密码永远不要提交
+keystore.properties
+*.jks
+*.keystore
+*.p12
+
 /MNNSource/
 /MNNDemo/
 /OpenSeeFaceSource/

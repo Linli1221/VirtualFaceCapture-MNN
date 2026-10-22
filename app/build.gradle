@@ -4,6 +4,29 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Release 签名
+//
+// 读取顺序：环境变量（CI Secrets） → keystore.properties（本地）。
+// 两者都没有时回退到 debug key：包能出、也能装，但 **CI 每次的 debug key 都是新的**，
+// 签名不一样 → 覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE，必须先卸载。
+// 正式签名方式见 README「签名 / Release 打包」。
+// ─────────────────────────────────────────────────────────────────────────────
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+def releaseStoreFile = System.getenv('RELEASE_STORE_FILE') ?: keystoreProps.getProperty('storeFile')
+def releaseStorePassword = System.getenv('RELEASE_STORE_PASSWORD') ?: keystoreProps.getProperty('storePassword')
+def releaseKeyAlias = System.getenv('RELEASE_KEY_ALIAS') ?: keystoreProps.getProperty('keyAlias')
+def releaseKeyPassword = System.getenv('RELEASE_KEY_PASSWORD') ?: keystoreProps.getProperty('keyPassword')
+
+def hasReleaseSigning =
+        releaseStoreFile && rootProject.file(releaseStoreFile).exists() &&
+        releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
 android {
     namespace 'com.example.virtualfacecapture'
     compileSdk rootProject.ext.compileSdkVersion
@@ -26,11 +49,27 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        // 只有真的拿到 keystore 才创建 release 配置，否则 AGP 会因缺字段直接报错。
+        if (hasReleaseSigning) {
+            release {
+                storeFile rootProject.file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                // v1 兼容 Android 6 及以下，v2/v3 供 7.0+ 校验，全开最稳
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.debug
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
         }
     }
     compileOptions {

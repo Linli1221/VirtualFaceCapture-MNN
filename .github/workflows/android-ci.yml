@@ -73,9 +73,30 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      # Release 签名：把 keystore 以 base64 存进仓库 Secret（RELEASE_KEYSTORE_BASE64），
+      # 这里解码成临时文件再交给 Gradle（RELEASE_STORE_FILE）。
+      # 没配 Secret 时回退 debug key —— 能出包，但每次 runner 的 debug key 都是新生成的，
+      # 签名不同 → 覆盖安装会失败。见 README「签名 / Release 打包」。
+      - name: Prepare release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::warning::未配置 RELEASE_KEYSTORE_BASE64，Release APK 将用 debug key 签名：每次构建签名都不同，覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "RELEASE_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "Keystore decoded: $(wc -c < "$RUNNER_TEMP/release.jks") bytes"
+
       # versionCode = run_number（单调递增，可直接覆盖安装旧包）
       # versionName = 1.0.<run_number>+<commit>（区分每次修改的产物）
       - name: Build APKs
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           chmod +x ./gradlew
@@ -93,6 +114,26 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk "dist/VirtualFaceCapture-${short_sha}-release.apk"
           cp facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar "dist/facecapture-sdk-${short_sha}.aar"
           ls -lh dist
+
+      # 把签名证书指纹打到构建日志 / Summary：能直接看出这次用的是正式 key 还是 debug key，
+      # 以及多次构建之间签名有没有变。
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          "$APKSIGNER" verify --print-certs "dist/VirtualFaceCapture-${GITHUB_SHA:0:7}-release.apk" | tee "${RUNNER_TEMP}/certs.txt"
+          {
+            echo "### Release APK 签名"
+            echo '```'
+            grep -E "Signer #1 certificate (DN|SHA-256)" "${RUNNER_TEMP}/certs.txt" || true
+            echo '```'
+            if [ -n "${RELEASE_STORE_FILE:-}" ]; then
+              echo "首次安装 / 覆盖安装须知：签名证书已在 CI 固定，可覆盖安装旧包。"
+            else
+              echo "⚠️ 当前使用 debug key 签名，**每次构建签名都不同**：装新包前请先卸载旧包。"
+              echo "参考 README「签名 / Release 打包」配置正式签名。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

@@ -128,7 +128,9 @@ git submodule update --init --depth 1 ThirdParty/MNN   # 仅需 MNN 头文件
 
 - **任意分支 push / 任意 PR**：自动构建 Debug + Release APK 与 SDK AAR，
   到仓库 `Actions` → 对应运行 → `Artifacts` 下载安装包（保留 30 天）；
-- CI 产物自带版本号 `1.0.<运行号>+<commit>`（versionCode 单调递增），可直接覆盖安装旧包；
+- CI 产物自带版本号 `1.0.<运行号>+<commit>`（versionCode 单调递增）；
+- ⚠️ **能否覆盖安装取决于签名**：默认回退 debug key（每次构建都不同，必须先卸载旧包）；
+  配好下面的「正式签名」后签名固定，才能直接覆盖升级；
 - **发布正式安装包**：推送 `v` 开头的 tag，自动创建 GitHub Release 并附带 APK：
 
 ```bash
@@ -138,6 +140,77 @@ git push origin v1.0.0
 
 > 💡 想省去本地 Android 环境，直接从 Actions 产物下载 APK 安装即可；
 > 本地构建则需先执行上面的 `git submodule update` 获取 MNN 头文件。
+
+### 签名 / Release 打包
+
+不做任何配置时 `release` 包会用 **debug key** 签名。这能装、能跑，但有一个坑：
+**GitHub Actions 每台 runner 的 debug key 都是现场新生成的**，所以每次构建出来的包
+签名都不一样，装上新的会报：
+
+```
+INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package ... signatures do not match previously installed version
+```
+
+解法是把签名密钥固定下来（顺便这也是发布到应用商店 / 分享给别人所必需的）。
+
+#### 1. 生成密钥库
+
+```bash
+keytool -genkeypair -v \
+  -keystore virtualfacecapture-release.jks \
+  -alias virtualfacecapture \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -storepass <你的密码> -keypass <同一个密码> \
+  -dname "CN=VirtualFaceCapture, OU=Release, O=YourOrg, C=CN"
+```
+
+> 🔐 **这个 .jks 和密码务必自己备份好**：一旦丢失，就再也无法用同一个签名更新已安装的
+> App（只能让用户卸载重装）。它已经被 `.gitignore` 排除，**不要提交**。
+
+#### 2. 配到 GitHub（4 个 Secret）
+
+仓库 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`：
+
+| Secret | 值 |
+|---|---|
+| `RELEASE_KEYSTORE_BASE64` | 整个 `.jks` 文件的 base64（单行） |
+| `RELEASE_STORE_PASSWORD` | keystore 密码 |
+| `RELEASE_KEY_ALIAS` | 别名，如 `virtualfacecapture` |
+| `RELEASE_KEY_PASSWORD` | key 密码（通常同上） |
+
+base64 一行生成：
+
+```bash
+# Linux / macOS
+base64 -w 0 virtualfacecapture-release.jks
+# Windows PowerShell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("virtualfacecapture-release.jks"))
+```
+
+配好后每次 CI 都会用这把 key 签名，日志 / Summary 里会打印证书 DN 与 SHA-256 指纹，
+方便核对「这次和上次是不是同一个签名」。
+
+#### 3. 本地构建也能用
+
+在**仓库根目录**放一个 `keystore.properties`（已在 `.gitignore` 里）：
+
+```properties
+storeFile=/absolute/path/to/virtualfacecapture-release.jks
+storePassword=你的密码
+keyAlias=virtualfacecapture
+keyPassword=同一个密码
+```
+
+也可以用环境变量 `RELEASE_STORE_FILE` / `RELEASE_STORE_PASSWORD` /
+`RELEASE_KEY_ALIAS` / `RELEASE_KEY_PASSWORD`，优先级高于 `keystore.properties`。
+
+#### 4. 验证
+
+```bash
+apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk
+```
+
+顺带一提：**测帧率一定用 release 包**，debug 包带调试信息、跑得明显更慢。
 
 ### 作为 SDK 集成
 
