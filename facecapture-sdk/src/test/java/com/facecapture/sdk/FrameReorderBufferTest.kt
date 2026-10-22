@@ -8,8 +8,8 @@ import org.junit.Test
 /**
  * [FrameReorderBuffer] 的单元测试（纯 JVM，假时钟）。
  *
- * 场景都按「双通道」的真实时序构造：GPU 通道 ~12ms、CPU 通道 ~20ms，
- * 两路结果会以任意顺序到达重排缓冲。
+ * 场景都按「多路并行」的真实时序构造：两路 GPU 引擎的推理耗时不可能完全一致
+ * （~12ms / ~20ms），结果是会以任意顺序到达重排缓冲的。
  */
 class FrameReorderBufferTest {
 

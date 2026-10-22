@@ -87,12 +87,14 @@ class MediaPipeFaceDetector(private val context: Context) {
     
     private var isInitialized = false
     
-    /** CPU 副引擎（双通道）是否已就绪。 */
-    @Volatile
-    private var secondaryReady = false
-    
     companion object {
         private const val TAG = "MediaPipeFaceDetector"
+
+        /**
+         * 除了主引擎之外，最多还能开几路并行关键点引擎（GPU 并行）。
+         * 必须与原生侧的 `kMaxEngines - 1` 保持一致。
+         */
+        const val MAX_EXTRA_ENGINES = 3
         
         // Model file names in assets
         private const val DETECTOR_MODEL = "face_detector_mp.mnn"
@@ -249,30 +251,33 @@ class MediaPipeFaceDetector(private val context: Context) {
     
     private external fun nativeRelease()
     
-    // ========== CPU + GPU 双通道（多引擎）原生接口 ==========
+    // ========== GPU 多路并行（多引擎）原生接口 ==========
     // 引擎按线程绑定：每个推理线程调用一次 nativeSelectEngine 选定槽位，
     // 之后该线程上的所有 per-frame 调用都会落到选定槽位的 MNN session 上。
     
-    /** 把当前线程绑定到引擎槽位（0 = 主引擎，1 = CPU 副引擎）。 */
+    /** 把当前线程绑定到引擎槽位（0 = 主引擎，1..MAX_EXTRA_ENGINES = 并行关键点引擎）。 */
     private external fun nativeSelectEngine(index: Int)
     
     /** 当前线程绑定的引擎槽位（调试用）。 */
     private external fun nativeGetEngineIndex(): Int
     
     /**
-     * 初始化 CPU 副引擎（只加载 landmarker）。须在 [initialize] 之后调用。
-     * @param useVulkan 期望后端；失败会自动回退 CPU
+     * 初始化一个额外的关键点引擎（只加载 landmarker）。须在 [initialize] 之后调用。
+     * @param slot 槽位，1..[MAX_EXTRA_ENGINES]
+     * @param useVulkan true = 再开一路 Vulkan（默认，走 GPU 并行）；false = CPU 后端
      * @param numThreads MNN 线程数，<=0 沿用主引擎线程数
      */
-    private external fun nativeInitSecondary(useVulkan: Boolean, numThreads: Int): Boolean
+    private external fun nativeInitEngine(slot: Int, useVulkan: Boolean, numThreads: Int): Boolean
     
-    /** 副引擎是否就绪。 */
-    private external fun nativeIsSecondaryReady(): Boolean
+    /** 指定槽位的引擎是否就绪（slot 0 = 主引擎）。 */
+    private external fun nativeIsEngineReady(slot: Int): Boolean
     
-    /** 释放副引擎占用的模型内存。 */
-    private external fun nativeReleaseSecondary()
+    /** 释放指定槽位的额外引擎（slot 0 不可释放）。 */
+    private external fun nativeReleaseEngine(slot: Int)
     
-
+    /** 释放全部额外引擎占用的模型内存。 */
+    private external fun nativeReleaseExtraEngines()
+    
     private external fun nativeSetDumpDirectory(dumpDir: String?)
     
     // Smoothing control native methods
@@ -652,49 +657,73 @@ class MediaPipeFaceDetector(private val context: Context) {
     }
     
     /**
-     * 初始化 CPU 副引擎（CPU + GPU 双通道）。
+     * 初始化一个额外的关键点引擎（GPU 多路并行）。
      *
-     * 副引擎只加载 landmarker：它唯一的职责是从帧队列里抢下关键点推理，让 CPU
-     * 和 GPU 同时干活。检测 / blendshape 仍由主引擎负责，因此副引擎的常驻内存
-     * 只有一份 landmark 模型。
+     * 额外引擎只加载 landmarker：它唯一的职责是从帧队列里抢下关键点推理，
+     * 让 GPU 一直有活儿干、把利用率顶满。检测 / blendshape 仍由主引擎负责，
+     * 因此每个额外引擎的常驻内存只有一份 landmark 模型。
      *
      * 必须在 [initialize] 成功后调用；调用是阻塞的（加载模型约几百毫秒），
      * 通常放在 SDK 的初始化流程里，不要放在每帧路径上。
      *
-     * @param useVulkan 期望后端。默认 false（就是要吃 CPU 核）；传 true 时若
-     *        Vulkan 创建失败会自动回退 CPU。
+     * @param slot 引擎槽位，1..[MAX_EXTRA_ENGINES]
+     * @param useVulkan 期望后端。默认 true（再开一路 Vulkan，GPU 并行）；
+     *        传 false 则跑 CPU 后端。注意**不会**在 Vulkan 失败时自动退回 CPU：
+     *        这一路的目的就是吃 GPU，退回 CPU 只会和重排 / 后处理抢核。
      * @param numThreads MNN 线程数，<=0 表示沿用 [initialize] 时的线程数
-     * @return 副引擎是否可用；失败时主引擎照常工作，管线退回单通道
+     * @return 该槽位是否可用；失败时主引擎照常工作，管线少一路并行
      */
-    fun initializeSecondaryEngine(useVulkan: Boolean = false, numThreads: Int = 0): Boolean {
+    fun initializeExtraEngine(
+        slot: Int,
+        useVulkan: Boolean = true,
+        numThreads: Int = 0,
+    ): Boolean {
         if (!isInitialized) {
-            Log.e(TAG, "Cannot init secondary engine: detector not initialized")
+            Log.e(TAG, "Cannot init extra engine $slot: detector not initialized")
+            return false
+        }
+        if (slot < 1 || slot > MAX_EXTRA_ENGINES) {
+            Log.e(TAG, "Cannot init extra engine: slot $slot out of range 1..$MAX_EXTRA_ENGINES")
             return false
         }
         return try {
-            val ok = nativeInitSecondary(useVulkan, numThreads)
-            secondaryReady = ok
-            Log.i(TAG, if (ok) "Secondary engine ready (CPU channel)" else "Secondary engine unavailable")
+            val ok = nativeInitEngine(slot, useVulkan, numThreads)
+            Log.i(
+                TAG,
+                if (ok) "Extra engine $slot ready" else "Extra engine $slot unavailable",
+            )
             ok
         } catch (t: Throwable) {
-            secondaryReady = false
-            Log.e(TAG, "Error initializing secondary engine", t)
+            Log.e(TAG, "Error initializing extra engine $slot", t)
             false
         }
     }
 
-    /** 副引擎（CPU 通道）是否可用。 */
-    fun isSecondaryEngineReady(): Boolean = secondaryReady
+    /** 指定槽位的引擎是否可用（slot 0 = 主引擎）。 */
+    fun isEngineReady(slot: Int): Boolean = try {
+        if (slot < 0 || slot > MAX_EXTRA_ENGINES) false else nativeIsEngineReady(slot)
+    } catch (t: Throwable) {
+        Log.e(TAG, "Error querying engine $slot", t)
+        false
+    }
 
-    /** 释放副引擎的模型内存；之后该引擎上的调用会返回 null。 */
-    fun releaseSecondaryEngine() {
-        if (!secondaryReady) return
+    /** 释放指定槽位额外引擎的模型内存；之后该引擎上的调用会返回 null。 */
+    fun releaseExtraEngine(slot: Int) {
+        if (slot < 1 || slot > MAX_EXTRA_ENGINES) return
         try {
-            nativeReleaseSecondary()
+            nativeReleaseEngine(slot)
         } catch (t: Throwable) {
-            Log.e(TAG, "Error releasing secondary engine", t)
+            Log.e(TAG, "Error releasing extra engine $slot", t)
         }
-        secondaryReady = false
+    }
+
+    /** 释放全部额外引擎的模型内存。 */
+    fun releaseExtraEngines() {
+        try {
+            nativeReleaseExtraEngines()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error releasing extra engines", t)
+        }
     }
 
     /**
@@ -1223,9 +1252,9 @@ class MediaPipeFaceDetector(private val context: Context) {
      */
     fun release() {
         if (isInitialized) {
-            // 副引擎先放：它只持有 landmarker，但两份模型同时在内存里时
+            // 额外引擎先放：它们只持有 landmarker，但多份模型同时在内存里时
             // 释放顺序反过来会让峰值内存多撑一会儿。
-            releaseSecondaryEngine()
+            releaseExtraEngines()
             nativeRelease()
             isInitialized = false
             Log.i(TAG, "MediaPipe face detector released")

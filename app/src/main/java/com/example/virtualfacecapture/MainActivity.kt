@@ -258,8 +258,9 @@ fun FaceCaptureScreen(
     // MNN 推理后端（Vulkan ⇄ CPU）：让用户在真机上实测哪一个能稳住 60 帧
     var mnnBackend by remember { mutableStateOf(faceTracker.getMnnBackend()) }
     var backendSwitching by remember { mutableStateOf(false) }
-    // CPU + GPU 双通道关键点推理：关掉就退回单路 Vulkan（省电、降发热）
-    var dualChannel by remember { mutableStateOf(faceTracker.isDualChannelActive()) }
+    // 关键点推理的 GPU 并行度：gpuChannels = 期望值，gpuActiveChannels = 实际生效
+    var gpuChannels by remember { mutableStateOf(faceTracker.getGpuChannelCount()) }
+    var gpuActiveChannels by remember { mutableStateOf(faceTracker.getActiveChannelCount()) }
 
     var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
 
@@ -476,7 +477,8 @@ fun FaceCaptureScreen(
                     drawDetectionBox = drawDetectionBox,
                     mnnBackend = mnnBackend,
                     backendSwitching = backendSwitching,
-                    dualChannel = dualChannel,
+                    gpuChannels = gpuChannels,
+                    gpuActiveChannels = gpuActiveChannels,
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
@@ -489,8 +491,9 @@ fun FaceCaptureScreen(
                                 faceTracker.start()
                                 isTracking.value = true
                                 trackingOutput.setTrackingActive(true)
-                                // 双通道是否真的跑起来要等 start() 之后才知道
-                                dualChannel = faceTracker.isDualChannelActive()
+                                // 实际生效几路要等 start() 之后才知道
+                                gpuChannels = faceTracker.getGpuChannelCount()
+                                gpuActiveChannels = faceTracker.getActiveChannelCount()
                             }
                         }
                     },
@@ -558,20 +561,25 @@ fun FaceCaptureScreen(
                             }
                         }
                     },
-                    onToggleDualChannel = {
-                        // 双通道的开关要在 start() 里拉起/收起关键点线程，属于管线重启，
+                    onToggleGpuChannels = {
+                        // 并行度变化要在 start() 里拉起/收起推理线程，属于管线重启，
                         // 和切后端一样放 IO 线程，避免主线程卡顿。
-                        val target = !dualChannel
-                        Log.i("FaceCapturePipeline", "Switching dual channel to " + target + " ...")
+                        // UI 上最多给到 3 路（4 路留给代码里手动开）。
+                        val next = if (gpuChannels >= 3) 1 else gpuChannels + 1
+                        Log.i("FaceCapturePipeline", "Switching GPU channels to $next ...")
                         scope.launch(Dispatchers.IO) {
                             try {
-                                faceTracker.setDualChannelEnabled(target)
+                                faceTracker.setGpuChannelCount(next)
                             } catch (t: Throwable) {
-                                Log.e("FaceCapturePipeline", "Switching dual channel failed", t)
+                                Log.e("FaceCapturePipeline", "Switching GPU channels failed", t)
                             }
-                            // 以 SDK 真实状态为准：副引擎不可用时会自动停在单通道
-                            dualChannel = faceTracker.isDualChannelActive()
-                            Log.i("FaceCapturePipeline", "Dual channel now " + dualChannel)
+                            // 以 SDK 真实状态为准：显存不够时会少于期望值
+                            gpuChannels = faceTracker.getGpuChannelCount()
+                            gpuActiveChannels = faceTracker.getActiveChannelCount()
+                            Log.i(
+                                "FaceCapturePipeline",
+                                "GPU channels now " + gpuActiveChannels + "/" + gpuChannels
+                            )
                         }
                     }
                 )
@@ -901,7 +909,8 @@ fun ControlPanel(
     drawDetectionBox: Boolean,
     mnnBackend: MnnBackend,
     backendSwitching: Boolean,
-    dualChannel: Boolean,
+    gpuChannels: Int,
+    gpuActiveChannels: Int,
     onToggleTracking: () -> Unit,
     onResetBaseline: () -> Unit,
     onToggleDebug: () -> Unit,
@@ -912,7 +921,7 @@ fun ControlPanel(
     onToggleLandmarks: () -> Unit,
     onToggleDetectionBox: () -> Unit,
     onToggleMnnBackend: () -> Unit,
-    onToggleDualChannel: () -> Unit,
+    onToggleGpuChannels: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -1101,20 +1110,25 @@ fun ControlPanel(
                 )
             }
 
-            // 第五行之后：CPU + GPU 双通道关键点推理
-            // 关键点推理是整条管线的瓶颈，单路 Vulkan 时 CPU 大核基本闲置；
-            // 打开后额外起一路 CPU 引擎，两路从同一个帧队列抢帧并行推理。
+            // 第五行之后：关键点推理的 GPU 并行度
+            // 关键点推理是整条管线的瓶颈，单路时 GPU 利用率并不高（一次推理里还夹着
+            // 预处理 / 命令录制 / 回读）；多开几路引擎抢同一个帧队列，GPU 就一直有活儿干。
             Button(
-                onClick = onToggleDualChannel,
+                onClick = onToggleGpuChannels,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (dualChannel) Color(0xFF3949AB)
+                    containerColor = if (gpuActiveChannels > 1) Color(0xFF3949AB)
                     else MaterialTheme.colorScheme.secondary
                 )
             ) {
                 Text(
-                    text = if (dualChannel) "关键点: CPU+GPU 双通道 (点击关)"
-                    else "关键点: 单路 (点击开双通道)",
+                    text = when {
+                        gpuChannels <= 1 -> "关键点: 单路 (点击开 GPU 并行)"
+                        gpuActiveChannels >= gpuChannels ->
+                            "关键点: GPU 并行 ×$gpuActiveChannels (点击 " +
+                                (if (gpuChannels >= 3) "关" else "加一路") + ")"
+                        else -> "关键点: GPU 并行 ×$gpuActiveChannels/$gpuChannels (资源不足)"
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )

@@ -111,32 +111,34 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
 `mini_linalg` + `neon_intrinsics`，针对 3×N 关键点这种典型 shape 做了
 向量化，加载和首帧推理耗时相比标量实现有明显下降。
 
-### CPU + GPU 双通道关键点推理
+### GPU 多路并行关键点推理
 
-关键点阶段占掉一帧 80% 的推理时间，单路 Vulkan 时 CPU 大核基本闲着。
-`PipelineFaceTracker` 因此额外初始化一套 **CPU 后端的 landmark session**，
-两路从同一个帧队列里抢帧、并行推理：
+关键点阶段占掉一帧 80% 的推理时间，但单路 Vulkan 的 GPU 利用率其实不高：一次推理里
+还夹着 YUV 预处理、命令录制、结果回读这些 CPU 段，GPU 经常在等。`PipelineFaceTracker`
+因此**多开几路 GPU 引擎**（每路一个独立的 MNN session）从同一个帧队列里抢帧，
+让 GPU 命令队列始终有活儿；CPU 这边只负责把乱序结果重排回时间顺序：
 
 ```
-                    ┌──────────────► [ GPU 引擎 (Vulkan) ] ──┐
-yuvLandmarkFrame ───┤                                        ├──► 重排 ──► 后处理
-      Channel       └──────────────► [ CPU 引擎 (CPU)    ] ──┘  (按 frameId 排序)
+                      ┌──► [ GPU 引擎 0 (Vulkan) ] ──┐
+yuvLandmarkFrame ─────┤                              ├──► 重排(CPU 线程) ──► 后处理
+      Channel         ├──► [ GPU 引擎 1 (Vulkan) ] ──┤   按 frameId 排序
+   (通道分派语义)      └──► [ GPU 引擎 2 (可选)    ] ──┘
 ```
 
-- 两路的 MNN session 完全独立：原生侧用 `EngineSlot[2]` + `thread_local`
-  选择引擎，每个推理线程启动时绑定一次自己的槽位，per-frame JNI 签名不用改；
+- 各路 MNN session 完全独立：原生侧用 `EngineSlot[4]` + `thread_local` 选择引擎，
+  每个推理线程启动时绑定一次自己的槽位，per-frame JNI 签名不用改；
 - 结果按 `frameId` 重排后再交给后处理，下游看到的帧序仍然严格递增
   （校准基线、眨眼曲线、发给 PC 的 `seq` 都依赖这个前提）；
 - 缺口最多等 60 ms（`REORDER_GAP_TIMEOUT_MS`），超时就接受丢帧继续跑，
-  不会为了等某一帧把整条链路拖慢；
-- 只在「YUV 直通 + 主引擎 Vulkan + 副引擎就绪」时启用；主引擎切到 CPU 后自动
-  退回单路（两个 CPU session 只会互相抢核）；
-- 时序滤波（landmark / 头姿）是**按通道**喂的：每路只看得到约一半的帧，滤波的
+  不会为了等某一帧把整条链路拖慢；重排只做排序、不碰推理，纯 CPU；
+- 并行度 1..4（`MAX_GPU_CHANNELS`，含主引擎），默认 2。只在「YUV 直通 + 主引擎
+  Vulkan」时 >1；主引擎切到 CPU 后自动退回单路，额外引擎的显存也会释放；
+- 时序滤波（landmark / 头姿）是**按通道**喂的：每路只看得到约 1/N 的帧，滤波的
   时间常数不变、只是响应略慢一点；头姿解算用的全局几何管线 + 全局滤波已经加锁
   串行化，不会数据竞争；
-- 代价是**多一份 landmark 模型常驻内存**，以及更高的 CPU 占用与发热。
-  设置面板的 **「关键点: CPU+GPU 双通道」** 按钮可以随时开关（会短暂重启管线），
-  也可以改 `PipelineFaceTracker.dualChannelEnabled` / `DUAL_CHANNEL_DEFAULT`。
+- 代价是**每路多一份 landmark 模型常驻显存**。设置面板的
+  **「关键点: GPU 并行 ×N」** 按钮可以在 单路 / ×2 / ×3 之间循环（会短暂重启管线），
+  也可以改 `PipelineFaceTracker.GPU_CHANNEL_DEFAULT` 或调用 `setGpuChannelCount(n)`。
 
 ---
 
@@ -231,7 +233,7 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 | **网络输出** | 打开对话框：启动 / 停止追踪服务、复制 `ws://` 地址、查看客户端数与输出帧率、当前帧缓冲时长、打开 `/status` 状态页 |
 | **Camera: 前置 / 后置 / 外接** | 枚举并切换摄像头，切换后自动重做基线；选择会记住 |
 | **Backend: Vulkan / CPU** | 运行时切换 MNN 推理后端（会重建 session，画面中断一帧左右） |
-| **关键点: CPU+GPU 双通道** | 再开一套 CPU 后端的 landmark session 与 Vulkan 并行抢帧（会短暂重启管线）；关掉即退回单路 |
+| **关键点: GPU 并行** | 在 单路 / GPU×2 / GPU×3 之间循环：多开几路 GPU 引擎抢同一个帧队列，把 GPU 喂饱（会短暂重启管线） |
 | **眨眼曲线 / 眨眼速度** | 是否把眨眼整形为更自然的 230 ms 曲线，以及曲线速度 |
 | **眼睛灵敏度** | 眼部 EAR 阈值灵敏度（0.5x ～ 2.0x），下方实时显示生效的 `closed / open` 阈值 |
 | **显示调试 / 关键点** | 顶栏调试 HUD（fps、帧耗时、pitch/yaw/roll + 条形图、ARKit 数值）与相机画面上的关键点 / 检测框叠加 |
