@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
         faceTracker = PipelineFaceTracker(this)
 
         // 恢复上次选择的摄像头（如果该 id 在本次开机后不存在，相机会自动回退到默认前置）
-        val cameraPrefs = getSharedPreferences(CAMERA_PREFS_NAME, MODE_PRIVATE)
+        val cameraPrefs = getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
         faceTracker.setPreferredCamera(cameraPrefs.getString(KEY_PREFERRED_CAMERA_ID, null))
 
         // 浏览器输出（OBS）：默认关闭，用户可在控制面板里开启
@@ -361,7 +361,7 @@ fun FaceCapturePipelineScreen(
                         val switched = faceTracker.switchCamera(camera.id)
                         if (switched) {
                             currentCamera = camera
-                            context.getSharedPreferences(CAMERA_PREFS_NAME, MODE_PRIVATE)
+                            context.getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
                                 .edit()
                                 .putString(KEY_PREFERRED_CAMERA_ID, camera.id)
                                 .apply()
