@@ -262,13 +262,27 @@ The bottom control panel has a new **Web Output** button that opens a dialog:
 | **Start / Stop** | Start / stop the Web Output server, **off by default** |
 | **Address** | LAN URL such as `http://192.168.1.23:8765/`, copyable |
 | **Output Height** | 360 / 480 / 640 / 720 / 1080, default 640 |
+| **Auto downscale** | On by default: when one frame takes too long to encode for the target FPS (over 85 % of the frame budget) the output height drops one step and recovers later; turn it off to always use the configured height |
 | **Output FPS** | 15 – 60 FPS, default 30 |
 | **Quality** | 40 – 95, default 75; higher = sharper, but bigger bitrate |
-| **Status** | Whether it is running, connected client count, actual output fps |
+| **Status** | Running state, client count, and `output fps · capture fps · encode ms/frame`: **high capture fps with low output fps means encoding is the bottleneck** (lower the height / quality, or let auto-downscale do it); low on both means the phone is struggling overall |
 | **OBS hint** | Short OBS usage tips shown inside the dialog |
 
 The server always listens on `0.0.0.0:8765` (port is fixed); when the phone's
 IP changes, the URL changes with it.
+
+**OBS frame rate looks low?** Check in this order:
+
+1. Is the dialog's `output fps` close to the configured value? If yes the phone is
+   fine and the problem is OBS / the network; if not, look at `encode ms/frame` on
+   the same line — when it exceeds `1000 / FPS` the encoder is the bottleneck
+   (enable auto-downscale, lower the height or the quality).
+2. Check the Browser Source's **FPS** property: it may sit at 10 / 20 (default 30),
+   and 30 is a safer choice than 60 when OBS itself is loaded.
+3. Add `?hud=1` to the URL and watch the page status bar: fps, and whether it keeps
+   showing "reconnecting" (that means Wi-Fi packet loss).
+4. Prefer `dpr=1` (no need for 2x rendering in OBS) and set the source resolution
+   close to the configured output height.
 
 ### Page URL & parameters
 

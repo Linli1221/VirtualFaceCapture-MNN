@@ -1300,6 +1300,10 @@ fun WebOutputDialog(
     val captureHeight = manager.captureHeight.value
     val targetFps = manager.targetFps.value
     val quality = manager.quality.value
+    val effectiveHeight = manager.effectiveHeight.value
+    val autoScale = manager.autoScale.value
+    val encodeMs = manager.encodeMs.value
+    val captureFps = manager.captureFps.value
     val urls = remember(running) { manager.lanUrls() }
     val heightIndex = WEB_OUTPUT_HEIGHTS.indexOf(captureHeight).coerceAtLeast(0)
 
@@ -1313,13 +1317,23 @@ fun WebOutputDialog(
             ) {
                 Text(
                     text = if (running) {
-                        "状态：运行中 · 客户端 $clients · 输出 %.0f fps".format(outputFps)
+                        "状态：运行中 · 客户端 $clients"
                     } else {
                         "状态：已停止"
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (running) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
                 )
+
+                if (running) {
+                    // 抓帧 fps 和编码 fps 分开显示：抓帧高、编码低就是编码跟不上（该降档）
+                    Text(
+                        text = "输出 %.0f fps · 抓帧 %.0f fps · 编码 %.1f ms/帧"
+                            .format(outputFps, captureFps, encodeMs),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
                 if (urls.isEmpty()) {
                     Text(
@@ -1365,7 +1379,11 @@ fun WebOutputDialog(
                 }
 
                 Text(
-                    text = "输出高度：$captureHeight px",
+                    text = if (running && effectiveHeight != captureHeight) {
+                        "输出高度：$captureHeight px（编码跟不上，已自动降到 ${effectiveHeight}px 保帧率）"
+                    } else {
+                        "输出高度：$captureHeight px"
+                    },
                     style = MaterialTheme.typography.bodySmall
                 )
                 Slider(
@@ -1377,6 +1395,18 @@ fun WebOutputDialog(
                     valueRange = 0f..(WEB_OUTPUT_HEIGHTS.size - 1).toFloat(),
                     steps = WEB_OUTPUT_HEIGHTS.size - 2
                 )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "编码跟不上时自动降分辨率",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = autoScale,
+                        onCheckedChange = { manager.autoScale.value = it }
+                    )
+                }
 
                 Text(
                     text = "输出帧率：$targetFps fps",
