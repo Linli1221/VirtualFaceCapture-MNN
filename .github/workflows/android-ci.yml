@@ -1,9 +1,12 @@
 # 每次修改都通过 GitHub Actions 构建 Android 安装包（APK）。
 #
+# 默认产物：**只有 arm64-v8a 的 debug APK**（最快出包，够装真机测）。
+# Release APK 与 SDK AAR 只在「推送 v* 标签」或手动触发并勾选 build_release 时构建。
+#
 # 触发条件：
-#   - 任意分支的 push / 任意 PR：构建 Debug + Release APK 与 SDK AAR，上传为 Artifact
-#   - 推送 v* 标签（如 v1.0.0）：额外创建 GitHub Release 并附带安装包
-#   - workflow_dispatch：手动触发
+#   - 任意分支的 push / 任意 PR：构建 arm64 debug APK，上传为 Artifact
+#   - 推送 v* 标签（如 v1.0.0）：额外构建签名 Release APK + AAR，并创建 GitHub Release
+#   - workflow_dispatch：手动触发（可勾选 build_release）
 #
 # 产物下载：仓库 → Actions → 对应运行 → Artifacts
 # Release 发布：git tag v1.0.0 && git push origin v1.0.0
@@ -16,6 +19,11 @@ on:
   pull_request:
     branches: ['**']
   workflow_dispatch:
+    inputs:
+      build_release:
+        description: '同时构建 Release APK 与 SDK AAR（默认只出 arm64 debug 包）'
+        type: boolean
+        default: false
 
 # 同一分支连续推送时，取消旧的构建，始终为最新一次修改出包
 concurrency:
@@ -90,6 +98,8 @@ jobs:
           echo "RELEASE_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "Keystore decoded: $(wc -c < "$RUNNER_TEMP/release.jks") bytes"
 
+      # 默认只出 arm64-v8a debug 包（abiFilters 已在各模块锁定 arm64-v8a）。
+      # Release APK 与 SDK AAR 只在推 tag 或手动勾选 build_release 时才构建。
       # versionCode = run_number（单调递增，可直接覆盖安装旧包）
       # versionName = 1.0.<run_number>+<commit>（区分每次修改的产物）
       - name: Build APKs
@@ -100,37 +110,59 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew :app:assembleDebug :app:assembleRelease :facecapture-sdk:assembleRelease \
-            -PversionCodeOverride="${{ github.run_number }}" \
-            -PversionNameOverride="1.0.${{ github.run_number }}+${GITHUB_SHA:0:7}" \
-            --stacktrace
+          VERSION_ARGS=(
+            "-PversionCodeOverride=${{ github.run_number }}"
+            "-PversionNameOverride=1.0.${{ github.run_number }}+${GITHUB_SHA:0:7}"
+          )
+
+          ./gradlew :app:assembleDebug "${VERSION_ARGS[@]}" --stacktrace
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* || "${{ inputs.build_release }}" == "true" ]]; then
+            echo "::notice::构建 Release APK 与 SDK AAR"
+            ./gradlew :app:assembleRelease :facecapture-sdk:assembleRelease \
+              "${VERSION_ARGS[@]}" --stacktrace
+          else
+            echo "::notice::只构建 arm64-v8a debug 包（跳过 Release APK / SDK AAR）"
+          fi
 
       - name: Collect artifacts
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:7}"
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/VirtualFaceCapture-${short_sha}-debug.apk"
-          cp app/build/outputs/apk/release/app-release.apk "dist/VirtualFaceCapture-${short_sha}-release.apk"
-          cp facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar "dist/facecapture-sdk-${short_sha}.aar"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             "dist/VirtualFaceCapture-${short_sha}-arm64-debug.apk"
+          # Release / AAR 只在需要时才会存在
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk \
+               "dist/VirtualFaceCapture-${short_sha}-arm64-release.apk"
+          fi
+          if [ -f facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar ]; then
+            cp facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar \
+               "dist/facecapture-sdk-${short_sha}.aar"
+          fi
           ls -lh dist
 
       # 把签名证书指纹打到构建日志 / Summary：能直接看出这次用的是正式 key 还是 debug key，
-      # 以及多次构建之间签名有没有变。
+      # 以及多次构建之间签名有没有变。只校验本次实际产出的 APK。
       - name: Verify APK signature
         run: |
           set -euo pipefail
           APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
-          "$APKSIGNER" verify --print-certs "dist/VirtualFaceCapture-${GITHUB_SHA:0:7}-release.apk" | tee "${RUNNER_TEMP}/certs.txt"
+          : > "${RUNNER_TEMP}/certs.txt"
+          for apk in dist/*.apk; do
+            echo "== $(basename "$apk") ==" | tee -a "${RUNNER_TEMP}/certs.txt"
+            "$APKSIGNER" verify --print-certs "$apk" | tee -a "${RUNNER_TEMP}/certs.txt"
+          done
           {
-            echo "### Release APK 签名"
+            echo "### APK 签名"
             echo '```'
-            grep -E "Signer #1 certificate (DN|SHA-256)" "${RUNNER_TEMP}/certs.txt" || true
+            grep -E "^(==|Signer #1 certificate (DN|SHA-256))" "${RUNNER_TEMP}/certs.txt" || true
             echo '```'
             if [ -n "${RELEASE_STORE_FILE:-}" ]; then
-              echo "首次安装 / 覆盖安装须知：签名证书已在 CI 固定，可覆盖安装旧包。"
+              echo "签名证书已在 CI 固定，Release 包可覆盖安装旧包。"
             else
-              echo "⚠️ 当前使用 debug key 签名，**每次构建签名都不同**：装新包前请先卸载旧包。"
+              echo "⚠️ 当前使用 AGP 自动生成的 debug key 签名，**每次构建签名都不同**：装新包前请先卸载旧包（adb uninstall）。"
               echo "参考 README「签名 / Release 打包」配置正式签名。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

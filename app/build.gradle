@@ -71,6 +71,14 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
         }
+        debug {
+            // debug 包同样用固定 key 签名（配了的话）。
+            // 原因：CI 现在默认只出 debug 包，而 AGP 自动生成的 debug key 每台 runner
+            // 都不一样 —— 不固定的话每次装新包都得先卸载。debug 包本身仍可调试。
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11

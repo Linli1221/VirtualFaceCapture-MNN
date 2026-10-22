@@ -8,7 +8,8 @@ ___
 
 ## 🧠 简介
 基于 **MNN** 推理引擎、在移动端复刻 **MediaPipe Face Landmarker** 面部捕捉方案，
-配合 **仿 OpenSeeFace** 风格的后处理流水线，用来实时驱动 **Live2D** 皮套。(测来测去好像也就只剩 Google 的模型好用一些了 -.-
+配合 **仿 OpenSeeFace** 风格的后处理流水线，用来实时驱动 **Live2D** 皮套
+（测来测去，也就 Google 的模型还比较好用 -.-）。
 
 整套面捕管线已经从 MediaPipe 源码里彻底剥离出来：不依赖 MediaPipe 的图计算
 （CalculatorGraph）、不依赖 JavaCV / OpenCV-Android、不依赖任何 MediaPipe Tasks
@@ -126,12 +127,15 @@ git submodule update --init --depth 1 ThirdParty/MNN   # 仅需 MNN 头文件
 
 仓库已配置 [Android CI](.github/workflows/android-ci.yml)，**每次修改都会自动构建安装包**：
 
-- **任意分支 push / 任意 PR**：自动构建 Debug + Release APK 与 SDK AAR，
-  到仓库 `Actions` → 对应运行 → `Artifacts` 下载安装包（保留 30 天）；
+- **任意分支 push / 任意 PR**：自动构建 **arm64-v8a 的 Debug APK**
+  （`VirtualFaceCapture-<sha>-arm64-debug.apk`），到仓库 `Actions` → 对应运行 →
+  `Artifacts` 下载（保留 30 天）；
+- Release APK 与 SDK AAR **默认不构建**（省 CI 时间）：推 `v` 开头的 tag，或手动
+  `Run workflow` 时勾选 `build_release`，才会额外产出；
 - CI 产物自带版本号 `1.0.<运行号>+<commit>`（versionCode 单调递增）；
 - ⚠️ **能否覆盖安装取决于签名**：默认回退 debug key（每次构建都不同，必须先卸载旧包）；
   配好下面的「正式签名」后签名固定，才能直接覆盖升级；
-- **发布正式安装包**：推送 `v` 开头的 tag，自动创建 GitHub Release 并附带 APK：
+- **发布正式安装包**：推送 `v` 开头的 tag，自动构建签名 Release APK 并创建 GitHub Release：
 
 ```bash
 git tag v1.0.0
@@ -152,6 +156,10 @@ INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package ... signatures do not match previous
 ```
 
 解法是把签名密钥固定下来（顺便这也是发布到应用商店 / 分享给别人所必需的）。
+
+配好之后**debug 包也会用这把固定 key 签名** —— 因为 CI 默认只出 debug 包，不固定的话
+每次装新包都得先卸载。切换签名的那一次需要手动卸载一次旧包
+（`adb uninstall com.example.virtualfacecapture`），之后就能一直覆盖升级了。
 
 #### 1. 生成密钥库
 
@@ -369,7 +377,8 @@ http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
 - **仿 OpenSeeFace 后处理**：参考 Python 版的 `tracker.py` / `similaritytransform.py`
   重写为 C++/Kotlin，包括 One-Euro 平滑、首帧标定、眨眼曲线整形等。
 - **ARKit-52 BlendShape 自解算**：不依赖 MediaPipe 的第三个 BlendShape 模型，
-  直接基于 478 关键点几何关系解算，省一次推理。（其实主要是 blend shape 模型直接出来的产物很难救，但推理代码还是留在工程里了，有需要的自己用罢 :(。
+  直接基于 478 关键点几何关系解算，省一次推理（其实主要问题是 blend shape 模型直出的
+  产物很难救，但推理代码还是留在工程里了，有需要的自取）。
 - **可发布的 AAR**：`:facecapture-sdk` 模块已经配置好 `maven-publish`，
   可一键打包成独立的面捕 SDK。
 - **多摄像头**：运行时枚举并切换前置 / 后置 / 外接摄像头，按设备重算旋转、

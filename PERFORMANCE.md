@@ -175,8 +175,12 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(JN
 
 ### 5.0 装哪个包
 
-CI 每次推送都会构建并上传 APK：仓库 **Actions → 最新一次 `Android CI` → 页面底部 Artifacts**
-（debug 与 release 都有）。直接装上就能用，不需要本地编译。
+CI 每次推送都会构建并上传 APK：仓库 **Actions → 最新一次 `Android CI` → 页面底部 Artifacts**。
+默认只出 **arm64-v8a 的 debug 包**（`VirtualFaceCapture-<sha>-arm64-debug.apk`）；
+需要 release 包时推 `v*` tag，或手动 `Run workflow` 勾选 `build_release`。
+
+> ⚠️ 测帧率优先用 release 包：debug 包带调试信息、JIT/校验开销更大，同一份代码会低几帧。
+> 手边只有 debug 包时，结论请按「相对变化」看，不要拿绝对值卡 60。
 
 ### 5.1 看什么
 
