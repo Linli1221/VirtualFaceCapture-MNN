@@ -17,6 +17,9 @@ keystore.properties
 # 本地构建/验证脚手架（Lead 用的 gradle、SDK 临时目录）
 /.build-tmp/
 
+# 打包产物（APK / Windows 便携版）
+/dist/
+
 # Windows 客户端依赖与打包产物
 windows-client/node_modules/
 windows-client/dist/
