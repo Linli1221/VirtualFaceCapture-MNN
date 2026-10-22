@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.os.Build
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * 一张已经编码好的输出帧。
@@ -55,9 +56,17 @@ class FrameEncoder {
             cachedPixels
         }
 
+        // 坑：ByteBuffer.duplicate() 会把自己的字节序重置成 BIG_ENDIAN（JDK-4715166，
+        // 官方以「非 bug」关闭，只提供 workaround），asIntBuffer() 又会继承那个字节序。
+        // 不重新指定的话，读出来的 int 是 R<<24|G<<16|B<<8|A：alpha 被当成红色、
+        // 红色被当成 alpha、G/B 互换 —— 表现就是 OBS 里整体偏灰偏粉、蓝紫色全丢、
+        // 红色分量接近 0 的暗部直接变透明（手机预览走 GL，不经过这里，所以看着正常）。
+        // glReadPixels 按 R,G,B,A 逐字节写入，arm64/x86_64 都是小端，所以显式按小端
+        // 组装：低 8 位 = R，高 8 位 = A。
         val source = rgba.duplicate()
         source.rewind()
-        val ints = source.asIntBuffer()
+        source.order(ByteOrder.LITTLE_ENDIAN)
+        val ints = source.asIntBuffer().order(ByteOrder.LITTLE_ENDIAN)
         if (ints.capacity() < count) {
             return EncodedFrame(null, null)
         }
