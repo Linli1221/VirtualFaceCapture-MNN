@@ -12,6 +12,7 @@
     "mock": "node tools/mock-tracker.js",
     "shot": "node tools/shot.js",
     "vendor": "node tools/vendor-assets.js",
+    "package": "node tools/package-windows.js",
     "postinstall": "node tools/vendor-assets.js",
     "selftest": "node tools/selftest.js"
   },

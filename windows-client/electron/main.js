@@ -17,6 +17,17 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SMOKE = process.argv.includes("--smoke");
 const SMOKE_RESULT = path.join(ROOT, "electron", "smoke-result.json");
 
+// 自定义配置目录：CI / 多开测试用，避免写 %APPDATA% 和单实例锁互相干扰。
+//   VFC_USER_DATA_DIR=<目录> VFC-Live2D.exe --smoke
+const userDataOverride =
+  process.env.VFC_USER_DATA_DIR ||
+  process.argv.find((arg) => arg.startsWith("--user-data-dir="))?.slice("--user-data-dir=".length);
+if (userDataOverride) {
+  const dir = path.resolve(userDataOverride);
+  fs.mkdirSync(dir, { recursive: true });
+  app.setPath("userData", dir);
+}
+
 // 自检环境（CI / 无交互桌面）经常没有可用 GPU，软件渲染会直接崩在 Chromium 启动阶段。
 if (SMOKE) app.disableHardwareAcceleration();
 

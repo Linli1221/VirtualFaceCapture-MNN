@@ -5,6 +5,7 @@ dist/
 # 自测产物：截图、Electron smoke 结果、临时日志
 shots/
 electron/smoke-result.json
+.smoke-userdata/
 *.log
 
 # 编辑器 / 系统

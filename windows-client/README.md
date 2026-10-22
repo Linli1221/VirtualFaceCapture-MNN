@@ -38,6 +38,7 @@ windows-client/
    ├─ mock-tracker.js         # 模拟手机端（零依赖 WS 服务端 + 60Hz 合成数据）
    ├─ vendor-assets.js        # 从 node_modules 复制浏览器构建到 renderer/vendor
    ├─ selftest.js             # 映射数值 + 低/抖动输入插值 + 模型发现 + 静态路由的自检
+   ├─ package-windows.js      # npm run package：组装免安装便携版（Electron 运行时 + 代码 + 模型）
    ├─ shot.js                 # 可选：系统 Chrome headless 截图（原始 CDP，不装 puppeteer）
    └─ evals/                  # 截图时注入的状态脚本（自测用）
 ```
@@ -73,6 +74,7 @@ npm i
 | `npm run serve` | 只起静态服务：<http://127.0.0.1:17890/>，用任意浏览器打开 |
 | `npm run mock` | 模拟手机端：`ws://127.0.0.1:8765/ws`，60Hz 推合成数据（`--hz` / `--jitter` 可调） |
 | `npm run selftest` | 一条命令的自检（映射数值 / 模型发现 / 静态路由） |
+| `npm run package` | 组装免安装便携版：`dist/windows/VFC-Live2D-win32-x64/`（见下文「打包」） |
 | `npm run shot -- --url ... --out ...` | 可选，自测截图；用**系统 Chrome**，不需要 puppeteer |
 | `npm run vendor` | 手动重新复制 vendor 构建 |
 
@@ -213,6 +215,31 @@ node tools/shot.js --url "http://127.0.0.1:17890/?ws=ws://127.0.0.1:8765/ws&mode
 `shot.js` 用原始 CDP 驱动 headless Chrome，不依赖 puppeteer；`--eval-file` 可注入
 `__vfc.freeze(true)` + `__vfc.applyTrack({bs,pose})` 得到确定性状态，再用
 `__vfc.pixelStats()`（canvas 缩略图 hash / 非透明像素占比）证明画面确实变了。
+
+## 打包（便携版）
+
+```powershell
+npm run package        # 需要 npm i 装好的 Electron 运行时（optionalDependency）
+```
+
+产物是**免安装目录**（解压即用，无注册表 / 无安装程序）：
+
+```
+dist/windows/VFC-Live2D-win32-x64/
+├─ VFC-Live2D.exe            # Electron 运行时（electron.exe 改名）
+├─ resources/app/            # package.json / server.js / electron / renderer / models / tools
+├─ 启动说明.txt
+└─ locales / *.dll / *.pak   # Electron 自带
+```
+
+- 没装 Electron 时先 `npm i`（国内可设 `$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'`），
+  或用 `--electron-dir <任意 Electron 发行版目录>`；也可 `--out` / `--name` 改输出位置与目录名。
+- 压缩：`Compress-Archive -Path dist\windows\VFC-Live2D-win32-x64 -DestinationPath dist\VFC-Live2D-win32-x64.zip`
+- 自检：`VFC-Live2D.exe --smoke` 启动后等渲染就绪，结果写 `resources/app/electron/smoke-result.json`
+  （退出码 0 = 就绪）。CI / 多开时用 `VFC_USER_DATA_DIR=<临时目录>` 隔离配置，不写 `%APPDATA%`。
+- **CI**：[`windows-client-ci.yml`](../.github/workflows/windows-client-ci.yml) 在改动
+  `windows-client/**` 时自动打包 + 跑 selftest + 启动自检；Artifact 名
+  `VFC-Live2D-win32-x64-<sha>`，推送 `v*` tag 时附到 GitHub Release。
 
 ## 与任务书的两处差异
 

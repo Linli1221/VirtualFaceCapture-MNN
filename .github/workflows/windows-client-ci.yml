@@ -1,0 +1,181 @@
+# 每次修改都通过 GitHub Actions 构建 Windows 客户端便携版（免安装 zip）。
+#
+# 产物：**VFC-Live2D-win32-x64-<sha7>.zip**
+#   - Electron 运行时（electron.exe 改名 VFC-Live2D.exe）+ resources/app（renderer / models / tools）
+#   - 解压即用，不需要装 Node / 不需要管理员权限（见包内「启动说明.txt」）
+#   - 同目录附 SHA256SUMS.txt
+#
+# 为什么要单独一个 workflow：
+#   - 纯 JS 不需要编译，但打包要拿 Electron 运行时（npm i 的 optionalDependency，~250 MB），
+#     只有 Windows runner 能直接产出可用的 win32-x64 目录；
+#   - 跑一遍 `npm run selftest` + 启动打包后的 exe 做 --smoke（等渲染就绪），
+#     保证「构建成功」= 「程序真的能启动」，而不只是 zip 生成成功。
+#
+# 触发条件：
+#   - push / PR 且改动落在 windows-client/（或本 workflow）时构建
+#   - 推送 v* 标签：额外把 zip 附到 GitHub Release（与 Android CI 共用同一个 Release）
+#   - workflow_dispatch：手动触发
+#
+# 产物下载：仓库 → Actions → Windows Client CI → 对应运行 → Artifacts
+name: Windows Client CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths:
+      - 'windows-client/**'
+      - '.github/workflows/windows-client-ci.yml'
+  pull_request:
+    paths:
+      - 'windows-client/**'
+      - '.github/workflows/windows-client-ci.yml'
+  workflow_dispatch:
+
+# 同一分支连续推送时，取消旧构建，始终为最新一次修改出包
+concurrency:
+  group: windows-client-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package portable app (win32-x64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: windows-client
+    env:
+      # Electron 45 的 exe 较大，下载/解压慢一点没关系，避免 npm 重试卡死
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_maxtimeout: '120000'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: windows-client/package-lock.json
+
+      # postinstall 会把 pixi / pixi-live2d-display 的浏览器构建复制到 renderer/vendor；
+      # electron 是 optionalDependency（装不上时 npm i 也不会整体失败），打包需要它。
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Run selftest
+        run: npm run selftest
+
+      - name: Build portable package
+        run: npm run package
+
+      # 启动打包后的 exe 自检：等页面 / 模型就绪，结果写到 resources/app/electron/smoke-result.json。
+      # - --no-sandbox / --disable-gpu：runner 没有 GPU，Chromium 沙箱也常被拒绝
+      # - VFC_USER_DATA_DIR：放到 workspace 里，不写 %APPDATA%，避免 runner 上的单实例锁 / 权限问题
+      - name: Smoke test packaged app
+        shell: pwsh
+        working-directory: .
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 某些环境会设置它让 Electron 退化成 Node（那样 --smoke 会变成 bad option）
+          Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+
+          $pkg = "windows-client/dist/windows/VFC-Live2D-win32-x64"
+          if (-not (Test-Path "$pkg/VFC-Live2D.exe")) { throw "打包产物缺少 VFC-Live2D.exe" }
+
+          $env:VFC_USER_DATA_DIR = Join-Path $env:GITHUB_WORKSPACE "windows-client/.smoke-userdata"
+          Remove-Item -Recurse -Force $env:VFC_USER_DATA_DIR -ErrorAction SilentlyContinue
+          $process = Start-Process -FilePath "$pkg/VFC-Live2D.exe" `
+            -ArgumentList '--smoke', '--no-sandbox', '--disable-gpu' `
+            -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            throw "打包后的程序自检超时（>180 s）"
+          }
+          Write-Host "smoke exit code: $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) { throw "打包后的程序自检失败（exit $($process.ExitCode)）" }
+
+          $resultFile = "$pkg/resources/app/electron/smoke-result.json"
+          if (-not (Test-Path $resultFile)) { throw "自检没有产出 smoke-result.json" }
+          $result = Get-Content $resultFile -Raw | ConvertFrom-Json
+          $result | ConvertTo-Json -Compress
+          if (-not $result.ready) { throw "打包后的程序没有渲染就绪：$($result | ConvertTo-Json -Compress)" }
+          if ($result.error) { throw "打包后的程序报错：$($result.error)" }
+
+          # 自检文件不随发行包分发
+          Remove-Item $resultFile -Force
+
+      - name: Zip and checksum
+        shell: pwsh
+        working-directory: .
+        run: |
+          $ErrorActionPreference = "Stop"
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $pkg = "windows-client/dist/windows/VFC-Live2D-win32-x64"
+
+          @(
+            "project: $env:GITHUB_REPOSITORY",
+            "commit:  $env:GITHUB_SHA",
+            "ref:     $env:GITHUB_REF",
+            "run:     $env:GITHUB_RUN_NUMBER",
+            "built:   $(Get-Date -Format o)"
+          ) | Set-Content "$pkg/BUILD-INFO.txt" -Encoding utf8
+
+          $zip = "windows-client/dist/VFC-Live2D-win32-x64-$short.zip"
+          Write-Host "zipping $pkg -> $zip"
+          Compress-Archive -Path $pkg -DestinationPath $zip -CompressionLevel Optimal
+
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  $(Split-Path -Leaf $zip)" | Set-Content "windows-client/dist/SHA256SUMS.txt" -Encoding utf8
+
+          $zipMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          $files = (Get-ChildItem $pkg -Recurse -File | Measure-Object).Count
+          Write-Host "zip: $zipMb MB, files: $files"
+
+          Add-Content $env:GITHUB_STEP_SUMMARY "### Windows 便携版"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "| 项 | 值 |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| --- | --- |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| 产物 | ``$(Split-Path -Leaf $zip)`` |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| 大小 | $zipMb MB（$files 个文件） |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| SHA-256 | ``$hash`` |"
+          Add-Content $env:GITHUB_STEP_SUMMARY "| 自检 | 打包后的 exe 启动成功，渲染已就绪 |"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: VFC-Live2D-win32-x64-${{ github.sha }}
+          path: |
+            windows-client/dist/*.zip
+            windows-client/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0   # zip 已压缩
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: VFC-Live2D-win32-x64-${{ github.sha }}
+          path: dist
+
+      # 与 Android CI 共用同一个 Release（按 tag 查找，已存在则追加资产）
+      - name: Attach portable zip to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

@@ -351,10 +351,26 @@ Query parameters:
 > If your local SDK's build-tools don't match what AGP expects, add
 > `-Pandroid.builder.sdkDownload=false` so Gradle uses what is already installed.
 
+The Windows client is plain JavaScript (nothing to compile), but it can be bundled into a
+**portable, installer-free zip** with the Electron runtime inside:
+
+```powershell
+cd windows-client
+npm ci
+npm run selftest          # 36 checks: mapping / low-fps interpolation / jitter buffer / static routes
+npm run package           # → dist/windows/VFC-Live2D-win32-x64/
+Compress-Archive -Path dist\windows\VFC-Live2D-win32-x64 -DestinationPath dist\VFC-Live2D-win32-x64.zip
+```
+
+Run `VFC-Live2D.exe --smoke` on the packaged app to verify it boots and renders (the result is
+written to `resources/app/electron/smoke-result.json`).
+
 ### GitHub Actions
 
-[Android CI](.github/workflows/android-ci.yml) builds on every push / PR: debug and release
-variants run in parallel and each publishes an artifact (kept 30 days):
+Two workflows build on every change:
+
+**[Android CI](.github/workflows/android-ci.yml)** — debug and release variants run in parallel and
+each publishes an artifact (kept 30 days):
 
 - `VirtualFaceCapture-<sha>-arm64-debug` — arm64-v8a debug APK
 - `VirtualFaceCapture-<sha>-arm64-release` — arm64-v8a release APK + SDK AAR
@@ -362,8 +378,15 @@ variants run in parallel and each publishes an artifact (kept 30 days):
 Artifacts carry `1.0.<run>+<commit>` so versionCode keeps increasing. Pushing a `v*` tag also
 creates a signed GitHub Release.
 
-> CI only builds the Android side. The Windows client is plain JavaScript — clone it and
-> `npm install`.
+**[Windows Client CI](.github/workflows/windows-client-ci.yml)** — runs when `windows-client/**`
+changes:
+
+- on `windows-latest`: `npm ci` → `npm run selftest` → `npm run package`, producing the portable
+  win32-x64 zip (Electron runtime + the 4 bundled Live2D models);
+- the packaged exe is **actually launched once** (`--smoke`, waits for the renderer to be ready),
+  so "build passed" means "the app starts", not just "a zip exists";
+- artifact `VFC-Live2D-win32-x64-<sha>` (zip + `SHA256SUMS.txt`), also attached to the GitHub
+  Release on `v*` tags.
 
 ### Signing
 

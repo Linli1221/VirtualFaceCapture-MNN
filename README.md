@@ -344,12 +344,26 @@ node -e "import('./renderer/mapping.js').then(m => console.log(m.mapTrack({bs:ne
 > 本机 SDK 里的 build-tools 与 AGP 期望版本不一致时，加 `-Pandroid.builder.sdkDownload=false`
 > 让 Gradle 用已安装的版本。
 
+Windows 客户端是纯 JS，不需要编译，但可以打成**免安装便携版**（内置 Electron 运行时）：
+
+```powershell
+cd windows-client
+npm ci
+npm run selftest          # 36 项自检（映射 / 低帧率插值 / 抖动缓冲 / 静态路由）
+npm run package           # → dist/windows/VFC-Live2D-win32-x64/
+Compress-Archive -Path dist\windows\VFC-Live2D-win32-x64 -DestinationPath dist\VFC-Live2D-win32-x64.zip
+```
+
+打包后可用 `VFC-Live2D.exe --smoke` 自检（等模型渲染就绪，结果写 `resources/app/electron/smoke-result.json`）。
+
 ### GitHub Actions 自动构建（每次修改出包）
 
-仓库已配置 [Android CI](.github/workflows/android-ci.yml)，**每次修改都会自动构建安装包**：
+仓库已配置两个 workflow，**每次修改都会自动构建**：
 
-- **任意分支 push / 任意 PR**：**debug 与 release 两个变体独立并行构建**，各出一个
-  Artifact（保留 30 天），到仓库 `Actions` → 对应运行 → `Artifacts` 下载：
+**[Android CI](.github/workflows/android-ci.yml)** —— 任意分支 push / 任意 PR：
+
+- **debug 与 release 两个变体独立并行构建**，各出一个 Artifact（保留 30 天），
+  到仓库 `Actions` → 对应运行 → `Artifacts` 下载：
   - `VirtualFaceCapture-<sha>-arm64-debug` —— arm64-v8a debug APK
   - `VirtualFaceCapture-<sha>-arm64-release` —— arm64-v8a release APK + SDK AAR
 - 两者互不阻塞：一个变体挂了另一个照样出包；
@@ -363,7 +377,15 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-> CI 只构建 Android 端；Windows 客户端是纯 JS，不需要编译，克隆下来 `npm install` 即可用。
+**[Windows Client CI](.github/workflows/windows-client-ci.yml)** —— 改动落在 `windows-client/**` 时：
+
+- 在 `windows-latest` 上 `npm ci` → `npm run selftest` → `npm run package`，
+  产出免安装便携版 zip（内置 Electron 运行时 + 4 个 Live2D 模型）；
+- 打包后**真的启动一次 exe 做自检**（`--smoke`，等渲染就绪才通过），
+  避免「zip 生成了但程序起不来」；
+- Artifact：`VFC-Live2D-win32-x64-<sha>`（zip + `SHA256SUMS.txt`）；
+- 推送 `v*` 标签时同样附到 GitHub Release，和 APK 一起分发。
+
 
 ### 签名 / Release 打包
 
