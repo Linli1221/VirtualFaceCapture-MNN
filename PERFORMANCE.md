@@ -2,10 +2,13 @@
 
 本文记录「优化帧率、稳定 60 帧」这一轮改动的**全部内容、原理、验证方法与已知风险**。
 
-> ⚠️ **重要前提**：本次改动是在**没有 JDK / Android SDK / NDK** 的机器上完成的，
-> **没有编译过、也没有上机跑过**（`gradlew` 无法执行）。
-> 所有验证都是静态的：逐行复核 + 括号配平脚本 + 跨模块符号核对。
-> **第一次拿到代码请先 `./gradlew :app:assembleDebug` 编译通过，再按第 5 节上机实测。**
+> ✅ **编译状态**：已通过 GitHub Actions 的 **Android CI**（run #6，commit `7e1898d`）：
+> `:app:assembleDebug` / `assembleRelease` 与 `arm64-v8a` 原生库全部构建成功，APK 已作为
+> artifact 上传（Actions → 最新一次 run → Artifacts）。
+> 但**代码只在 CI 里编译过，没有在真机上运行过** —— 运行时行为请按第 5 节实测。
+>
+> 📌 首次 CI 报过唯一的编译错误：`DisplayMetrics.refreshRate` 是 `@hide` 字段
+> （编译期不可见），已改为 `WindowManager.defaultDisplay.refreshRate` 兜底。
 
 ---
 
@@ -169,6 +172,11 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(JN
 
 ## 5. 上机验证步骤
 
+### 5.0 装哪个包
+
+CI 每次推送都会构建并上传 APK：仓库 **Actions → 最新一次 `Android CI` → 页面底部 Artifacts**
+（debug 与 release 都有）。直接装上就能用，不需要本地编译。
+
 ### 5.1 看什么
 
 ```bash
@@ -223,12 +231,15 @@ adb logcat -s PipelineFaceTracker Camera2Manager MediaPipeFaceDetector
 
 ## 6. 已知风险 / 后续可做
 
-### 必须复查
+### 已验证 / 待验证
 
-1. **没有编译过**。第一次构建请重点看：`MNN::Tensor::elementSize()` / `getDimensionType()`
-   的可见性、`ExecutorCoroutineDispatcher` / `asCoroutineDispatcher` 的 import、
-   `FloatArray` / `java.util.Arrays.sort` 的用法。
-2. **`.so` 需要重新构建**（`nativeSetBackend` / `nativeGetBackend` 是新符号）。
+1. **编译：已通过**（CI run #6，debug + release，arm64-v8a，含全部 JNI 改动）。
+   因此 `MNN::Tensor::elementSize()` / `getDimensionType()`、`ExecutorCoroutineDispatcher`
+   / `asCoroutineDispatcher`、`FloatArray` + `java.util.Arrays.sort` 这些编译期风险全部排除。
+2. **运行时：未验证**。以下只能在真机上确认 —— 首次启动请看 logcat 是否出现
+   `MNN backend in use: VULKAN`（或自动回落到 `CPU`）、有没有
+   `Failed to initialize native detector`，以及画面/表情是否正常。
+3. **`.so` 需要重新构建**（`nativeSetBackend` / `nativeGetBackend` 是新符号）。
    如果 App 用了旧的 `.so`，`setBackend()` 会捕获 `UnsatisfiedLinkError` 返回 `false`，
    `initialize()` 里的 `nativeGetBackend()` 也已 try/catch 兜底，**不会崩**，只是切不了后端。
 
