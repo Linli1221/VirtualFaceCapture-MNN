@@ -102,9 +102,15 @@ class TrackingServer(
      * 上半身采集是否启用（决定 hello.upperBody 与 track 是否带 ub* 字段，协议 §4.1 / §4.2）。
      *
      * 关闭时 track 里一个上半身字段都不出现；打开后即使暂无结果也发 `ubOk:false`。
+     *
+     * 属性名不能叫 `upperBodyEnabled`：它的 JVM setter 与 [setUpperBodyEnabled] 签名相同，
+     * Kotlin 会报 Platform declaration clash（2026-10-23 的 CI 就挂在这里）。
      */
     @Volatile
-    var upperBodyEnabled: Boolean = false
+    private var upperBodyOn: Boolean = false
+
+    /** 只读状态（日志 / 自检用；外部切换一律走 [setUpperBodyEnabled]）。 */
+    val isUpperBodyEnabled: Boolean get() = upperBodyOn
 
     /** 最近一秒实际发出的 track 帧率。 */
     @Volatile
@@ -288,8 +294,8 @@ class TrackingServer(
      * 关闭时顺手丢掉快照，避免重新打开后先把关闭前的旧姿态发出去。
      */
     fun setUpperBodyEnabled(enabled: Boolean) {
-        if (upperBodyEnabled == enabled) return
-        upperBodyEnabled = enabled
+        if (upperBodyOn == enabled) return
+        upperBodyOn = enabled
         if (!enabled) upperBodySnapshot = null
     }
 
@@ -299,7 +305,7 @@ class TrackingServer(
      * 只做一次引用赋值，不在调用线程做任何序列化 / 计算。
      */
     fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame) {
-        if (!upperBodyEnabled) return
+        if (!upperBodyOn) return
         upperBodySnapshot = frame
     }
 
@@ -336,7 +342,7 @@ class TrackingServer(
         // 上半身是可选增量（协议 §4.2）：未启用时一个 ub* 字段都不出现；
         // 启用后即使本帧没结果（从未收到 / 超过 1500 ms 未更新 / tracking=false）也发
         // ubOk:false，ub / body 全 0，保证结构稳定，客户端可安全回默认姿态。
-        val upperBodyFrame = if (upperBodyEnabled) {
+        val upperBodyFrame = if (upperBodyOn) {
             upperBodySnapshot ?: emptyUpperBodyFrame
         } else {
             null
@@ -618,7 +624,7 @@ class TrackingServer(
                 app = appName,
                 decimation = decimation,
                 targetFps = targetFps,
-                upperBody = upperBodyEnabled,
+                upperBody = upperBodyOn,
                 timestampMs = System.currentTimeMillis(),
             )
         )
