@@ -27,6 +27,7 @@ windows-client/
 │  ├─ index.html              # 画布 + 控制面板
 │  ├─ app.js                  # TrackerClient（WS/心跳/重连/丢旧帧）+ UI + 测试钩子
 │  ├─ live2d.js               # Live2DStage：加载模型、逐帧写参数、渲染
+│  ├─ interp.js               # 低输入帧率插值：输入帧时间轴（纯函数，可被 Node 直接 import）
 │  ├─ mapping.js              # 纯函数映射层（可被 Node 直接 import）
 │  ├─ style.css
 │  └─ vendor/                 # 已提交的浏览器构建：cubism core / pixi / pixi-live2d-display(cubism4)
@@ -36,7 +37,7 @@ windows-client/
    ├─ web-launch.js           # npm run web：不用 Electron，用 Edge/Chrome --app 开窗
    ├─ mock-tracker.js         # 模拟手机端（零依赖 WS 服务端 + 60Hz 合成数据）
    ├─ vendor-assets.js        # 从 node_modules 复制浏览器构建到 renderer/vendor
-   ├─ selftest.js             # 映射数值 + 模型发现 + 静态路由的自检
+   ├─ selftest.js             # 映射数值 + 低/抖动输入插值 + 模型发现 + 静态路由的自检
    ├─ shot.js                 # 可选：系统 Chrome headless 截图（原始 CDP，不装 puppeteer）
    └─ evals/                  # 截图时注入的状态脚本（自测用）
 ```
@@ -70,7 +71,7 @@ npm i
 | `npm start` | Electron 桌面窗口（透明/无边框/置顶/鼠标穿透都可用） |
 | `npm run web` | 不用 Electron：起本地服务 + Edge/Chrome `--app` 窗口（找不到浏览器则只起服务） |
 | `npm run serve` | 只起静态服务：<http://127.0.0.1:17890/>，用任意浏览器打开 |
-| `npm run mock` | 模拟手机端：`ws://127.0.0.1:8765/ws`，60Hz 推合成数据 |
+| `npm run mock` | 模拟手机端：`ws://127.0.0.1:8765/ws`，60Hz 推合成数据（`--hz` / `--jitter` 可调） |
 | `npm run selftest` | 一条命令的自检（映射数值 / 模型发现 / 静态路由） |
 | `npm run shot -- --url ... --out ...` | 可选，自测截图；用**系统 Chrome**，不需要 puppeteer |
 | `npm run vendor` | 手动重新复制 vendor 构建 |
@@ -90,13 +91,44 @@ npm i
    http://127.0.0.1:17890/?ws=ws://192.168.1.23:8765/ws&model=ATRI
    ```
 
-   支持 `?ws=`、`?model=`（大小写不敏感，默认 ATRI）、`?transparent=1`（纯浏览器下模拟透明底）。
+   支持 `?ws=`、`?model=`（大小写不敏感，默认 ATRI）、`?transparent=1`（纯浏览器下模拟透明底）、
+   `?fps=<n>`（渲染目标帧率，默认 60，`0` = 不限制）。
 
 状态条会显示 已连接 / 重连中 / 未连接、设备名、输入 fps、渲染 fps、RTT、seq、丢旧帧数；
 连续 0.8s 收不到人脸（`face:false`）会显示「未检测到人脸」。
 
 连接行为：5s 心跳（ping/pong），按 `seq` 丢旧帧，断线按 **0.5s → 1s → 2s → 5s** 退避重连；
 重连/收到 `hello` 时重置 seq 跟踪与姿态归一化窗口（手机 App 重启后 seq 从 0 开始也能继续）。
+
+## 帧率
+
+- **渲染目标帧率固定 60 fps**（协议 §9）：`Live2DStage` 建好 PIXI Application 后设
+  `app.ticker.maxFPS = 60`，高刷屏（120 / 144 / 165 Hz）不再按屏幕刷新率空转，
+  GPU 占用与笔记本发热都跟着降。状态栏的「渲染 fps」是最近 0.5 s 的**实测均值**
+  （限帧后 `ticker.FPS` 这个瞬时值会剧烈跳动，已不再使用）。
+- **URL 参数 `?fps=<n>`** 可改目标帧率：`?fps=30` 省电、`?fps=0` 不限制（交给 vsync）。
+  范围 10~240，非法值回落 60。
+- **输入帧率低于渲染帧率时自动插值**：手机推 30 fps、PC 画 60 fps 时，一次输入要撑两帧渲染。
+  旧做法是「收到就设目标 + 每帧按固定系数靠近」，两帧里先冲 60%、再拖尾，看起来一卡一卡。
+  现在 `renderer/interp.js` 维护一条**播放时间轴**，渲染时取「当前时刻 − 自适应延迟」处的线性
+  插值：输入跟得上渲染时延迟为 0（直接显示最新帧），断流最多外推 40 ms。
+  代价是输入明显慢于渲染时多一个输入帧的延迟（30 fps → 约 33 ms），换来均匀的 60 fps 运动。
+- **输入间隔不稳定时也能匀速播放**：延迟不是固定值，而是按「最近的输入节奏」自适应——
+  间隔 p85 + 传输滞后 p90 + 8 ms 余量（上限 120 ms）；需要更多缓冲时快升（120 ms 时间常数），
+  缓冲够了再慢降（600 ms），并且升降都限速，保证播放时间永远往前走、不会倒带。
+  单次 100～200 ms 的抽风（GC / 推理卡顿 / Wi-Fi 排队）只影响那一两帧，不会把延迟永久抬高。
+- **时间轴优先用手机报文的 `t`**（采集时间，协议 §4.2）：WebSocket/TCP 是有序的，但两帧可能被
+  PC 调度挤在一起到达，用采集时间才能按真实间隔播放。手机与本机时钟不同步的部分，用「最近
+  12 帧的 到达−采集 最小值」估计、每帧最多跟随 1 ms；偏移一次跳变超过 120 ms（帧缓冲重预缓冲 /
+  网络路径切换）则重锚，绝不让时间轴倒退。没有 `t` 的老报文退化为按到达时间排队。
+- **复现抖动**：`node tools/mock-tracker.js --hz 20 --jitter 25` 给每帧加 0～25 ms 随机发送延迟
+  （时间戳仍按真实生产节奏走），用来对比「带时间戳 / 不带时间戳」的播放效果。
+- **缓动与帧率无关**：`smoothing`（默认 0.6）按 60 fps 每帧标定，实际用
+  `alpha = 1 - exp(-dt/τ)` 换算，改目标帧率、显示器抖动都不会改变手感；
+  插值开启时只保留 10 ms 的轻量平滑来压输入噪声。
+- 调试面板（`D`）里新增「目标帧率 / 实测渲染 / 输入间隔 / 插值延迟 / 输入抖动」，
+  控制台也可以通过 `__vfcDebug.interp` / `__vfc.interp` 直接读
+  （`delayMs`、`inputIntervalMs`、`jitterMs`、`transitJitterMs`、`starvedEpisodes`）。
 
 ## 模型
 
@@ -166,7 +198,8 @@ npm run selftest
 ```
 
 覆盖：协议 §8.1 的 eye/mouth/mouthForm/eyeBall 公式与 clamp、§8.2 自适应归一化首帧与收敛、
-reset 可复现性、apply(bs,pose) 与 apply(track) 等价、4 个模型发现、静态服务路由（含路径穿越拒绝）。
+reset 可复现性、apply(bs,pose) 与 apply(track) 等价、低输入帧率插值（30/15 fps 输入 + 60 fps 渲染
+时每帧步进均匀、延迟收敛、断流外推有上限）、4 个模型发现、静态服务路由（含路径穿越拒绝）。
 
 端到端渲染自测（可选，需要系统 Chrome）：
 

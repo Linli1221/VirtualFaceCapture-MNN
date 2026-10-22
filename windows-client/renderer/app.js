@@ -2,7 +2,8 @@
  * app.js — 渲染页主逻辑：WS 客户端 + 协议处理 + 每帧映射 + UI + Electron 窗口开关
  *
  * 数据流：WebSocket(track) → 按 seq 丢旧帧 → mapping.createMapper().apply(bs, pose)
- *        → stage.setTargetParams(params) → InternalModel.beforeModelUpdate 钩子里写 cubism 参数
+ *        → stage.pushTrackParams(params)（输入慢于渲染时走时间轴插值）
+ *        → InternalModel.beforeModelUpdate 钩子里写 cubism 参数
  *
  * 对外测试钩子（verifier 用）：
  *   window.__vfc      = { ready, freeze(v), applyTrack({bs,pose}), state(), connect(url), disconnect(), setModel(name), ... }
@@ -16,6 +17,20 @@ const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
 const HEARTBEAT_INTERVAL_MS = 5000;
 const STALE_TIMEOUT_MS = 20000;
 const SMOOTHING = 0.6;
+
+/** PC 端渲染目标帧率（协议 §9：60 FPS @ 1080p）；0 = 不限制，交给 vsync。 */
+const DEFAULT_TARGET_FPS = 60;
+const MIN_TARGET_FPS = 10;
+const MAX_TARGET_FPS = 240;
+
+/** ?fps=<n>：覆盖目标帧率；0 / 负数 = 不限制。非法值回落到默认 60。 */
+function parseTargetFps(raw) {
+  if (raw == null || String(raw).trim() === "") return DEFAULT_TARGET_FPS;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return DEFAULT_TARGET_FPS;
+  if (value <= 0) return 0;
+  return Math.round(Math.min(Math.max(value, MIN_TARGET_FPS), MAX_TARGET_FPS));
+}
 
 const STORE_KEYS = {
   ws: "vfc.wsUrl",
@@ -33,6 +48,7 @@ const FALLBACK_MODELS = [
 
 const query = new URLSearchParams(window.location.search);
 const native = window.vfcNative ?? null; // Electron preload 注入；纯 Web 下为 null
+const TARGET_FPS = parseTargetFps(query.get("fps"));
 
 const ui = {
   root: document.getElementById("ui"),
@@ -81,6 +97,7 @@ const state = {
   rttMs: null,
   inputFps: 0,
   renderFps: 0,
+  targetFps: TARGET_FPS,
   error: null,
   frozen: false,
   loadingModel: false,
@@ -90,7 +107,11 @@ const state = {
 };
 
 const mapper = createMapper();
-const stage = new Live2DStage({ canvas: document.getElementById("live2d"), smoothing: SMOOTHING });
+const stage = new Live2DStage({
+  canvas: document.getElementById("live2d"),
+  smoothing: SMOOTHING,
+  targetFps: TARGET_FPS,
+});
 
 /** verifier / 调试读取的稳定对象（原地更新，引用不变）。 */
 const debugState = {
@@ -103,6 +124,17 @@ const debugState = {
   seq: null,
   fps: 0,
   renderFps: 0,
+  targetFps: TARGET_FPS,
+  interp: {
+    active: false,
+    delayMs: 0,
+    inputIntervalMs: 0,
+    jitterMs: 0,
+    transitJitterMs: 0,
+    samples: 0,
+    starvedFrames: 0,
+    starvedEpisodes: 0,
+  },
   latencyMs: null,
   lastTrack: null,
   params: null,
@@ -470,6 +502,7 @@ function connectTo(url) {
 function feedTrack(track) {
   if (!track || typeof track !== "object") return false;
 
+  const now = performance.now();
   const result = mapper.apply(track.bs ?? [], track.pose ?? [0, 0, 0]);
   state.lastTrack = track;
   state.lastResult = result;
@@ -484,7 +517,9 @@ function feedTrack(track) {
     state.faceMissingSince = null;
   }
 
-  stage.setTargetParams(result.params);
+  // 走时间轴：输入帧率低于渲染帧率时，渲染层会在两帧之间插值（见 interp.js）。
+  // track.t 是手机采集时间戳：到达时间被 WS 批量/PC 卡顿挤在一起时，用它还原真实帧间隔。
+  stage.pushTrackParams(result.params, now, track.t);
 
   if (Array.isArray(track.bs) && track.bs.length !== 52) {
     state.badFrames = (state.badFrames ?? 0) + 1;
@@ -505,6 +540,8 @@ function publishDebug() {
   debugState.seq = state.seq;
   debugState.fps = Math.round(state.inputFps * 10) / 10;
   debugState.renderFps = Math.round(state.renderFps * 10) / 10;
+  debugState.targetFps = stage.targetFps;
+  debugState.interp = stage.getInterpolatorStats();
   debugState.latencyMs = state.rttMs == null ? null : Math.round(state.rttMs * 10) / 10;
   debugState.lastTrack = state.lastTrack;
   debugState.params = params;
@@ -618,6 +655,7 @@ function renderDebugGrid() {
   const pose = Array.isArray(track?.pose) ? track.pose : [0, 0, 0];
   const result = state.lastResult;
   const params = result?.params ?? {};
+  const interp = stage.getInterpolatorStats();
   const rows = [
     ["bs.eyeBlinkL", fmt(bs[BS_INDEX.eyeBlinkLeft], 3)],
     ["bs.eyeBlinkR", fmt(bs[BS_INDEX.eyeBlinkRight], 3)],
@@ -639,6 +677,11 @@ function renderDebugGrid() {
     ["BodyAngleX →", fmt(stage.getEngineParam("ParamBodyAngleX"), 2)],
     ["target AngleX", fmt(params.ParamAngleX, 2)],
     ["target AngleY", fmt(params.ParamAngleY, 2)],
+    ["目标帧率", stage.targetFps ? String(stage.targetFps) : "不限"],
+    ["实测渲染", fmt(state.renderFps, 1)],
+    ["输入间隔", fmt(interp.inputIntervalMs, 1) + " ms"],
+    ["输入抖动", fmt(interp.jitterMs, 1) + " ms" + (interp.starvedEpisodes ? ` · 见底 ${interp.starvedEpisodes} 次` : "")],
+    ["插值延迟", fmt(interp.delayMs, 1) + " ms" + (interp.active ? " · 插值中" : "")],
     ["frames", String(state.frames)],
     ["dropped", String(state.dropped)],
     ["缺失参数", (stage.missingParams ?? []).length ? (stage.missingParams ?? []).join(",") : "无"],
@@ -661,7 +704,7 @@ function startUiLoop() {
       lastFrames = state.frames;
       lastSample = now;
     }
-    state.renderFps = stage.app ? stage.app.ticker.FPS : 0;
+    state.renderFps = stage.getRenderFps();
 
     // 连续丢脸 > 0.8s 时提示，避免用户以为画面卡了
     const faceMissing = state.connected && state.faceMissingSince != null && now - state.faceMissingSince > 800;
@@ -874,6 +917,9 @@ window.__vfc = {
       ready: stage.ready,
       modelUrl: stage.modelUrl,
       smoothing: stage.smoothing,
+      targetFps: stage.targetFps,
+      renderFps: stage.getRenderFps(),
+      interp: stage.getInterpolatorStats(),
       engineParams: debugState.engine,
     };
   },
@@ -889,6 +935,20 @@ window.__vfc = {
   setSmoothing(value) {
     return stage.setSmoothing(value);
   },
+  /** 改渲染目标帧率（0 = 不限制），返回实际生效值。 */
+  setTargetFps(value) {
+    const fps = stage.setTargetFps(value);
+    state.targetFps = fps;
+    publishDebug();
+    return fps;
+  },
+  getRenderFps() {
+    return stage.getRenderFps();
+  },
+  /** 插值缓冲状态：{ active, delayMs, inputIntervalMs, samples }。 */
+  get interp() {
+    return stage.getInterpolatorStats();
+  },
   renderNow() {
     stage.renderNow();
   },
@@ -902,6 +962,8 @@ window.__vfc = {
 async function boot() {
   wireUi();
   await initNativeControls();
+  ui.renderFps.title =
+    stage.targetFps > 0 ? `目标 ${stage.targetFps} fps（URL ?fps=<n> 可改，0 = 不限）` : "不限制帧率（跟随 vsync）";
   updateMeta();
 
   const problems = checkEnvironment();

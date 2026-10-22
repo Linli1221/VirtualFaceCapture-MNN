@@ -9,12 +9,15 @@
  *   node tools/mock-tracker.js --scenario closed     # 眼睛全闭（截图对比用）
  *   node tools/mock-tracker.js --scenario sway       # 只摆头
  *   node tools/mock-tracker.js --scenario neutral    # 全中性
+ *   node tools/mock-tracker.js --hz 30 --jitter 20   # 30 Hz，发送时间随机晚 0~20 ms（测抖动缓冲）
  *
  * 参数：
  *   --port <n>        监听端口（默认 8765，协议固定值）
  *   --host <ip>       监听地址（默认 0.0.0.0，方便真机/局域网客户端连）
  *   --frames <n>      发 n 帧后停止推流（默认 0 = 不限）
  *   --hz <n>          每秒帧数（默认 60）
+ *   --jitter <ms>     模拟传输抖动：发送时间在计划时间后随机晚 0~ms
+ *                     （报文里的 `t` 仍按计划采集时间递增，用来验证 PC 端时间轴）
  *   --scenario <name> all | neutral | blink | sway | jaw | closed | open
  *   --quiet           不打印每秒统计
  *
@@ -58,6 +61,7 @@ const options = {
   port: 8765,
   frames: 0,
   hz: 60,
+  jitter: 0,
   scenario: "all",
   quiet: false,
 };
@@ -69,10 +73,11 @@ function parseArgs(argv) {
     else if (arg === "--host") options.host = argv[++i] || options.host;
     else if (arg === "--frames" || arg === "-n") options.frames = Math.max(0, Number(argv[++i]) || 0);
     else if (arg === "--hz") options.hz = Math.max(1, Number(argv[++i]) || options.hz);
+    else if (arg === "--jitter") options.jitter = Math.max(0, Number(argv[++i]) || 0);
     else if (arg === "--scenario" || arg === "--mode") options.scenario = argv[++i] || options.scenario;
     else if (arg === "--quiet" || arg === "-q") options.quiet = true;
     else if (arg === "--help" || arg === "-h") {
-      console.log(`用法：node tools/mock-tracker.js [--port 8765] [--frames N] [--hz 60] [--scenario all|neutral|blink|sway|jaw|closed|open]`);
+      console.log(`用法：node tools/mock-tracker.js [--port 8765] [--frames N] [--hz 60] [--jitter 0] [--scenario all|neutral|blink|sway|jaw|closed|open]`);
       process.exit(0);
     }
   }
@@ -87,7 +92,7 @@ function parseArgs(argv) {
 const round4 = (value) => Math.round(value * 10000) / 10000;
 
 /** 按帧号确定性生成一帧 track（同样帧号永远得到同样数据，方便截图复现）。 */
-function buildTrack(seq) {
+function buildTrack(seq, timestampMs) {
   const t = seq / options.hz;
   const flags = SCENARIOS[options.scenario] ?? SCENARIOS.all;
   const bs = new Array(52).fill(0);
@@ -146,7 +151,7 @@ function buildTrack(seq) {
   return {
     type: "track",
     seq,
-    t: Date.now(),
+    t: Number.isFinite(timestampMs) ? timestampMs : Date.now(),
     bs: bs.map(round4),
     pose: pose.map(round4),
     face,
@@ -173,6 +178,7 @@ function helloMessage() {
 
 const clients = new Set();
 let frame = 0;
+let startedAt = 0;
 let sentSinceSample = 0;
 let actualFps = 0;
 let sampleAt = Date.now();
@@ -345,24 +351,41 @@ function tick() {
     log(`已发送 ${options.frames} 帧，停止推流（服务仍在监听，Ctrl+C 退出）`);
     return;
   }
-  const track = buildTrack(frame);
+  // `t` 用「计划采集时间」而不是发送时刻：真实手机也是采集完就记时间，
+  // 传输/调度抖动只影响到达时间。--jitter 时两者会拉开，正好用来验证 PC 端时间轴。
+  const productionAt = startedAt + Math.round((frame * 1000) / options.hz);
+  const track = buildTrack(frame, productionAt);
   const text = JSON.stringify(track);
   for (const client of clients) client.send(text);
   frame += 1;
   sentSinceSample += 1;
 }
 
+function scheduleNext() {
+  if (!sending) return;
+  const interval = 1000 / options.hz;
+  // 抖动只往后拖（传输只会加延迟），按绝对计划时间排，避免误差累积
+  const jitter = options.jitter > 0 ? Math.random() * options.jitter : 0;
+  const deadline = startedAt + (frame * 1000) / options.hz + jitter;
+  const wait = Math.max(1, Math.round(deadline - Date.now()));
+  timer = setTimeout(() => {
+    if (!sending) return;
+    tick();
+    scheduleNext();
+  }, wait);
+}
+
 function startSending() {
   if (sending) return;
   sending = true;
-  const interval = Math.max(1, Math.round(1000 / options.hz));
-  timer = setInterval(tick, interval);
+  startedAt = Date.now();
+  scheduleNext();
 }
 
 function stopSending() {
   if (!sending) return;
   sending = false;
-  if (timer) clearInterval(timer);
+  if (timer) clearTimeout(timer);
   timer = null;
 }
 
@@ -392,7 +415,7 @@ code{background:#1b2333;padding:2px 6px;border-radius:5px}a{color:#5ac8fa}</styl
       <a href="/__control?mode=neutral">neutral</a> | <a href="/__control?mode=blink">blink</a> |
       <a href="/__control?mode=sway">sway</a> | <a href="/__control?mode=closed">closed</a> |
       <a href="/__control?mode=open">open</a>）</li>
-  <li>hz: <code>${options.hz}</code>，已发帧：<code>${frame}</code>，客户端：<code>${clients.size}</code></li>
+  <li>hz: <code>${options.hz}</code>，抖动: <code>${options.jitter} ms</code>，已发帧：<code>${frame}</code>，客户端：<code>${clients.size}</code></li>
   <li><a href="/status">/status</a></li>
 </ul>
 <p>渲染页：<a href="http://127.0.0.1:17890/?ws=ws://127.0.0.1:${options.port}/ws&model=ATRI">
@@ -419,6 +442,8 @@ const server = http.createServer((req, res) => {
         version: VERSION,
         seq: frame,
         scenario: options.scenario,
+        hz: options.hz,
+        jitter: options.jitter,
       }),
     );
     return;
@@ -454,7 +479,7 @@ server.on("error", (error) => {
 parseArgs(process.argv.slice(2));
 
 server.listen(options.port, options.host, () => {
-  console.log(`[mock] 协议 ${PROTOCOL} v${VERSION} · ${options.hz}Hz · scenario=${options.scenario}`);
+  console.log(`[mock] 协议 ${PROTOCOL} v${VERSION} · ${options.hz}Hz · scenario=${options.scenario}${options.jitter ? ` · 发送抖动 0~${options.jitter}ms` : ""}`);
   console.log(`[mock] WS   ws://127.0.0.1:${options.port}/ws`);
   console.log(`[mock] 页面 http://127.0.0.1:${options.port}/`);
   console.log(`[mock] 渲染 http://127.0.0.1:17890/?ws=ws://127.0.0.1:${options.port}/ws&model=ATRI`);

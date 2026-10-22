@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
- * tools/selftest.js — 不依赖浏览器的自检：映射数值 + 模型发现 + 静态服务路由
+ * tools/selftest.js — 不依赖浏览器的自检：映射数值 + 输入帧率/抖动缓冲 + 模型发现 + 静态服务路由
  *
  *   node tools/selftest.js
  *
- * 覆盖协议 §8.1 / §8.2（含自适应归一化首帧行为、reset 可复现性）与 server.js 的静态服务。
+ * 覆盖协议 §8.1 / §8.2（含自适应归一化首帧行为、reset 可复现性）、
+ * 输入帧率低于渲染帧率 / 输入间隔不稳定时的插值（renderer/interp.js）与 server.js 的静态服务。
  */
 import assert from "node:assert/strict";
 import { createMapper, mapBshapes, mapTrackToParams, AdaptiveAngleNormalizer, BS_INDEX, BS_COUNT, PARAM_IDS } from "../renderer/mapping.js";
+import { ParamTimeline } from "../renderer/interp.js";
 import { discoverModels, startServer } from "../server.js";
 
 const results = [];
@@ -158,6 +160,319 @@ await test("AdaptiveAngleNormalizer 负向量程独立自适应", () => {
   normalizer.reset();
   assert.equal(normalizer.samples, 0);
   near(normalizer.normalize(-5), -5 / (20 * 0.99 + 0.5 * 0.01), 1e-9);
+});
+
+console.log("[selftest] interp.js · 输入帧率低 / 间隔不稳定时的插值与抖动缓冲");
+
+/** 只让 ParamAngleX 变化，便于用「值 = 斜率 × 时间」验证插值是否均匀。 */
+function makeAngleParams(angleX) {
+  const params = Object.fromEntries(PARAM_IDS.map((id) => [id, 0]));
+  params.ParamAngleX = angleX;
+  return params;
+}
+
+/**
+ * 按指定输入 / 渲染节奏同时推进时间轴与采样（模拟真实收帧 + rAF），
+ * 返回每两个渲染帧之间的参数步进（跳过前 600 ms，让自适应延迟先收敛）。
+ */
+function simulateTimeline({ inputHz, renderHz, durationMs }) {
+  const timeline = new ParamTimeline();
+  const inputInterval = 1000 / inputHz;
+  const renderInterval = 1000 / renderHz;
+  const steps = [];
+  let prev = null;
+  let index = 0;
+  let nextInputAt = 0;
+  for (let t = 0; t <= durationMs; t += renderInterval) {
+    while (nextInputAt <= t + 1e-9) {
+      timeline.push(makeAngleParams(index), nextInputAt);
+      index += 1;
+      nextInputAt = index * inputInterval;
+    }
+    const value = timeline.sample(t).ParamAngleX;
+    if (prev !== null && t > 600) steps.push(value - prev);
+    prev = value;
+  }
+  return { timeline, steps };
+}
+
+/** 可复现的伪随机（LCG），避免 Math.random 让测试偶发失败。 */
+function makeRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+/**
+ * 模拟「输入间隔不稳定」：生产节奏由 intervalsMs 循环给出；
+ * arrivalJitterMs > 0 时到达时间 = 生产时间 + 0..jitter 的随机延迟（WS 有序，保证单调）；
+ * useStamps = true 时把生产时间当作 track.t 传给 push（模拟真实协议）。
+ * driftMs 让到达时间每帧额外偏移一点（模拟两端时钟频率略有差异）。
+ * 返回渲染侧步进、sampleAt 序列与缓冲见底比例。
+ */
+function simulateUnstable({
+  intervalsMs = [1000 / 30],
+  renderHz = 60,
+  durationMs = 2000,
+  arrivalJitterMs = 0,
+  driftMs = 0,
+  useStamps = false,
+  seed = 1,
+  skipMs = 900,
+} = {}) {
+  const timeline = new ParamTimeline();
+  const random = makeRandom(seed);
+  const renderInterval = 1000 / renderHz;
+  const slack = intervalsMs.reduce((sum, value) => sum + value, 0);
+  const events = [];
+  let production = 0;
+  let prevArrival = -Infinity;
+  let index = 0;
+  while (production <= durationMs + slack) {
+    const interval = intervalsMs[index % intervalsMs.length];
+    let arrival = production + driftMs * index + (arrivalJitterMs > 0 ? random() * arrivalJitterMs : 0);
+    if (index === 0) arrival = production;
+    if (arrival < prevArrival + 1) arrival = prevArrival + 1;
+    prevArrival = arrival;
+    events.push({ production, arrival, params: makeAngleParams(index) });
+    production += interval;
+    index += 1;
+  }
+
+  const steps = [];
+  const sampleAts = [];
+  let prev = null;
+  let cursor = 0;
+  let starved = 0;
+  let frames = 0;
+  for (let t = 0; t <= durationMs; t += renderInterval) {
+    while (cursor < events.length && events[cursor].arrival <= t + 1e-9) {
+      const event = events[cursor];
+      timeline.push(event.params, event.arrival, useStamps ? event.production : null);
+      cursor += 1;
+    }
+    const starvedBefore = timeline.starvedFrames;
+    const sampled = timeline.sample(t);
+    if (!sampled) continue;
+    if (t >= skipMs) {
+      frames += 1;
+      if (timeline.starvedFrames > starvedBefore) starved += 1;
+      if (prev !== null) steps.push(sampled.ParamAngleX - prev);
+    }
+    prev = sampled.ParamAngleX;
+    sampleAts.push(t - timeline.delayMs);
+  }
+  return { timeline, steps, sampleAts, starvedRatio: frames ? starved / frames : 0 };
+}
+
+await test("输入 60 fps / 渲染 60 fps：不启用缓冲，延迟保持 0，逐帧跟随最新输入", () => {
+  const { timeline, steps } = simulateTimeline({ inputHz: 60, renderHz: 60, durationMs: 1500 });
+  assert.equal(timeline.delayMs, 0);
+  assert.equal(timeline.interpolating, false);
+  assert.ok(steps.length > 40, "样本太少：" + steps.length);
+  // 60 / 60：一帧输入撑一帧渲染，步进就是 1（不做多余延迟）
+  for (const step of steps) assert.ok(step > 0.9 && step < 1.1, "步进应≈1，实际 " + step);
+});
+
+await test("输入 30 fps / 渲染 60 fps：延迟 ≈ 一个输入间隔 + 抖动余量，渲染步进均匀（每帧 0.5）", () => {
+  const { timeline, steps } = simulateTimeline({ inputHz: 30, renderHz: 60, durationMs: 1900 });
+  const input = 1000 / 30;
+  near(timeline.targetDelayMs(), input + 8, 0.5);
+  assert.ok(steps.length > 40, "样本太少：" + steps.length);
+  for (const step of steps) assert.ok(step > 0.45 && step < 0.55, "步进应≈0.5，实际 " + step);
+  near(timeline.delayMs, input + 8, 3);
+});
+
+await test("输入 15 fps / 渲染 60 fps：渲染步进仍是均匀的 0.25", () => {
+  const { steps } = simulateTimeline({ inputHz: 15, renderHz: 60, durationMs: 2000 });
+  assert.ok(steps.length > 40, "样本太少：" + steps.length);
+  for (const step of steps) assert.ok(step > 0.22 && step < 0.28, "步进应≈0.25，实际 " + step);
+});
+
+await test("乱序帧被丢弃、同时刻帧覆盖，不影响节奏", () => {
+  const timeline = new ParamTimeline();
+  assert.equal(timeline.push(makeAngleParams(1), 100), true);
+  assert.equal(timeline.push(makeAngleParams(2), 50), false);
+  assert.equal(timeline.count, 1);
+  assert.equal(timeline.push(makeAngleParams(3), 100), true);
+  assert.equal(timeline.count, 1);
+  assert.equal(timeline.sample(100).ParamAngleX, 3);
+});
+
+await test("断流：最多外推 40 ms / 0.75 个输入间隔，不会让参数飞出去", () => {
+  const timeline = new ParamTimeline();
+  for (let i = 0; i < 10; i++) timeline.push(makeAngleParams(i * 2), i * (1000 / 30));
+  for (let t = 0; t <= 500; t += 1000 / 60) timeline.sample(t);
+  const value = timeline.sample(5000).ParamAngleX;
+  assert.ok(Number.isFinite(value), "外推值应为有限数字");
+  assert.ok(value >= 18 - 1e-9, "不应回退，实际 " + value);
+  assert.ok(value <= 18 + 0.75 * 2 + 1e-9, "外推应被限制在 0.75 个输入间隔内，实际 " + value);
+});
+
+await test("断流超过 maxIntervalMs：旧样本作废，节奏重新测", () => {
+  const timeline = new ParamTimeline();
+  timeline.push(makeAngleParams(0), 0);
+  timeline.push(makeAngleParams(1), 33);
+  timeline.push(makeAngleParams(2), 1500);
+  assert.equal(timeline.count, 1);
+  assert.equal(timeline.inputIntervalMs, 0);
+});
+
+await test("参数缺失 / 非数字：按 0 处理，不抛异常", () => {
+  const timeline = new ParamTimeline();
+  timeline.push({ ParamAngleX: 10, ParamEyeLOpen: "x" }, 0);
+  const sampled = timeline.sample(0);
+  assert.equal(sampled.ParamAngleX, 10);
+  assert.equal(sampled.ParamEyeLOpen, 0);
+});
+
+await test("reset 清空样本、延迟与节奏", () => {
+  const timeline = new ParamTimeline();
+  timeline.push(makeAngleParams(1), 0);
+  timeline.push(makeAngleParams(2), 33);
+  timeline.sample(66);
+  timeline.reset();
+  assert.equal(timeline.count, 0);
+  assert.equal(timeline.delayMs, 0);
+  assert.equal(timeline.inputIntervalMs, 0);
+  assert.equal(timeline.sample(100), null);
+});
+
+await test("输入间隔抖动（10/50 ms 交替）：延迟按 p85 覆盖，缓冲不被抽干，播放时间单调", () => {
+  const { timeline, steps, sampleAts, starvedRatio } = simulateUnstable({
+    intervalsMs: [10, 50],
+    durationMs: 3000,
+    skipMs: 1000,
+  });
+  assert.ok(timeline.inputJitterMs > 15, "应测出间隔抖动（p85 − 中位数），实际 " + timeline.inputJitterMs);
+  assert.ok(timeline.delayMs > 40 && timeline.delayMs <= 120, "延迟应覆盖 50 ms 的长间隔，实际 " + timeline.delayMs);
+  assert.ok(starvedRatio < 0.03, "缓冲见底比例应 < 3%，实际 " + starvedRatio);
+  const average = steps.reduce((sum, value) => sum + value, 0) / steps.length;
+  assert.ok(average > 0.42 && average < 0.58, "平均步进应接近 30/60 = 0.5，实际 " + average);
+  let prev = -Infinity;
+  for (const at of sampleAts) {
+    assert.ok(at >= prev - 1e-6, "sampleAt 不应倒退：" + prev + " -> " + at);
+    prev = at;
+  }
+});
+
+await test("传输抖动（到达时间 0~25 ms 随机延迟）：用手机采集时间戳排轴，步进恢复均匀", () => {
+  const { timeline, steps, starvedRatio } = simulateUnstable({
+    intervalsMs: [1000 / 30],
+    arrivalJitterMs: 25,
+    useStamps: true,
+    durationMs: 3200,
+    skipMs: 1500,
+    seed: 7,
+  });
+  assert.ok(timeline.transitJitterMs > 5, "应测出传输滞后，实际 " + timeline.transitJitterMs);
+  assert.ok(starvedRatio < 0.02, "缓冲见底比例应 < 2%，实际 " + starvedRatio);
+  for (const step of steps) assert.ok(step > 0.42 && step < 0.58, "步进应≈0.5，实际 " + step);
+});
+
+await test("WS 批量到达（两帧挤在一起）：手机时间戳让播放间隔恢复正常", () => {
+  const inputInterval = 1000 / 30;
+  const run = (useStamps) => {
+    const timeline = new ParamTimeline();
+    const events = [];
+    for (let i = 0; i < 120; i++) {
+      const production = i * inputInterval;
+      const batch = Math.floor(i / 2);
+      const arrival = (batch * 2 + 1) * inputInterval + (i % 2); // 每两帧同一批，相差 1 ms
+      events.push({ production, arrival, params: makeAngleParams(i) });
+    }
+    const steps = [];
+    let prev = null;
+    let cursor = 0;
+    for (let t = 0; t <= 3400; t += 1000 / 60) {
+      while (cursor < events.length && events[cursor].arrival <= t + 1e-9) {
+        const event = events[cursor];
+        timeline.push(event.params, event.arrival, useStamps ? event.production : null);
+        cursor += 1;
+      }
+      const sampled = timeline.sample(t);
+      if (!sampled) continue;
+      if (prev !== null && t >= 1600) steps.push(sampled.ParamAngleX - prev);
+      prev = sampled.ParamAngleX;
+    }
+    return { maxStep: Math.max(...steps.map((value) => Math.abs(value))), steps };
+  };
+
+  const withStamps = run(true);
+  const without = run(false);
+  assert.ok(withStamps.maxStep < 0.62, "有时间戳时应均匀（≤0.62），实际 " + withStamps.maxStep);
+  assert.ok(without.maxStep > 1.0, "没有时间戳时突发会跳帧（>1.0），实际 " + without.maxStep);
+});
+
+await test("手机时钟回跳 / 时间戳缺失：重新锚定，不倒退、不抛异常", () => {
+  const timeline = new ParamTimeline();
+  assert.equal(timeline.push(makeAngleParams(1), 0, 1000), true);
+  assert.equal(timeline.push(makeAngleParams(2), 33, 1033), true);
+  assert.equal(timeline.push(makeAngleParams(3), 66, 500), true, "时钟回跳后应重新锚定并接受");
+  assert.equal(timeline.count, 1);
+  assert.equal(timeline.sample(66).ParamAngleX, 3);
+  assert.equal(timeline.push(makeAngleParams(4), 99, 533), true);
+  assert.ok(timeline.count >= 2);
+  assert.ok(Number.isFinite(timeline.sample(99).ParamAngleX));
+
+  const fallback = new ParamTimeline();
+  fallback.push(makeAngleParams(1), 0, 1000);
+  fallback.push(makeAngleParams(2), 33, 1033);
+  fallback.push(makeAngleParams(3), 66); // 时间戳丢失：退回到达时间
+  assert.equal(fallback.count, 1, "两套时间基准不能混用");
+  fallback.push(makeAngleParams(4), 99);
+  assert.equal(fallback.count, 2);
+  const value = fallback.sample(99).ParamAngleX;
+  assert.ok(value >= 3 && value <= 4, "回退后应继续插值，实际 " + value);
+});
+
+await test("输入节奏突变：延迟快升慢降，sampleAt 始终单调（不倒带）", () => {
+  const timeline = new ParamTimeline();
+  const renderInterval = 1000 / 60;
+  let nextInput = 0;
+  let index = 0;
+  const sampleAts = [];
+  let delayAfterSlow = null;
+  let delayAfterRecover = null;
+  for (let t = 0; t <= 5200; t += renderInterval) {
+    while (nextInput <= t + 1e-9) {
+      timeline.push(makeAngleParams(index), nextInput);
+      index += 1;
+      nextInput += nextInput < 1000 ? 1000 / 60 : nextInput < 2500 ? 1000 / 15 : 1000 / 60;
+    }
+    timeline.sample(t);
+    sampleAts.push(t - timeline.delayMs);
+    if (t >= 1250 && delayAfterSlow === null) delayAfterSlow = timeline.delayMs;
+    if (t >= 3000 && delayAfterRecover === null) delayAfterRecover = timeline.delayMs;
+  }
+  assert.ok(delayAfterSlow > 40, "切到 15 fps 后 250 ms 内延迟应明显上升，实际 " + delayAfterSlow);
+  assert.ok(delayAfterRecover > 15, "切回 60 fps 后 500 ms 仍应缓慢回落，实际 " + delayAfterRecover);
+  assert.ok(timeline.delayMs < 5, "再过 2 s 应基本回落，实际 " + timeline.delayMs);
+  let prev = -Infinity;
+  for (const at of sampleAts) {
+    assert.ok(at >= prev - 1e-6, "sampleAt 不应倒退：" + prev + " -> " + at);
+    prev = at;
+  }
+});
+
+await test("到达节奏比手机时钟略快（两端时钟频差）：偏移有界，媒体时间不会跑到到达时间前面", () => {
+  // 到达时间每帧早 0.2 ms（相当于 6000 ppm 的时钟频差，真实设备远小于此），跑 20 s
+  const { timeline, starvedRatio } = simulateUnstable({
+    intervalsMs: [1000 / 30],
+    arrivalJitterMs: 2,
+    driftMs: -0.2,
+    useStamps: true,
+    durationMs: 20000,
+    seed: 7,
+    skipMs: 2000,
+  });
+  const ahead = Math.max(0, -Math.min(...timeline._lags));
+  assert.ok(ahead < 8, "媒体时间最多领先到达时间 8 ms，实际 " + ahead);
+  assert.ok(timeline.transitJitterMs < 8, "到达规律时传输抖动应很小，实际 " + timeline.transitJitterMs);
+  near(timeline.delayMs, 1000 / 30 + 8, 8);
+  assert.ok(starvedRatio < 0.02, "见底比例 " + starvedRatio);
 });
 
 console.log("[selftest] server.js · 模型发现与静态路由");
