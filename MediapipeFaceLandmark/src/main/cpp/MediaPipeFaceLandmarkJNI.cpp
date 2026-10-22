@@ -1,4 +1,7 @@
 #include <jni.h>
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <android/log.h>
@@ -18,6 +21,63 @@ using namespace mediapipe_face;
 static std::unique_ptr<FaceDetector> g_faceDetector = nullptr;
 static std::unique_ptr<FaceLandmarker> g_faceLandmarker = nullptr;
 static std::unique_ptr<BlendShapePredictor> g_blendshapePredictor = nullptr;
+
+// Model paths / thread count captured in nativeInit so the MNN backend can be
+// rebuilt at runtime without going back to Kotlin for the model files again.
+// NOTE: std::string copies — never keep the GetStringUTFChars pointers.
+static std::string g_detector_model_path;
+static std::string g_landmarker_model_path;
+static std::string g_blendshape_model_path;  // empty => blendshape disabled
+static int g_num_threads = 2;
+
+// Currently active MNN backend: true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU.
+static std::atomic<bool> g_use_vulkan{true};
+
+// Serializes model creation. Per-frame inference does NOT take this lock:
+// callers must not switch the backend while the capture pipeline is running
+// (MediaPipeFaceDetector.setBackend() documents and enforces that contract).
+static std::mutex g_model_mutex;
+
+// Creates the three models on the requested backend using the cached paths.
+// Caller must hold g_model_mutex. Returns false only when a critical model
+// (detector / landmarker) fails; the blendshape model stays optional.
+static bool createModelsLocked(bool use_vulkan) {
+    g_faceDetector.reset();
+    g_faceLandmarker.reset();
+    g_blendshapePredictor.reset();
+    
+    auto detector = std::make_unique<FaceDetector>();
+    if (!detector->loadModel(g_detector_model_path, g_num_threads, use_vulkan)) {
+        LOGE("Failed to load face detector: %s", detector->lastError().c_str());
+        return false;
+    }
+    LOGI("Face detector loaded successfully");
+    
+    auto landmarker = std::make_unique<FaceLandmarker>();
+    if (!landmarker->loadModel(g_landmarker_model_path, g_num_threads, use_vulkan)) {
+        LOGE("Failed to load face landmarker: %s", landmarker->lastError().c_str());
+        return false;
+    }
+    LOGI("Face landmarker loaded successfully");
+    
+    std::unique_ptr<BlendShapePredictor> blendshape;
+    if (!g_blendshape_model_path.empty()) {
+        blendshape = std::make_unique<BlendShapePredictor>();
+        if (!blendshape->loadModel(g_blendshape_model_path, g_num_threads, use_vulkan)) {
+            LOGE("Failed to load blendshape predictor: %s",
+                 blendshape->lastError().c_str());
+            blendshape.reset();
+            LOGI("BlendShape prediction will be disabled");
+        } else {
+            LOGI("BlendShape predictor loaded successfully");
+        }
+    }
+    
+    g_faceDetector = std::move(detector);
+    g_faceLandmarker = std::move(landmarker);
+    g_blendshapePredictor = std::move(blendshape);
+    return true;
+}
 
 // Cached head pose for compensation
 static HeadPose g_lastHeadPose;
@@ -44,57 +104,149 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInit(
     
     LOGI("Initializing MediaPipe Face Detection with BlendShape support");
     
+    if (detectorModelPath == nullptr || landmarkerModelPath == nullptr) {
+        LOGE("Model paths must not be null");
+        return JNI_FALSE;
+    }
+    
     const char* detectorPath = env->GetStringUTFChars(detectorModelPath, nullptr);
     const char* landmarkerPath = env->GetStringUTFChars(landmarkerModelPath, nullptr);
-    const char* blendshapePath = blendshapeModelPath ? 
+    const char* blendshapePath = blendshapeModelPath ?
                                   env->GetStringUTFChars(blendshapeModelPath, nullptr) : nullptr;
     
-    // Clean up existing instances
-    g_faceDetector.reset();
-    g_faceLandmarker.reset();
-    g_blendshapePredictor.reset();
+    // Keep std::string copies of the paths so the backend can be switched later.
+    const std::string detectorPathCopy = (detectorPath != nullptr) ? detectorPath : "";
+    const std::string landmarkerPathCopy = (landmarkerPath != nullptr) ? landmarkerPath : "";
+    const std::string blendshapePathCopy = (blendshapePath != nullptr) ? blendshapePath : "";
+    
+    if (detectorPath != nullptr) {
+        env->ReleaseStringUTFChars(detectorModelPath, detectorPath);
+    }
+    if (landmarkerPath != nullptr) {
+        env->ReleaseStringUTFChars(landmarkerModelPath, landmarkerPath);
+    }
+    if (blendshapePath != nullptr) {
+        env->ReleaseStringUTFChars(blendshapeModelPath, blendshapePath);
+    }
+    
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    
+    g_detector_model_path = detectorPathCopy;
+    g_landmarker_model_path = landmarkerPathCopy;
+    g_blendshape_model_path = blendshapePathCopy;
+    g_num_threads = static_cast<int>(numThreads);
     g_hasHeadPose = false;
     
-    // Create detector
-    g_faceDetector = std::make_unique<FaceDetector>();
-    if (!g_faceDetector->loadModel(detectorPath, numThreads)) {
-        LOGE("Failed to load face detector: %s", g_faceDetector->lastError().c_str());
-        env->ReleaseStringUTFChars(detectorModelPath, detectorPath);
-        env->ReleaseStringUTFChars(landmarkerModelPath, landmarkerPath);
-        if (blendshapePath) env->ReleaseStringUTFChars(blendshapeModelPath, blendshapePath);
-        return JNI_FALSE;
-    }
-    LOGI("Face detector loaded successfully");
-    
-    // Create landmarker
-    g_faceLandmarker = std::make_unique<FaceLandmarker>();
-    if (!g_faceLandmarker->loadModel(landmarkerPath, numThreads)) {
-        LOGE("Failed to load face landmarker: %s", g_faceLandmarker->lastError().c_str());
-        env->ReleaseStringUTFChars(detectorModelPath, detectorPath);
-        env->ReleaseStringUTFChars(landmarkerModelPath, landmarkerPath);
-        if (blendshapePath) env->ReleaseStringUTFChars(blendshapeModelPath, blendshapePath);
-        return JNI_FALSE;
-    }
-    LOGI("Face landmarker loaded successfully");
-    
-    // Create blendshape predictor (optional)
-    if (blendshapePath) {
-        g_blendshapePredictor = std::make_unique<BlendShapePredictor>();
-        if (!g_blendshapePredictor->loadModel(blendshapePath, numThreads)) {
-            LOGE("Failed to load blendshape predictor: %s", g_blendshapePredictor->lastError().c_str());
-            // Continue without blendshape support
-            g_blendshapePredictor.reset();
-            LOGI("BlendShape prediction will be disabled");
-        } else {
-            LOGI("BlendShape predictor loaded successfully");
+    // Create detector + landmarker (+ optional blendshape) on the current backend.
+    // If Vulkan cannot be created on this device, fall back to the CPU backend
+    // instead of failing initialization outright.
+    bool ok = createModelsLocked(g_use_vulkan.load());
+    if (!ok && g_use_vulkan.load()) {
+        LOGI("Vulkan backend unavailable, falling back to MNN CPU backend");
+        ok = createModelsLocked(false);
+        if (ok) {
+            g_use_vulkan.store(false);
         }
     }
     
-    env->ReleaseStringUTFChars(detectorModelPath, detectorPath);
-    env->ReleaseStringUTFChars(landmarkerModelPath, landmarkerPath);
-    if (blendshapePath) env->ReleaseStringUTFChars(blendshapeModelPath, blendshapePath);
+    if (!ok) {
+        LOGE("Failed to initialize MediaPipe face models");
+        return JNI_FALSE;
+    }
     
+    LOGI("MediaPipe face models initialized (backend=%s, threads=%d)",
+         g_use_vulkan.load() ? "Vulkan" : "CPU", g_num_threads);
     return JNI_TRUE;
+}
+
+/**
+ * Switch the MNN inference backend of all three models at runtime.
+ *
+ * The models are reloaded in place from the paths cached by nativeInit, so the
+ * smoothing filter configuration and state are preserved. On failure the old
+ * backend is restored (best effort) and JNI_FALSE is returned.
+ *
+ * @param useVulkan true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU
+ * @return true if the requested backend is active after the call
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetBackend(
+        JNIEnv* env,
+        jobject /* this */,
+        jboolean useVulkan) {
+    
+    const bool want_vulkan = (useVulkan == JNI_TRUE);
+    
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    
+    if (!g_faceDetector || !g_faceLandmarker) {
+        LOGE("Cannot switch MNN backend: models not initialized");
+        return JNI_FALSE;
+    }
+    if (g_detector_model_path.empty() || g_landmarker_model_path.empty()) {
+        LOGE("Cannot switch MNN backend: model paths were not cached");
+        return JNI_FALSE;
+    }
+    
+    const bool previous_vulkan = g_use_vulkan.load();
+    if (want_vulkan == previous_vulkan) {
+        LOGI("MNN backend already %s", want_vulkan ? "Vulkan" : "CPU");
+        return JNI_TRUE;
+    }
+    
+    LOGI("Switching MNN backend to %s (reloading models)...",
+         want_vulkan ? "Vulkan" : "CPU");
+    
+    // Critical model #1: face detector.
+    if (!g_faceDetector->loadModel(g_detector_model_path, g_num_threads, want_vulkan)) {
+        LOGE("Face detector reload on %s failed: %s",
+             want_vulkan ? "Vulkan" : "CPU", g_faceDetector->lastError().c_str());
+        g_faceDetector->loadModel(g_detector_model_path, g_num_threads, previous_vulkan);
+        LOGI("Rolled back to %s", previous_vulkan ? "Vulkan" : "CPU");
+        return JNI_FALSE;
+    }
+    
+    // Critical model #2: face landmarker.
+    if (!g_faceLandmarker->loadModel(g_landmarker_model_path, g_num_threads, want_vulkan)) {
+        LOGE("Face landmarker reload on %s failed: %s",
+             want_vulkan ? "Vulkan" : "CPU", g_faceLandmarker->lastError().c_str());
+        // Roll back both critical models so the pipeline stays usable.
+        g_faceLandmarker->loadModel(g_landmarker_model_path, g_num_threads, previous_vulkan);
+        g_faceDetector->loadModel(g_detector_model_path, g_num_threads, previous_vulkan);
+        LOGI("Rolled back to %s", previous_vulkan ? "Vulkan" : "CPU");
+        return JNI_FALSE;
+    }
+    
+    // Optional model: blendshape predictor.
+    if (g_blendshapePredictor && !g_blendshape_model_path.empty()) {
+        if (!g_blendshapePredictor->loadModel(g_blendshape_model_path, g_num_threads,
+                                              want_vulkan)) {
+            LOGE("BlendShape reload on %s failed: %s",
+                 want_vulkan ? "Vulkan" : "CPU",
+                 g_blendshapePredictor->lastError().c_str());
+            if (!g_blendshapePredictor->loadModel(g_blendshape_model_path, g_num_threads,
+                                                  previous_vulkan)) {
+                LOGE("BlendShape rollback failed, blendshape prediction disabled");
+                g_blendshapePredictor.reset();
+            }
+        }
+    }
+    
+    g_use_vulkan.store(want_vulkan);
+    LOGI("MNN backend switched to %s", want_vulkan ? "Vulkan" : "CPU");
+    return JNI_TRUE;
+}
+
+/**
+ * Get the currently active MNN inference backend.
+ * @return true if running on Vulkan, false if running on the CPU backend
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(
+        JNIEnv* env,
+        jobject /* this */) {
+    
+    return g_use_vulkan.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 /**
@@ -181,7 +333,10 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeDetectLandmar
     size_t numLandmarks = result.landmarks.size();
     jfloatArray landmarksArray = env->NewFloatArray(numLandmarks * 3);
     
-    std::vector<float> landmarksData;
+    // Per-thread scratch buffer: clear() keeps the capacity, so after the first
+    // frame there is no heap allocation left in this per-frame copy path.
+    static thread_local std::vector<float> landmarksData;
+    landmarksData.clear();
     landmarksData.reserve(numLandmarks * 3);
     
     for (const auto& lm : result.landmarks) {
@@ -285,7 +440,10 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeDetectLandmar
     size_t numLandmarks = result.landmarks.size();
     jfloatArray landmarksArray = env->NewFloatArray(numLandmarks * 3);
     
-    std::vector<float> landmarksData;
+    // Per-thread scratch buffer: clear() keeps the capacity, so after the first
+    // frame there is no heap allocation left in this per-frame copy path.
+    static thread_local std::vector<float> landmarksData;
+    landmarksData.clear();
     landmarksData.reserve(numLandmarks * 3);
     
     for (const auto& lm : result.landmarks) {
@@ -355,6 +513,8 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeRelease(
         jobject /* this */) {
     
     LOGI("Releasing MediaPipe Face Detection resources");
+    
+    std::lock_guard<std::mutex> lock(g_model_mutex);
     
     g_faceDetector.reset();
     g_faceLandmarker.reset();
@@ -913,7 +1073,10 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeDetectLandmar
     size_t numLandmarks = result.landmarks.size();
     jfloatArray landmarksArray = env->NewFloatArray(numLandmarks * 3 + 1);
     
-    std::vector<float> landmarksData;
+    // Per-thread scratch buffer: clear() keeps the capacity, so after the first
+    // frame there is no heap allocation left in this per-frame copy path.
+    static thread_local std::vector<float> landmarksData;
+    landmarksData.clear();
     landmarksData.reserve(numLandmarks * 3 + 1);
     
     for (const auto& lm : result.landmarks) {
@@ -993,7 +1156,10 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeDetectAllFrom
     size_t numLandmarks = result.landmarks.size();
     jfloatArray landmarksArray = env->NewFloatArray(numLandmarks * 3);
     
-    std::vector<float> landmarksData;
+    // Per-thread scratch buffer: clear() keeps the capacity, so after the first
+    // frame there is no heap allocation left in this per-frame copy path.
+    static thread_local std::vector<float> landmarksData;
+    landmarksData.clear();
     landmarksData.reserve(numLandmarks * 3);
     
     for (const auto& lm : result.landmarks) {

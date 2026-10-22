@@ -284,11 +284,21 @@ data class TrackingStatus(
                             presenceScore < 0.3f
         
         // 构建原因字符串（调试用）
-        val reason = buildString {
-            append("Pres=%.2f ".format(presenceScore))
-            append("IoU=%.2f ".format(iou))
-            append("Move=%.3f ".format(movement))
-            append("Conf=%.2f".format(smoothedConfidence))
+        //
+        // 旧实现每帧都无条件做 4 次 String.format（"%.2f"/"%.3f"）。String.format 需要
+        // 解析格式串 + Formatter 状态机，单次约 5~10µs，一帧 4 次就是 20~40µs，而且全部
+        // 产生临时 String。项目里唯一的消费者 PipelineFaceTracker 只在
+        // `if (trackingStatus.shouldRedetect)` 分支里读 reason 打日志，
+        // 所以正常追踪路径可以完全不构建。
+        val reason = if (shouldRedetect) {
+            buildString {
+                append("Pres=%.2f ".format(presenceScore))
+                append("IoU=%.2f ".format(iou))
+                append("Move=%.3f ".format(movement))
+                append("Conf=%.2f".format(smoothedConfidence))
+            }
+        } else {
+            ""
         }
         
         // 更新状态

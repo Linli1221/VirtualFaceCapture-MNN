@@ -650,7 +650,10 @@ class SimpleEyeExtractor {
             nearSideCompensationMultiplier = dynamicMultiplier.coerceIn(0.5f, 15.0f)
             
             // 当补偿系数变化较大时打印日志
-            if (abs(nearSideCompensationMultiplier - prevMultiplier) > 0.3f) {
+            // 注意：String.format 单次约 5~10µs，且这段代码在每帧的 processWithPose 路径上，
+            // 移动/靠近镜头时会连续触发。这里先判断 DEBUG 是否开启，未开启时不做任何格式化。
+            if (abs(nearSideCompensationMultiplier - prevMultiplier) > 0.3f &&
+                Log.isLoggable("EyeExtractor", Log.DEBUG)) {
                 Log.d("EyeExtractor", String.format(
                     "📏 faceRatio=%.2f, FOV=%.0f°, perspective=%.2f -> multiplier=%.1f",
                     currentFaceRatio, cameraFovDegrees, perspectiveStrength, nearSideCompensationMultiplier
@@ -685,25 +688,37 @@ class SimpleEyeExtractor {
      */
     fun computeEyeAspectRatio(eye: EyePoints): Float {
         // 计算垂直距离 (上下眼睑)
-        val verticalDistances = mutableListOf<Float>()
-        
-        // 对于每个上眼睑点，找到最近的下眼睑点
+        //
+        // 旧实现：每个上眼睑点都调用一次 eye.lower.minOfOrNull { ... }（7×7 = 49 次
+        // Point3D.distance2DTo，内部 2 次 Math.pow(Double) + 1 次 sqrt），再把结果装箱
+        // 塞进 mutableListOf<Float>()，最后 average()。
+        // 每帧左右眼各一次 ⇒ 98 次 distance2DTo、2 个 ArrayList、14 个装箱 Float、
+        // 以及 minOfOrNull / average 内部的迭代器，全是每帧短命对象。
+        //
+        // 新实现：逐点同样调用 distance2DTo（保留原数值路径，保证逐位一致），
+        // 但用 Float 局部最小值 + Double 累加替代「装箱收集 + 二次遍历」，
+        // 整个函数不再分配任何对象。累加顺序（上眼睑下标升序）与旧实现相同。
+        var sumVertical = 0.0
+        var upperCount = 0
         for (upperPt in eye.upper) {
-            val minDist = eye.lower.minOfOrNull { lowerPt ->
-                upperPt.distance2DTo(lowerPt)
-            } ?: 0f
-            verticalDistances.add(minDist)
+            var minDist = Float.MAX_VALUE
+            for (lowerPt in eye.lower) {
+                minDist = minOf(minDist, upperPt.distance2DTo(lowerPt))
+            }
+            // 下眼睑为空时 minOfOrNull 返回 null，旧实现按 0f 计入平均，这里保持一致
+            sumVertical += (if (minDist == Float.MAX_VALUE) 0f else minDist).toDouble()
+            upperCount++
         }
-        
-        val avgVertical = if (verticalDistances.isNotEmpty()) {
-            verticalDistances.average().toFloat()
+
+        val avgVertical = if (upperCount > 0) {
+            (sumVertical / upperCount).toFloat()
         } else {
             0f
         }
-        
+
         // 计算水平距离 (眼角之间)
         val horizontal = eye.innerCorner.distance2DTo(eye.outerCorner)
-        
+
         // EAR = vertical / horizontal
         return if (horizontal > 1e-6f) {
             avgVertical / horizontal

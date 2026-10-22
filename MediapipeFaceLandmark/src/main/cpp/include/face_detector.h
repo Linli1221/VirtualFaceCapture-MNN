@@ -9,6 +9,7 @@
 #ifndef MEDIAPIPE_FACE_DETECTOR_H
 #define MEDIAPIPE_FACE_DETECTOR_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -45,9 +46,14 @@ public:
      * @brief Load the face detection model
      * @param mnn_path Path to the MNN model file
      * @param num_threads Number of threads for inference
+     * @param use_vulkan true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU
      * @return true if successful
+     *
+     * Can be called again on a live instance to switch the backend: the old
+     * session/model is released first, the smoothing filter state is kept.
      */
-    bool loadModel(const std::string& mnn_path, int num_threads = 2);
+    bool loadModel(const std::string& mnn_path, int num_threads = 2,
+                   bool use_vulkan = true);
 
     /**
      * @brief Detect faces from RGB image data
@@ -126,6 +132,21 @@ private:
     std::shared_ptr<MNN::Interpreter> interpreter_;
     MNN::Session* session_ = nullptr;
     MNN::Tensor* input_tensor_ = nullptr;
+
+    // ---- Reusable per-frame resources (avoid re-allocating on the hot path) ----
+    // Host tensor used as the destination of MNN ImageProcess::convert(); it is
+    // uploaded to the (possibly device-side) input_tensor_ via copyFromHostTensor.
+    std::unique_ptr<MNN::Tensor> input_host_tensor_;
+    // Cached ImageProcess (config is identical for RGB and YUV paths except for
+    // sourceFormat, so it is rebuilt only when the source format changes).
+    std::shared_ptr<MNN::CV::ImageProcess> image_process_;
+    int image_process_format_ = -1;
+    // Repacked YUV buffer reused across frames (resize instead of re-allocate).
+    std::vector<uint8_t> yuv_buffer_;
+    // Host output tensors reused across frames (the detector outputs are large:
+    // ~57 KB of regressors + ~3.5 KB of scores per frame).
+    std::unique_ptr<MNN::Tensor> bbox_host_tensor_;
+    std::unique_ptr<MNN::Tensor> score_host_tensor_;
 
     // Model dimensions
     int input_h_ = 128;

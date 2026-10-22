@@ -43,6 +43,28 @@ data class FilterConfig(
 )
 
 /**
+ * MNN 推理后端。
+ *
+ * 三个模型（检测 / Landmark / BlendShape）历史上全部强制跑
+ * `MNN_FORWARD_VULKAN`。实际的整机帧率取决于 GPU 驱动、与 Live2D 渲染的 GPU
+ * 争用、以及每帧 GPU→CPU 回读的同步开销，不同机型差异极大：
+ *
+ * - [VULKAN]：默认后端，GPU 上算子更快，但每帧有上传/回读同步；
+ * - [CPU]：纯 CPU，配合多线程后没有 GPU 争用与回读停顿，在高刷/大分辨率
+ *   机型上往往更「稳」（帧时间抖动更小）。
+ *
+ * 现在可以在运行时切换，方便按机型实测选出能稳住 60fps 的那一档。
+ */
+enum class MnnBackend {
+    VULKAN,
+    CPU;
+
+    companion object {
+        fun fromNative(useVulkan: Boolean): MnnBackend = if (useVulkan) VULKAN else CPU
+    }
+}
+
+/**
  * Landmark detection result with presence score
  * @param landmarks 478 facial landmarks
  * @param presenceScore Confidence that a face is present [0, 1]
@@ -77,7 +99,16 @@ class MediaPipeFaceDetector(private val context: Context) {
         private const val DEFAULT_SCORE_THRESHOLD = 0.5f
         private const val DEFAULT_IOU_THRESHOLD = 0.3f
         private const val DEFAULT_PRESENCE_THRESHOLD = 0.5f
-        private const val DEFAULT_NUM_THREADS = 2
+
+        /**
+         * 推理线程数默认值。
+         *
+         * Vulkan 后端下 numThread 基本不参与计算；一旦切到 CPU 后端，线程数直接
+         * 决定 landmark 推理耗时（2 线程约 24ms，4 线程可降到 12~16ms），也就是
+         * 能不能稳住 60fps 的关键旋钮。上限压在 4，避免长时间占满大核后触发降频。
+         */
+        private val DEFAULT_NUM_THREADS: Int
+            get() = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         
         // BlendShape indices (ARKit compatible)
         const val BS_NEUTRAL = 0
@@ -147,6 +178,15 @@ class MediaPipeFaceDetector(private val context: Context) {
         blendshapeModelPath: String?,
         numThreads: Int
     ): Boolean
+
+    /**
+     * 用初始化时缓存的模型路径重建三个 MNN session，切换到指定后端。
+     * @return 切换成功与否；失败时原生侧会尝试回滚到旧后端。
+     */
+    private external fun nativeSetBackend(useVulkan: Boolean): Boolean
+
+    /** @return true 表示当前跑在 Vulkan 后端。 */
+    private external fun nativeGetBackend(): Boolean
     
     private external fun nativeDetectLandmarks(
         imageData: ByteArray,
@@ -479,6 +519,49 @@ class MediaPipeFaceDetector(private val context: Context) {
         Log.i(TAG, "Setting dump directory to: $dumpDir")
         nativeSetDumpDirectory(dumpDir)
     }
+
+    // ========== MNN Backend selection ==========
+
+    /** 当前生效的推理后端（默认与历史行为一致：Vulkan）。 */
+    @Volatile
+    var currentBackend: MnnBackend = MnnBackend.VULKAN
+        private set
+
+    /**
+     * 运行时切换 MNN 推理后端。
+     *
+     * 内部会用初始化时缓存的模型路径重建三个 session，因此调用前必须保证
+     * **没有其它线程正在做推理**（[com.facecapture.sdk.PipelineFaceTracker]
+     * 会先 stop 再切、再 start）。
+     *
+     * @return true 表示切换成功；失败时原生侧会尝试回滚到原后端，此时返回值
+     *         为 false 且 [currentBackend] 保持不变。
+     */
+    fun setBackend(backend: MnnBackend): Boolean {
+        if (!isInitialized) {
+            Log.w(TAG, "setBackend($backend) ignored: detector not initialized")
+            return false
+        }
+        if (backend == currentBackend) return true
+
+        return try {
+            val ok = nativeSetBackend(backend == MnnBackend.VULKAN)
+            if (ok) {
+                currentBackend = backend
+                Log.i(TAG, "MNN backend switched to $backend")
+            } else {
+                Log.e(TAG, "MNN backend switch to $backend failed, kept $currentBackend")
+            }
+            ok
+        } catch (t: Throwable) {
+            // 老版本 .so 里没有 nativeSetBackend 时会抛 UnsatisfiedLinkError
+            Log.e(TAG, "MNN backend switch failed: ${t.message}")
+            false
+        }
+    }
+
+    /** 当前生效的推理后端。 */
+    fun getBackend(): MnnBackend = currentBackend
     
     /**
      * Initialize the face detector with models from assets
@@ -518,6 +601,13 @@ class MediaPipeFaceDetector(private val context: Context) {
             
             if (isInitialized) {
                 Log.i(TAG, "MediaPipe face detector initialized successfully")
+                // 与原生侧实际生效的后端对齐（默认 Vulkan）
+                currentBackend = try {
+                    MnnBackend.fromNative(nativeGetBackend())
+                } catch (t: Throwable) {
+                    MnnBackend.VULKAN
+                }
+                Log.i(TAG, "MNN backend in use: $currentBackend")
                 if (nativeIsBlendshapeAvailable()) {
                     Log.i(TAG, "BlendShape prediction enabled")
                 }
@@ -569,7 +659,7 @@ class MediaPipeFaceDetector(private val context: Context) {
         ) ?: return null
         
         // Convert float array to List<Point3D>
-        val landmarks = mutableListOf<Point3D>()
+        val landmarks = ArrayList<Point3D>(landmarksArray.size / 3)
         for (i in landmarksArray.indices step 3) {
             landmarks.add(
                 Point3D(
@@ -690,10 +780,11 @@ class MediaPipeFaceDetector(private val context: Context) {
         if (landmarksArray.size < 4) return null  // At least one landmark + score
         
         val presenceScore = landmarksArray[landmarksArray.size - 1]
-        val landmarks = mutableListOf<Point3D>()
-        
+
         // Parse landmarks (all except the last element)
         val landmarkCount = (landmarksArray.size - 1) / 3
+        // 预分配容量，避免逐帧扩容
+        val landmarks = ArrayList<Point3D>(landmarkCount)
         for (i in 0 until landmarkCount) {
             val idx = i * 3
             landmarks.add(Point3D(
@@ -830,9 +921,11 @@ class MediaPipeFaceDetector(private val context: Context) {
         if (landmarksArray.size < 4) return null
         
         val presenceScore = landmarksArray[landmarksArray.size - 1]
-        val landmarks = mutableListOf<Point3D>()
-        
+
+        // 预分配容量：478 个点，避免 ArrayList 反复扩容（逐帧 60 次）
         val landmarkCount = (landmarksArray.size - 1) / 3
+        val landmarks = ArrayList<Point3D>(landmarkCount)
+        
         for (i in 0 until landmarkCount) {
             val idx = i * 3
             landmarks.add(Point3D(
@@ -886,7 +979,7 @@ class MediaPipeFaceDetector(private val context: Context) {
             scoreThreshold, iouThreshold, presenceThreshold
         ) ?: return null
         
-        val landmarks = mutableListOf<Point3D>()
+        val landmarks = ArrayList<Point3D>(landmarksArray.size / 3)
         for (i in landmarksArray.indices step 3) {
             landmarks.add(Point3D(
                 x = landmarksArray[i],

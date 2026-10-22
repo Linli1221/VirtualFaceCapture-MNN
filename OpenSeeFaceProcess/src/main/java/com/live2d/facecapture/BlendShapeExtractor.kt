@@ -56,7 +56,15 @@ class BlendShapeExtractor(
         // 3. 提取嘴部 BlendShape
         extractMouthBlendShapes(keyPoints, blendShapes, headPose, landmarks)
 
-        return blendShapes.clamp()
+        // 注意：clamp() 会 this.copy(...) 出一整个新的 ARKitBlendShapes（52 个字段），
+        // 所以这里不再 clamp —— 统一放到 extractFullBlendShapes 结束处做一次。
+        // clamp() 只改写 7 个字段（eyeBlinkLeft/Right、eyeWideLeft/Right、jawOpen、
+        // mouthSmileLeft/Right），而高级提取器（advancedMode）只写 eyeSquint / jawL/R/
+        // Forward / noseSneer / brow* / cheek* / mouthFunnel 等其余字段，两者不重叠；
+        // 高级提取器也只读取 landmarks、不读取 blendShapes 的旧值。
+        // 因此「先 clamp 再让高级提取器改字段，最后再 clamp 一次」与「只在最后 clamp 一次」
+        // 的输出完全相同，但后者每帧少分配一个 52 字段的对象。
+        return blendShapes
     }
     
     /**
@@ -151,6 +159,34 @@ class BlendShapeExtractor(
     )
 
     /**
+     * 计算一组点的几何中心。
+     *
+     * 旧写法是 `points.map { it.x }.average().toFloat()` 连写三次 —— 每个轴都会分配一个
+     * List<Float>（Float 装箱）、一个迭代器，再做一次 Double 累加。每帧两只眼睛上下眼睑
+     * 各 3 个轴，等于每帧 12 个 List + 约 84 个装箱 Float + 12 个迭代器，全部是短命对象。
+     *
+     * 这里改成单次遍历、Double 累加：求和顺序（下标升序）与 `average()` 完全一致，
+     * 除法也同样是 Double / Int，所以结果逐位相同。
+     */
+    private fun centerOf(points: List<Point3D>): Point3D {
+        var sumX = 0.0
+        var sumY = 0.0
+        var sumZ = 0.0
+        for (point in points) {
+            sumX += point.x.toDouble()
+            sumY += point.y.toDouble()
+            sumZ += point.z.toDouble()
+        }
+        val count = points.size
+        if (count == 0) return Point3D(0f, 0f, 0f)
+        return Point3D(
+            (sumX / count).toFloat(),
+            (sumY / count).toFloat(),
+            (sumZ / count).toFloat()
+        )
+    }
+
+    /**
      * 计算单眼的眼球方向
      *
      * @param eye 眼部关键点
@@ -177,19 +213,11 @@ class BlendShapeExtractor(
 
         // 计算眼眶高度 (上下眼睑中心的距离)
         val upperCenter = if (eye.upper.isNotEmpty()) {
-            Point3D(
-                eye.upper.map { it.x }.average().toFloat(),
-                eye.upper.map { it.y }.average().toFloat(),
-                eye.upper.map { it.z }.average().toFloat()
-            )
+            centerOf(eye.upper)
         } else eyeCenter
 
         val lowerCenter = if (eye.lower.isNotEmpty()) {
-            Point3D(
-                eye.lower.map { it.x }.average().toFloat(),
-                eye.lower.map { it.y }.average().toFloat(),
-                eye.lower.map { it.z }.average().toFloat()
-            )
+            centerOf(eye.lower)
         } else eyeCenter
 
         val eyeHeight = upperCenter.distance2DTo(lowerCenter)

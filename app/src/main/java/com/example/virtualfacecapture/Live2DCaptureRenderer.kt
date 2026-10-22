@@ -14,7 +14,7 @@ import javax.microedition.khronos.opengles.GL10
 /**
  * Live2D 的 GL 渲染器，代替原来的 [com.live2d.demo.GLRenderer]。
  *
- * 与原渲染器的区别只有一点：不再直接画到窗口，而是
+ * 需要抓帧（浏览器输出）时走离屏路径：
  *
  * ```
  * 场景 -> 离屏 FBO(RGBA8, 透明背景) -> [按需] 缩小到输出尺寸 + glReadPixels
@@ -26,10 +26,15 @@ import javax.microedition.khronos.opengles.GL10
  *    浏览器端才能拿到真正的透明背景；
  * 2. 抓帧时可以先用 GPU 缩放到输出尺寸，CPU 只需要读一小块像素，编码压力可控。
  *
+ * 没有任何人抓帧时（默认状态）直接画窗口，省掉整趟离屏渲染 + 贴回；
+ * 高刷屏（>75Hz）还会把 native 绘制压到 60fps 附近，见 [minNativeDrawIntervalNanos]。
+ *
  * 如果 FBO / shader 创建失败，会自动退回「直接画窗口」的原行为（只是没有透明通道）。
  */
 class Live2DCaptureRenderer(
     private val sinkProvider: () -> GlCaptureSink?,
+    /** 屏幕刷新率（Hz）。≤75Hz 时完全不做帧率节流，行为与改动前一致。 */
+    refreshRate: Float = 60f,
 ) : GLSurfaceView.Renderer {
 
     companion object {
@@ -57,7 +62,43 @@ class Live2DCaptureRenderer(
 
         /** 无人抓帧持续 2 秒后释放抓帧 FBO。 */
         private const val CAPTURE_IDLE_RELEASE_NANOS = 2_000_000_000L
+
+        /** Live2D 动画按 60fps 设计，高刷屏没必要把每个 vsync 都重画一遍。 */
+        private const val TARGET_FPS = 60
+
+        /** 只有明显高于 60Hz 的屏幕才节流；60Hz 屏保持原有节奏，避免误伤。 */
+        private const val THROTTLE_REFRESH_THRESHOLD_HZ = 75f
+
+        /** 间隔容差：抵消 vsync 抖动，保证 120Hz 屏稳定地「每两帧画一次」。 */
+        private const val THROTTLE_TOLERANCE = 0.85
+
+        /**
+         * 计算两次 nativeOnDrawFrame() 之间的最小间隔（纳秒）。
+         *
+         * - ≤75Hz（绝大多数手机）：返回 0，表示不节流，调用节奏与改动前完全一致；
+         * - 120Hz：每 2 个 vsync 画一帧 → 60fps；
+         * - 144Hz：每 2 个 vsync 画一帧 → 72fps（再降就要掉到 48fps，反而更不稳）。
+         */
+        private fun computeMinNativeDrawInterval(refreshRate: Float): Long {
+            if (!refreshRate.isFinite() || refreshRate <= THROTTLE_REFRESH_THRESHOLD_HZ) {
+                return 0L
+            }
+            val divisor = (refreshRate / TARGET_FPS).toInt().coerceAtLeast(1)
+            val frameIntervalNanos = 1_000_000_000.0 / refreshRate.toDouble()
+            return (frameIntervalNanos * divisor * THROTTLE_TOLERANCE).toLong()
+        }
     }
+
+    /**
+     * 允许调用 nativeOnDrawFrame() 的最小间隔；0 表示不节流。
+     *
+     * 注意：节流只减少「画」的次数，不改变 native 调用的约定（native 内部仍按自己的
+     * 时钟推进动画），所以不会出现动画变慢，只是帧率上限被压到 60fps 附近。
+     */
+    private val minNativeDrawIntervalNanos: Long = computeMinNativeDrawInterval(refreshRate)
+
+    /** 上一次真正调用 nativeOnDrawFrame() 的时间戳（System.nanoTime）。 */
+    private var lastNativeDrawNanos = 0L
 
     // 全屏 blit
     private var blitProgram = 0
@@ -114,38 +155,82 @@ class Live2DCaptureRenderer(
         sceneWidth = width
         sceneHeight = height
         createSceneTarget(width, height)
+
+        // 新尺寸的离屏目标还没有内容：让下一帧一定要真正渲染（否则高刷屏上可能
+        // 把一张尚未渲染的纹理贴到窗口上）
+        lastNativeDrawNanos = 0L
     }
 
     override fun onDrawFrame(gl: GL10?) {
         if (!glReady || !sceneReady || blitProgram == 0 || quadBuffer == null) {
             // FBO 不可用：保持原行为，直接画窗口
             JniBridgeJava.nativeOnDrawFrame()
+            lastNativeDrawNanos = System.nanoTime()
             return
         }
 
-        // 1) 画到离屏 FBO（透明背景）
+        val sink = sinkProvider()
+        val captureWanted = sink != null && sink.isCaptureWanted()
+        val now = System.nanoTime()
+
+        // 0) 高刷屏节流：还没到下一帧的绘制时间，就放过这次 native 绘制。
+        //
+        // 不做任何 native 调用、但必须把上一帧的离屏结果重贴一次窗口 —— EGL 交换后的
+        // 后备缓冲内容未定义，完全不画在部分机型上会闪黑/花屏。
+        if (minNativeDrawIntervalNanos > 0L &&
+            now - lastNativeDrawNanos < minNativeDrawIntervalNanos
+        ) {
+            if (!captureWanted) {
+                releaseCaptureTargetIfIdle(now)
+            }
+            blitSceneToWindow()
+            return
+        }
+        lastNativeDrawNanos = now
+
+        // 1) 没人抓帧 + 60Hz 屏：直接画窗口。
+        //    这时离屏 FBO 与全屏贴回纯属浪费（每个 vsync 多一整趟离屏渲染 + 一次
+        //    全屏贴图），视觉结果与 FBO 方案完全一致。
+        if (!captureWanted && minNativeDrawIntervalNanos == 0L) {
+            releaseCaptureTargetIfIdle(now)
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, sceneWidth, sceneHeight)
+            JniBridgeJava.nativeOnDrawFrame()
+            return
+        }
+
+        // 2) 画到离屏 FBO（透明背景）
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, sceneFramebuffer)
         GLES20.glViewport(0, 0, sceneWidth, sceneHeight)
         JniBridgeJava.nativeOnDrawFrame()
 
-        // 2) 按需抓帧（GPU 缩放到输出尺寸，CPU 只读小块）
-        val sink = sinkProvider()
-        if (sink != null && sink.isCaptureWanted()) {
-            captureLastWantedNanos = System.nanoTime()
+        // 3) 按需抓帧（GPU 缩放到输出尺寸，CPU 只读小块）
+        if (sink != null && captureWanted) {
+            captureLastWantedNanos = now
             tryCapture(sink)
-        } else if (captureFramebuffer != 0 &&
-            System.nanoTime() - captureLastWantedNanos > CAPTURE_IDLE_RELEASE_NANOS
-        ) {
+        } else {
             // 浏览器输出关闭 2 秒后释放抓帧用的 FBO/纹理，别白占显存
-            destroyTarget(captureTexture, captureFramebuffer)
-            captureTexture = 0
-            captureFramebuffer = 0
-            captureWidth = 0
-            captureHeight = 0
-            Log.i(TAG, "抓帧目标已释放")
+            releaseCaptureTargetIfIdle(now)
         }
 
-        // 3) 贴回窗口，看到的内容与原来一致
+        // 4) 贴回窗口，看到的内容与原来一致
+        blitSceneToWindow()
+    }
+
+    /** 浏览器输出关闭、抓帧目标闲置超过 2 秒后释放。 */
+    private fun releaseCaptureTargetIfIdle(now: Long) {
+        if (captureFramebuffer == 0) return
+        if (now - captureLastWantedNanos <= CAPTURE_IDLE_RELEASE_NANOS) return
+        destroyTarget(captureTexture, captureFramebuffer)
+        captureTexture = 0
+        captureFramebuffer = 0
+        captureWidth = 0
+        captureHeight = 0
+        Log.i(TAG, "抓帧目标已释放")
+    }
+
+    /** 把离屏场景贴回窗口（透明背景在离屏 FBO 里，窗口这层铺黑底）。 */
+    private fun blitSceneToWindow() {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         GLES20.glViewport(0, 0, sceneWidth, sceneHeight)
         GLES20.glDisable(GLES20.GL_BLEND)

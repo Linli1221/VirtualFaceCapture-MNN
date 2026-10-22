@@ -85,10 +85,26 @@ class Camera2Manager(private val context: Context) {
     
     // Processing mode
     var useDirectYuvMode: Boolean = false
+
+    /**
+     * Enable RGB preview callback even in YUV mode (for debug visualization).
+     *
+     * 每帧生成一帧 RGB 预览意味着相机线程上要多做一次整帧 YUV→RGB（480x480 级别
+     * 约 0.7MB/帧、数十万次像素运算）。调试预览默认关闭时这项开销纯属浪费，直接
+     * 拖慢相机线程（进而压缩实际采集帧率），所以改由上层按需开关，并且 volatile
+     * 保证相机线程能立刻看到变化。
+     */
+    @Volatile
+    var enablePreviewInYuvMode: Boolean = false
     
-    // Enable RGB preview callback even in YUV mode (for debug visualization)
-    // When true, both yuvFrameCallback and frameCallback will be called
-    var enablePreviewInYuvMode: Boolean = true
+    /**
+     * 当前是否真的会产出预览帧。
+     *
+     * 上层（PipelineFaceTracker）用它决定要不要在相机线程上做 RGB 转换 ——
+     * 只有「开关打开」且「确有订阅者」时才转换。
+     */
+    val willProducePreviewFrames: Boolean
+        get() = enablePreviewInYuvMode && frameCallback != null
     
     // Camera sensor orientation (degrees) - will be set from camera characteristics
     private var sensorOrientation: Int = 0
@@ -96,6 +112,17 @@ class Camera2Manager(private val context: Context) {
     // Camera vertical FOV in degrees - calculated from camera characteristics
     var cameraVerticalFovDegrees: Float = 63.0f
         private set
+
+    /**
+     * Cached WindowManager.
+     *
+     * [getRotationDegrees] runs on the camera callback thread for **every**
+     * frame; doing a `getSystemService()` lookup there every time is pure
+     * overhead, so resolve it once.
+     */
+    private val windowManager: WindowManager by lazy {
+        context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    }
 
     companion object {
         private const val TAG = "Camera2Manager"
@@ -109,6 +136,14 @@ class Camera2Manager(private val context: Context) {
         private const val MIN_SIZE = 192       // Minimum dimension to ensure quality
         private const val MAX_SIZE = 640       // Maximum dimension to limit computation
         private const val IDEAL_SIZE = 480     // Ideal dimension for balance
+
+        /**
+         * 整帧像素硬上限（640x480）。
+         *
+         * 人脸检测只用 128/192 的输入、landmark 只用 192 的 ROI，整帧再大也只是让
+         * YUV 旋转/缩放/裁剪多做无用功，而且大尺寸的 YUV 输出往往拿不到 60fps。
+         */
+        private const val MAX_PIXEL_COUNT = 640 * 480
         
         // Aspect ratio preference (1.0 = perfect square)
         private const val MAX_ASPECT_RATIO = 1.5f  // Allow up to 3:2 ratio
@@ -312,13 +347,14 @@ class Camera2Manager(private val context: Context) {
 
             Log.i(TAG, "Selected preview size: ${previewSize.width}x${previewSize.height}")
 
-            // Create ImageReader for frame capture
-            // Use 4 buffers to prevent frame drops when processing takes longer
+            // Create ImageReader for frame capture.
+            // 3 个 buffer：处理端偶尔慢一拍时相机可以继续出帧，配合
+            // acquireLatestImage() 只会拿到最新一帧，不会积压延迟。
             imageReader = ImageReader.newInstance(
                 previewSize.width,
                 previewSize.height,
                 ImageFormat.YUV_420_888,
-                2  // Increased from 2 to prevent frame drops
+                3
             ).apply {
                 setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             }
@@ -431,6 +467,11 @@ class Camera2Manager(private val context: Context) {
             
             // Skip sizes that are too small or too large
             if (minDim < MIN_SIZE || maxDim > MAX_SIZE * 2) {
+                return@mapNotNull null
+            }
+
+            // 整帧像素硬上限：大尺寸只会拖慢预处理且通常拿不到 60fps
+            if (width * height > MAX_PIXEL_COUNT) {
                 return@mapNotNull null
             }
             
@@ -598,15 +639,40 @@ class Camera2Manager(private val context: Context) {
 
         val fpsRanges = characteristics
             ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-        if (fpsRanges == null || fpsRanges.isEmpty()) {
-            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 60))
-        } else {
-            // Prefer the highest upper bound while still starting at <= 30 FPS
-            // (30-60 on phones, 30-30 on cameras that cap at 30, etc.).
-            val chosen = fpsRanges.filter { it.lower <= 30 }.maxByOrNull { it.upper }
-                ?: fpsRanges.maxByOrNull { it.upper }
-            chosen?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        chooseTargetFpsRange(fpsRanges)?.let {
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+            Log.i(TAG, "AE target FPS range: ${it.lower}-${it.upper}")
         }
+    }
+
+    /**
+     * Pick the camera FPS range that best supports a **stable 60 FPS** pipeline.
+     *
+     * Preference order (Camera2 only accepts ranges the device advertises):
+     *  1. a fixed `(60, 60)` — the steadiest possible choice;
+     *  2. an adaptive range whose ceiling reaches 60 with a low floor, usually
+     *     `(30, 60)`: the sensor stays at 60 in good light and is still allowed
+     *     to fall back to 30 in the dark instead of producing a black frame;
+     *  3. the highest-ceiling range starting at <= 30 (typically `(30, 30)`),
+     *     for cameras that simply cannot do 60;
+     *  4. whatever has the highest ceiling.
+     */
+    private fun chooseTargetFpsRange(
+        ranges: Array<android.util.Range<Int>>?,
+    ): android.util.Range<Int>? {
+        if (ranges == null || ranges.isEmpty()) {
+            return android.util.Range(30, 60)
+        }
+
+        ranges.firstOrNull { it.lower == 60 && it.upper == 60 }?.let { return it }
+
+        ranges
+            .filter { it.upper >= 60 && it.lower <= 30 }
+            .maxByOrNull { it.upper }
+            ?.let { return it }
+
+        return ranges.filter { it.lower <= 30 }.maxByOrNull { it.upper }
+            ?: ranges.maxByOrNull { it.upper }
     }
     
     // Timing for YUV conversion performance tracking
@@ -753,7 +819,6 @@ class Camera2Manager(private val context: Context) {
      *  - unknown:  back-camera formula as the generic fallback.
      */
     private fun getRotationDegrees(): Int {
-        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         @Suppress("DEPRECATION")
         val displayRotation = windowManager.defaultDisplay.rotation
 

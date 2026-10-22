@@ -262,21 +262,6 @@ class SimpleSmileExtractor {
         return effectiveDelta * pitchCompensationFactor
     }
     
-    /**
-     * 计算 Roll 角补偿（左右嘴角差异）
-     * @return Pair(leftCompensation, rightCompensation)
-     */
-    private fun calculateRollCompensation(currentRoll: Float): Pair<Float, Float> {
-        val deltaRoll = currentRoll - calibrationRoll
-        if (abs(deltaRoll) <= 3f) {
-            return Pair(0f, 0f)
-        }
-        
-        // 当头向右倾斜 (roll > 0)，左嘴角看起来更高，右嘴角看起来更低
-        val compensation = deltaRoll * rollCompensationFactor
-        return Pair(-compensation, compensation)
-    }
-
     fun extractSmileBlendShapes(
         keyPoints: FaceKeyPoints,
         blendShapes: ARKitBlendShapes,
@@ -297,20 +282,44 @@ class SimpleSmileExtractor {
         }
         
         // 1. 提取原始微笑特征
-        val (rawLeftFeature, rawRightFeature) = extractSmileFeatures(mouthOuter, faceHeight)
-        
+        //
+        // 特征 = (嘴唇中心Y - 嘴角Y) / faceHeight
+        // 正值 = 嘴角高于中心 = 微笑；负值 = 嘴角低于中心 = 撇嘴
+        //
+        // mouthOuter 索引：[0] 左嘴角、[5] 下唇中心、[10] 右嘴角、[15] 上唇中心
+        //
+        // 旧实现调用 extractSmileFeatures() 返回 Pair<Float, Float>：每帧 1 个 Pair
+        // 对象 + 2 个装箱 Float；这里内联成两个局部 Float，运算与求和顺序完全不变。
+        val leftCorner = mouthOuter[0]
+        val rightCorner = mouthOuter[10]
+        val upperLipCenter = mouthOuter[15]
+        val lowerLipCenter = mouthOuter[5]
+
+        // 嘴唇中心（上下唇的平均）
+        val mouthCenterY = (upperLipCenter.y + lowerLipCenter.y) / 2f
+
+        val rawLeftFeature = (mouthCenterY - leftCorner.y) / faceHeight
+        val rawRightFeature = (mouthCenterY - rightCorner.y) / faceHeight
+
         // 2. 应用俯仰角和 Roll 角补偿
         var compensatedLeftFeature = rawLeftFeature
         var compensatedRightFeature = rawRightFeature
-        
+
         if (enablePitchCompensation && headPose != null && calibration.isCalibrated) {
             val pitchComp = calculatePitchCompensation(headPose.pitch)
             compensatedLeftFeature += pitchComp
             compensatedRightFeature += pitchComp
-            
-            val (rollCompLeft, rollCompRight) = calculateRollCompensation(headPose.roll)
-            compensatedLeftFeature += rollCompLeft
-            compensatedRightFeature += rollCompRight
+
+            // Roll 补偿（原 calculateRollCompensation 返回 Pair，每帧多 1 个 Pair + 2 个装箱 Float）。
+            // |Δroll| <= 3° 时两个补偿量均为 0，原实现也是直接返回 (0f, 0f)，
+            // 所以这里直接跳过，效果完全相同。
+            val deltaRoll = headPose.roll - calibrationRoll
+            if (abs(deltaRoll) > 3f) {
+                // 当头向右倾斜 (roll > 0)，左嘴角看起来更高，右嘴角看起来更低
+                val rollCompensation = deltaRoll * rollCompensationFactor
+                compensatedLeftFeature += -rollCompensation
+                compensatedRightFeature += rollCompensation
+            }
         }
         
         // 3. 校准期收集数据（使用原始特征）
@@ -335,84 +344,38 @@ class SimpleSmileExtractor {
         }
         
         // 6. 转换为 BlendShape 值
-        val (smileLeft, frownLeft) = featureDeltaToBlendShape(
-            leftDelta, 
-            calibration.observedSmileMax, 
-            calibration.observedFrownMax
-        )
-        val (smileRight, frownRight) = featureDeltaToBlendShape(
-            rightDelta, 
-            calibration.observedSmileMax, 
-            calibration.observedFrownMax
-        )
-        
-        // 7. 输出
-        blendShapes.mouthSmileLeft = smileLeft
-        blendShapes.mouthSmileRight = smileRight
-        blendShapes.mouthFrownLeft = frownLeft
-        blendShapes.mouthFrownRight = frownRight
+        //    原实现每帧调用两次 featureDeltaToBlendShape()，每次返回 Pair(smile, frown)
+        //    （其中必然一个是 0f）⇒ 每帧 2 个 Pair + 4 个装箱 Float。
+        //    拆成两个标量函数后不再产生临时对象，分支条件与原实现完全互斥等价。
+        blendShapes.mouthSmileLeft = deltaToSmile(leftDelta, calibration.observedSmileMax)
+        blendShapes.mouthFrownLeft = deltaToFrown(leftDelta, calibration.observedFrownMax)
+        blendShapes.mouthSmileRight = deltaToSmile(rightDelta, calibration.observedSmileMax)
+        blendShapes.mouthFrownRight = deltaToFrown(rightDelta, calibration.observedFrownMax)
     }
-    
+
     /**
-     * 从嘴巴轮廓提取微笑特征
-     * 
-     * 特征 = (嘴唇中心Y - 嘴角Y) / faceHeight
-     * 正值 = 嘴角高于中心 = 微笑
-     * 负值 = 嘴角低于中心 = 撇嘴
-     * 
-     * @return Pair(leftFeature, rightFeature)
+     * 特征变化量 → 微笑 BlendShape [0, 1]
+     * 与原 featureDeltaToBlendShape() 的微笑分支逐位一致。
      */
-    private fun extractSmileFeatures(mouthOuter: List<Point3D>, faceHeight: Float): Pair<Float, Float> {
-        // mouthOuter 索引：
-        // [0] = 左嘴角
-        // [5] = 下唇中心
-        // [10] = 右嘴角
-        // [15] = 上唇中心
-        
-        val leftCorner = mouthOuter[0]
-        val rightCorner = mouthOuter[10]
-        val upperLipCenter = mouthOuter[15]
-        val lowerLipCenter = mouthOuter[5]
-        
-        // 嘴唇中心（上下唇的平均）
-        val mouthCenterY = (upperLipCenter.y + lowerLipCenter.y) / 2f
-        
-        // 归一化的特征值
-        // 注意：图像坐标系 Y 向下，所以嘴角 Y < 中心 Y 表示嘴角更高（微笑）
-        val leftFeature = (mouthCenterY - leftCorner.y) / faceHeight
-        val rightFeature = (mouthCenterY - rightCorner.y) / faceHeight
-        
-        return Pair(leftFeature, rightFeature)
+    private fun deltaToSmile(delta: Float, smileMax: Float): Float {
+        return if (delta > SMILE_DEAD_ZONE) {
+            // 微笑
+            ((delta - SMILE_DEAD_ZONE) / (smileMax - SMILE_DEAD_ZONE)).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
     }
-    
+
     /**
-     * 将特征变化量转换为 smile/frown BlendShape
-     * 
-     * @param delta 相对于基线的变化量
-     * @param smileMax 微笑最大值（用于归一化）
-     * @param frownMax 撇嘴最大值
-     * @return Pair(smile, frown)，均为 [0, 1]
+     * 特征变化量 → 撇嘴 BlendShape [0, 1]
+     * 与原 featureDeltaToBlendShape() 的撇嘴分支逐位一致。
      */
-    private fun featureDeltaToBlendShape(
-        delta: Float,
-        smileMax: Float,
-        frownMax: Float
-    ): Pair<Float, Float> {
-        return when {
-            delta > SMILE_DEAD_ZONE -> {
-                // 微笑
-                val smile = ((delta - SMILE_DEAD_ZONE) / (smileMax - SMILE_DEAD_ZONE)).coerceIn(0f, 1f)
-                Pair(smile, 0f)
-            }
-            delta < -FROWN_DEAD_ZONE -> {
-                // 撇嘴
-                val frown = ((abs(delta) - FROWN_DEAD_ZONE) / (frownMax - FROWN_DEAD_ZONE)).coerceIn(0f, 1f)
-                Pair(0f, frown)
-            }
-            else -> {
-                // 中性
-                Pair(0f, 0f)
-            }
+    private fun deltaToFrown(delta: Float, frownMax: Float): Float {
+        return if (delta < -FROWN_DEAD_ZONE) {
+            // 撇嘴
+            ((abs(delta) - FROWN_DEAD_ZONE) / (frownMax - FROWN_DEAD_ZONE)).coerceIn(0f, 1f)
+        } else {
+            0f
         }
     }
     

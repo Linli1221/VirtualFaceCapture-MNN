@@ -21,6 +21,11 @@ with hot paths (pose estimation, point-cloud transforms, …) accelerated by
 **ARM NEON** SIMD intrinsics. End-to-end the system pushes close to **60 FPS**
 on a Snapdragon 888 device. 🎉
 
+> 📈 For the full frame-rate optimization breakdown, log reading guide and
+> on-device tuning steps see **[PERFORMANCE.md](PERFORMANCE.md)** (10 Hz detection
+> throttling, single-consumer dispatch, runtime Vulkan⇄CPU MNN backend switch,
+> preview RGB gating, batched Compose updates, zero-allocation post-processing, …).
+
 ---
 
 ## ✨ Demo
@@ -196,6 +201,7 @@ the screen with the current Live2D model name on top. All buttons and sliders:
 | **Blink Curve: ON / OFF** | Green ↔ secondary | Toggle the **natural-blink curve shaper**. When on, raw blink events are reshaped into a smoother ~230 ms curve (no jitter / half-blinks). When off, the raw EAR is passed through. |
 | **Camera: Front / Back / External** | — | Open the **camera picker**: lists every camera exposed by the device (front / back / logical multi-cam / USB external) and switches capture instantly. The choice is remembered across launches. |
 | **Web Output** | — | Open the **Web Output** dialog: start / stop the server, copy the LAN URL, tune output height / FPS / quality and watch the connection status. See "Web Output / OBS" below. |
+| **Backend: Vulkan / CPU** | purple ↔ teal | **Switch the MNN inference backend at runtime** (rebuilds the inference sessions; the picture pauses for about one frame). Which one is faster is **device-dependent** (GPU driver quality, contention with the Live2D renderer, per-frame GPU→CPU read-back cost), so tap it to A/B test when the frame rate is not stable. Details in [PERFORMANCE.md](PERFORMANCE.md). |
 
 ### Sliders
 

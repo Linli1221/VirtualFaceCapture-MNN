@@ -9,6 +9,7 @@
 #ifndef MEDIAPIPE_FACE_LANDMARKER_H
 #define MEDIAPIPE_FACE_LANDMARKER_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -54,9 +55,14 @@ public:
      * @brief Load the landmark detection model
      * @param mnn_path Path to the MNN model file
      * @param num_threads Number of threads for inference
+     * @param use_vulkan true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU
      * @return true if successful
+     *
+     * Can be called again on a live instance to switch the backend: the old
+     * session/model is released first, the smoothing filter state is kept.
      */
-    bool loadModel(const std::string& mnn_path, int num_threads = 2);
+    bool loadModel(const std::string& mnn_path, int num_threads = 2,
+                   bool use_vulkan = true);
 
     /**
      * @brief Detect landmarks from RGB image data
@@ -151,15 +157,17 @@ private:
                            float& width, float& height, float& rotation);
 
     // Preprocess image for landmark detection
+    // Writes directly into `dest` (a host tensor owned by this instance), so no
+    // intermediate std::vector / memcpy is needed on the hot path.
     void preprocessImage(const uint8_t* img_data, int img_width, int img_height,
                          float center_x, float center_y, float width, float height,
-                         float rotation, float* output);
+                         float rotation, MNN::Tensor* dest);
 
     // Preprocess YUV image directly
     void preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::ImageFormat yuvFormat,
                                 int img_width, int img_height, int img_rotation,
                                 float center_x, float center_y, float width, float height,
-                                float face_rotation, float* output);
+                                float face_rotation, MNN::Tensor* dest);
 
     // Decode model outputs to landmarks
     void decodeLandmarks(const float* landmarks_tensor,
@@ -177,6 +185,19 @@ private:
     std::shared_ptr<MNN::Interpreter> interpreter_;
     MNN::Session* session_ = nullptr;
     MNN::Tensor* input_tensor_ = nullptr;
+
+    // ---- Reusable per-frame resources (avoid re-allocating on the hot path) ----
+    // Host tensor that ImageProcess::convert() writes into before uploading it
+    // to the (possibly device-side) input_tensor_.
+    std::unique_ptr<MNN::Tensor> input_host_tensor_;
+    // Cached ImageProcess (rebuilt only when the source format changes).
+    std::shared_ptr<MNN::CV::ImageProcess> image_process_;
+    int image_process_format_ = -1;
+    // Repacked YUV buffer reused across frames (resize instead of re-allocate).
+    std::vector<uint8_t> yuv_buffer_;
+    // Host output tensors reused across frames.
+    std::unique_ptr<MNN::Tensor> landmarks_output_host_;
+    std::unique_ptr<MNN::Tensor> flag_output_host_;
 
     // Model dimensions
     int input_h_ = 192;

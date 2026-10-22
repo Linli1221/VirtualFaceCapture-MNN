@@ -110,8 +110,25 @@ FaceLandmarker::~FaceLandmarker() {
     }
 }
 
-bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads) {
+bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads,
+                               bool use_vulkan) {
     last_error_.clear();
+    
+    // Release the previous session and model so loadModel() can also be used to
+    // switch the inference backend at runtime (the old device session, e.g.
+    // Vulkan buffers, is freed here instead of being leaked).
+    if (interpreter_) {
+        if (session_) {
+            interpreter_->releaseSession(session_);
+        }
+        interpreter_->releaseModel();
+    }
+    session_ = nullptr;
+    interpreter_.reset();
+    input_tensor_ = nullptr;
+    input_host_tensor_.reset();
+    landmarks_output_host_.reset();
+    flag_output_host_.reset();
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -122,7 +139,7 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads) {
     
     MNN::ScheduleConfig config;
     config.numThread = num_threads;
-    config.type = MNN_FORWARD_VULKAN;
+    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
     backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
     config.backendConfig = &backendCfg;
@@ -139,6 +156,10 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads) {
         return false;
     }
     
+    // Host-side scratch tensor reused every frame (see detect/detectFromYuv).
+    input_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+        new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType()));
+    
     auto shape = input_tensor_->shape();
     if (shape.size() == 4) {
         input_h_ = shape[1];
@@ -151,7 +172,9 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads) {
         }
     }
     
-    FACE_LOGI("Face landmarker model loaded: %dx%dx%d", input_w_, input_h_, input_c_);
+    FACE_LOGI("Face landmarker model loaded: %dx%dx%d (backend=%s, threads=%d)",
+              input_w_, input_h_, input_c_,
+              use_vulkan ? "Vulkan" : "CPU", num_threads);
     return true;
 }
 
@@ -214,7 +237,12 @@ void FaceLandmarker::transformFaceRect(const FaceDetection& detection,
 
 void FaceLandmarker::preprocessImage(const uint8_t* img_data, int img_width, int img_height,
                                       float center_x, float center_y, float width, float height,
-                                      float rotation, float* output) {
+                                      float rotation, MNN::Tensor* dest) {
+    if (dest == nullptr) {
+        last_error_ = "Invalid preprocess destination tensor";
+        return;
+    }
+    
     const float cx_px = center_x * static_cast<float>(img_width);
     const float cy_px = center_y * static_cast<float>(img_height);
     const float w_px = width * static_cast<float>(img_width);
@@ -241,22 +269,32 @@ void FaceLandmarker::preprocessImage(const uint8_t* img_data, int img_width, int
     ::memcpy(config.mean, mean, sizeof(mean));
     ::memcpy(config.normal, norm, sizeof(norm));
     
-    auto process = std::shared_ptr<MNN::CV::ImageProcess>(
-        MNN::CV::ImageProcess::create(config));
-    process->setMatrix(trans);
+    // Reuse the cached ImageProcess when the source format did not change.
+    if (!image_process_ ||
+        image_process_format_ != static_cast<int>(config.sourceFormat)) {
+        image_process_ = std::shared_ptr<MNN::CV::ImageProcess>(
+            MNN::CV::ImageProcess::create(config));
+        image_process_format_ = static_cast<int>(config.sourceFormat);
+    }
+    if (!image_process_) {
+        last_error_ = "ImageProcess::create failed";
+        return;
+    }
+    image_process_->setMatrix(trans);
     
-    std::vector<int> dims = {1, input_h_, input_w_, input_c_};
-    std::shared_ptr<MNN::Tensor> temp_tensor(
-        MNN::Tensor::create<float>(dims, nullptr, MNN::Tensor::TENSORFLOW));
-    
-    process->convert(img_data, img_width, img_height, img_width * 3, temp_tensor.get());
-    ::memcpy(output, temp_tensor->host<float>(), input_h_ * input_w_ * 3 * sizeof(float));
+    // Convert straight into the reusable host tensor (no temp tensor + memcpy).
+    image_process_->convert(img_data, img_width, img_height, img_width * 3, dest);
 }
 
 void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::ImageFormat yuvFormat,
                                              int img_width, int img_height, int img_rotation,
                                              float center_x, float center_y, float width, float height,
-                                             float face_rotation, float* output) {
+                                             float face_rotation, MNN::Tensor* dest) {
+    if (dest == nullptr) {
+        last_error_ = "Invalid preprocess destination tensor";
+        return;
+    }
+    
     int srcWidth = (img_rotation == 90 || img_rotation == 270) ? img_height : img_width;
     int srcHeight = (img_rotation == 90 || img_rotation == 270) ? img_width : img_height;
     
@@ -297,16 +335,21 @@ void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::Ima
     ::memcpy(config.mean, mean, sizeof(mean));
     ::memcpy(config.normal, norm, sizeof(norm));
     
-    auto process = std::shared_ptr<MNN::CV::ImageProcess>(
-        MNN::CV::ImageProcess::create(config));
-    process->setMatrix(trans);
+    // Reuse the cached ImageProcess when the source format did not change.
+    if (!image_process_ ||
+        image_process_format_ != static_cast<int>(config.sourceFormat)) {
+        image_process_ = std::shared_ptr<MNN::CV::ImageProcess>(
+            MNN::CV::ImageProcess::create(config));
+        image_process_format_ = static_cast<int>(config.sourceFormat);
+    }
+    if (!image_process_) {
+        last_error_ = "ImageProcess::create failed";
+        return;
+    }
+    image_process_->setMatrix(trans);
     
-    std::vector<int> dims = {1, input_h_, input_w_, input_c_};
-    std::shared_ptr<MNN::Tensor> temp_tensor(
-        MNN::Tensor::create<float>(dims, nullptr, MNN::Tensor::TENSORFLOW));
-    
-    process->convert(yuvData, srcWidth, srcHeight, 0, temp_tensor.get());
-    ::memcpy(output, temp_tensor->host<float>(), input_h_ * input_w_ * 3 * sizeof(float));
+    // Convert straight into the reusable host tensor (no temp tensor + memcpy).
+    image_process_->convert(yuvData, srcWidth, srcHeight, 0, dest);
 }
 
 void FaceLandmarker::decodeLandmarks(const float* landmarks_tensor,
@@ -351,7 +394,7 @@ FaceLandmarksResult FaceLandmarker::detect(const uint8_t* img_data, int img_widt
     result.presence = false;
     result.presence_score = 0.0f;
     
-    if (!interpreter_ || !session_ || !input_tensor_) {
+    if (!interpreter_ || !session_ || !input_tensor_ || !input_host_tensor_) {
         last_error_ = "Model not loaded";
         return result;
     }
@@ -361,14 +404,11 @@ FaceLandmarksResult FaceLandmarker::detect(const uint8_t* img_data, int img_widt
     float center_x, center_y, width, height, rotation;
     transformFaceRect(face_rect, center_x, center_y, width, height, rotation);
     
-    std::vector<float> input_data(input_h_ * input_w_ * input_c_);
+    // Convert straight into the reusable host tensor (no per-frame vector/memcpy).
     preprocessImage(img_data, img_width, img_height,
-                    center_x, center_y, width, height, rotation, input_data.data());
-    
-    auto input_host = new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType());
-    std::memcpy(input_host->host<float>(), input_data.data(), input_data.size() * sizeof(float));
-    input_tensor_->copyFromHostTensor(input_host);
-    delete input_host;
+                    center_x, center_y, width, height, rotation,
+                    input_host_tensor_.get());
+    input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
@@ -386,20 +426,25 @@ FaceLandmarksResult FaceLandmarker::detect(const uint8_t* img_data, int img_widt
         return result;
     }
     
-    std::shared_ptr<MNN::Tensor> landmarks_host(
-        new MNN::Tensor(landmarks_tensor, landmarks_tensor->getDimensionType()));
-    landmarks_tensor->copyToHostTensor(landmarks_host.get());
-
-    std::shared_ptr<MNN::Tensor> flag_host = std::make_shared<MNN::Tensor>(
-            face_flag_tensor, MNN::Tensor::CAFFE);
-    face_flag_tensor->copyToHostTensor(flag_host.get());
-    float raw_score = flag_host->host<float>()[0];
+    if (!landmarks_output_host_ ||
+        landmarks_output_host_->elementSize() != landmarks_tensor->elementSize()) {
+        landmarks_output_host_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(landmarks_tensor, landmarks_tensor->getDimensionType()));
+    }
+    if (!flag_output_host_ ||
+        flag_output_host_->elementSize() != face_flag_tensor->elementSize()) {
+        flag_output_host_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(face_flag_tensor, MNN::Tensor::CAFFE));
+    }
+    landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+    face_flag_tensor->copyToHostTensor(flag_output_host_.get());
+    float raw_score = flag_output_host_->host<float>()[0];
     result.presence_score = 1.0f / (1.0f + std::exp(-raw_score));
 
     result.presence = result.presence_score >= presence_threshold;
     
     if (result.presence) {
-        decodeLandmarks(landmarks_host->host<float>(), center_x, center_y, 
+        decodeLandmarks(landmarks_output_host_->host<float>(), center_x, center_y, 
                         width, height, rotation, result);
     }
     
@@ -432,7 +477,7 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
     result.presence = false;
     result.presence_score = 0.0f;
     
-    if (!interpreter_ || !session_ || !input_tensor_) {
+    if (!interpreter_ || !session_ || !input_tensor_ || !input_host_tensor_) {
         last_error_ = "Model not loaded";
         return result;
     }
@@ -441,25 +486,21 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
     int srcHeight = (rotation == 90 || rotation == 270) ? img_width : img_height;
     
     auto yuvFormat = yuv::detectFormat(uvPixelStride, uData, vData);
-    std::vector<uint8_t> yuvBuffer;
+    // Reuses the member buffer: resize only, no per-frame re-allocation.
     yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
-                       srcWidth, srcHeight, yuvFormat, yuvBuffer);
+                       srcWidth, srcHeight, yuvFormat, yuv_buffer_);
     
     PERF_START(preprocess_timer);
     
     float center_x, center_y, width, height, face_rotation;
     transformFaceRect(face_rect, center_x, center_y, width, height, face_rotation);
     
-    std::vector<float> input_data(input_h_ * input_w_ * input_c_);
-    preprocessImageFromYuv(yuvBuffer.data(), yuvFormat,
+    // Convert straight into the reusable host tensor (no per-frame vector/memcpy).
+    preprocessImageFromYuv(yuv_buffer_.data(), yuvFormat,
                            img_width, img_height, rotation,
                            center_x, center_y, width, height, face_rotation,
-                           input_data.data());
-    
-    auto input_host = new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType());
-    std::memcpy(input_host->host<float>(), input_data.data(), input_data.size() * sizeof(float));
-    input_tensor_->copyFromHostTensor(input_host);
-    delete input_host;
+                           input_host_tensor_.get());
+    input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
@@ -477,20 +518,25 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
         return result;
     }
     
-    std::shared_ptr<MNN::Tensor> landmarks_host(
-        new MNN::Tensor(landmarks_tensor, landmarks_tensor->getDimensionType()));
-    landmarks_tensor->copyToHostTensor(landmarks_host.get());
-
-    std::shared_ptr<MNN::Tensor> flag_host = std::make_shared<MNN::Tensor>(
-            face_flag_tensor, MNN::Tensor::CAFFE);
-    face_flag_tensor->copyToHostTensor(flag_host.get());
-    float raw_score = flag_host->host<float>()[0];
+    if (!landmarks_output_host_ ||
+        landmarks_output_host_->elementSize() != landmarks_tensor->elementSize()) {
+        landmarks_output_host_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(landmarks_tensor, landmarks_tensor->getDimensionType()));
+    }
+    if (!flag_output_host_ ||
+        flag_output_host_->elementSize() != face_flag_tensor->elementSize()) {
+        flag_output_host_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(face_flag_tensor, MNN::Tensor::CAFFE));
+    }
+    landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+    face_flag_tensor->copyToHostTensor(flag_output_host_.get());
+    float raw_score = flag_output_host_->host<float>()[0];
     result.presence_score = 1.0f / (1.0f + std::exp(-raw_score));
 
     result.presence = result.presence_score >= presence_threshold;
     
     if (result.presence) {
-        decodeLandmarks(landmarks_host->host<float>(), center_x, center_y,
+        decodeLandmarks(landmarks_output_host_->host<float>(), center_x, center_y,
                         width, height, face_rotation, result);
     }
     

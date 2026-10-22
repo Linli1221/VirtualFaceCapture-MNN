@@ -55,8 +55,24 @@ BlendShapePredictor::~BlendShapePredictor() {
     }
 }
 
-bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads) {
+bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads,
+                                    bool use_vulkan) {
     last_error_.clear();
+    
+    // Release the previous session and model so loadModel() can also be used to
+    // switch the inference backend at runtime (the old device session, e.g.
+    // Vulkan buffers, is freed here instead of being leaked).
+    if (interpreter_) {
+        if (session_) {
+            interpreter_->releaseSession(session_);
+        }
+        interpreter_->releaseModel();
+    }
+    session_ = nullptr;
+    interpreter_.reset();
+    input_tensor_ = nullptr;
+    input_host_tensor_.reset();
+    output_host_tensor_.reset();
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -67,7 +83,7 @@ bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads
     
     MNN::ScheduleConfig config;
     config.numThread = num_threads;
-    config.type = MNN_FORWARD_VULKAN;
+    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
     backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
     config.backendConfig = &backendCfg;
@@ -84,13 +100,18 @@ bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads
         return false;
     }
     
+    // Host-side scratch tensor reused every frame (see predict()).
+    input_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+        new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType()));
+    
     auto shape = input_tensor_->shape();
     if (shape.size() >= 2) {
         input_h_ = shape[1];  // Should be 146
         input_w_ = shape.size() > 2 ? shape[2] : 2;  // Should be 2
     }
     
-    FACE_LOGI("BlendShape model loaded: input [%d, %d]", input_h_, input_w_);
+    FACE_LOGI("BlendShape model loaded: input [%d, %d] (backend=%s, threads=%d)",
+              input_h_, input_w_, use_vulkan ? "Vulkan" : "CPU", num_threads);
     return true;
 }
 
@@ -124,7 +145,7 @@ BlendShapeResult BlendShapePredictor::predict(
     PERF_START(total_timer);
     BlendShapeResult result;
     
-    if (!interpreter_ || !session_ || !input_tensor_) {
+    if (!interpreter_ || !session_ || !input_tensor_ || !input_host_tensor_) {
         last_error_ = "BlendShape model not loaded";
         return result;
     }
@@ -137,14 +158,10 @@ BlendShapeResult BlendShapePredictor::predict(
     // Prepare Tensor
     PERF_START(prepare_timer);
     
-    std::vector<float> input_data(kLandmarkSubsetSize * 2);
-    prepareLandmarkTensor(landmarks, image_width, image_height, input_data.data());
-    
-    auto input_host = new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType());
-    std::memcpy(input_host->host<float>(), input_data.data(),
-                input_data.size() * sizeof(float));
-    input_tensor_->copyFromHostTensor(input_host);
-    delete input_host;
+    // Write the landmark subset straight into the reusable host tensor.
+    prepareLandmarkTensor(landmarks, image_width, image_height,
+                          input_host_tensor_->host<float>());
+    input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(prepare_timer, s_perf_profiler.prepare_tensor);
     
@@ -167,12 +184,14 @@ BlendShapeResult BlendShapePredictor::predict(
         return result;
     }
     
-    std::shared_ptr<MNN::Tensor> output_host(
-        new MNN::Tensor(output_tensor, MNN::Tensor::CAFFE));
-    output_tensor->copyToHostTensor(output_host.get());
+    if (!output_host_tensor_) {
+        output_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(output_tensor, MNN::Tensor::CAFFE));
+    }
+    output_tensor->copyToHostTensor(output_host_tensor_.get());
     
-    const float* output_data = output_host->host<float>();
-    int output_size = output_host->elementSize();
+    const float* output_data = output_host_tensor_->host<float>();
+    int output_size = output_host_tensor_->elementSize();
     
     int num_blendshapes = std::min(output_size, static_cast<int>(BS_COUNT));
     for (int i = 0; i < num_blendshapes; ++i) {

@@ -573,16 +573,13 @@ class BlinkCurveProcessor {
     private fun synchronizeBlink(leftResult: Float, rightResult: Float, currentTimeMs: Long): Pair<Float, Float> {
         val leftState = leftEye.state
         val rightState = rightEye.state
-        
-        // 定义眨眼相关状态（不包含 SQUINT_HOLD，眯眼不同步）
-        val blinkStates = setOf(
-            EyeState.CLOSING,
-            EyeState.BLINK_CLOSED,
-            EyeState.BLINK_OPENING
-        )
-        
-        val leftInBlink = leftState in blinkStates
-        val rightInBlink = rightState in blinkStates
+
+        // 眨眼相关状态（不包含 SQUINT_HOLD，眯眼不同步）
+        //
+        // 旧实现每次调用都 `setOf(EyeState.CLOSING, EyeState.BLINK_CLOSED, EyeState.BLINK_OPENING)`，
+        // 即每帧分配一个 3 元素 LinkedHashSet。这里改为枚举比较，零分配、语义完全相同。
+        val leftInBlink = isBlinkState(leftState)
+        val rightInBlink = isBlinkState(rightState)
         
         // 如果两只眼睛都在眨眼状态，进行同步
         if (leftInBlink && rightInBlink) {
@@ -619,6 +616,16 @@ class BlinkCurveProcessor {
         return Pair(leftResult, rightResult)
     }
     
+    /**
+     * 是否属于「眨眼」相关状态（CLOSING / BLINK_CLOSED / BLINK_OPENING）
+     * 原实现用 setOf(...).contains()，每帧都会新建一个 Set；这里改为纯比较。
+     */
+    private fun isBlinkState(state: EyeState): Boolean {
+        return state == EyeState.CLOSING ||
+            state == EyeState.BLINK_CLOSED ||
+            state == EyeState.BLINK_OPENING
+    }
+
     /**
      * 重置所有状态
      */

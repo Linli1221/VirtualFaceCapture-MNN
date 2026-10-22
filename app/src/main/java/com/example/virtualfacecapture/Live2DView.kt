@@ -1,9 +1,12 @@
 package com.example.virtualfacecapture
 
+import android.content.Context
 import android.opengl.GLSurfaceView
+import android.os.Build
 import android.util.Log
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.virtualfacecapture.web.GlCaptureSink
 import com.live2d.demo.JniBridgeJava
@@ -13,8 +16,8 @@ import com.live2d.demo.JniBridgeJava
  * Wraps GLSurfaceView with Live2D rendering
  * 使用 Live2DModelManager 来管理模型加载
  *
- * @param captureSink 可选：浏览器输出（OBS）的抓帧接收方。为 null 时行为与之前完全一致，
- *                    只是画面会多经过一次离屏 FBO + 贴回窗口（视觉上无差别）。
+ * @param captureSink 可选：浏览器输出（OBS）的抓帧接收方。没人抓帧时渲染器直接画窗口，
+ *                    不产生任何离屏 FBO / 贴回开销；有人抓帧时才走离屏路径（视觉上无差别）。
  */
 @Composable
 fun Live2DView(
@@ -29,7 +32,16 @@ fun Live2DView(
 
     // 用 rememberUpdatedState 包一层：抓帧接收方变化时不需要重建 GLSurfaceView
     val captureSinkState = rememberUpdatedState(captureSink)
-    val renderer = remember { Live2DCaptureRenderer { captureSinkState.value } }
+
+    // 刷新率只在创建 GLSurfaceView 时采样一次（渲染器装在 View 上之后换不了）。
+    // 读不到时按 60Hz 处理 —— 对渲染器来说 60Hz 等价于「不做任何节流」。
+    val localContext = LocalContext.current
+    val renderer = remember {
+        Live2DCaptureRenderer(
+            sinkProvider = { captureSinkState.value },
+            refreshRate = resolveDisplayRefreshRate(localContext),
+        )
+    }
     
     DisposableEffect(Unit) {
         onDispose {
@@ -125,6 +137,36 @@ fun Live2DView(
             // Update when recomposed if needed
         }
     )
+}
+
+/**
+ * 读取屏幕刷新率（Hz）。
+ *
+ * 读不到（或拿到非法值）时返回 60Hz —— [Live2DCaptureRenderer] 对 ≤75Hz 完全不做
+ * 帧率节流，也就是退回改动前的行为，这是最安全的兜底。
+ */
+@Suppress("DEPRECATION")
+private fun resolveDisplayRefreshRate(context: Context): Float {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val direct = try {
+            context.display?.refreshRate
+        } catch (t: Throwable) {
+            null
+        }
+        if (direct != null && direct.isFinite() && direct > 0f) {
+            return direct
+        }
+    }
+
+    val metrics = try {
+        context.resources.displayMetrics.refreshRate
+    } catch (t: Throwable) {
+        0f
+    }
+    if (metrics.isFinite() && metrics > 0f) {
+        return metrics
+    }
+    return 60f
 }
 
 /**

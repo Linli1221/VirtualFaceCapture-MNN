@@ -177,8 +177,25 @@ SmoothingFilterType FaceDetector::getFilterType() const {
     return detection_filter_ ? detection_filter_->getFilterType() : SmoothingFilterType::NONE;
 }
 
-bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads) {
+bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads,
+                             bool use_vulkan) {
     last_error_.clear();
+    
+    // Release the previous session and model so loadModel() can also be used to
+    // switch the inference backend at runtime (the old device session, e.g.
+    // Vulkan buffers, is freed here instead of being leaked).
+    if (interpreter_) {
+        if (session_) {
+            interpreter_->releaseSession(session_);
+        }
+        interpreter_->releaseModel();
+    }
+    session_ = nullptr;
+    interpreter_.reset();
+    input_tensor_ = nullptr;
+    input_host_tensor_.reset();
+    bbox_host_tensor_.reset();
+    score_host_tensor_.reset();
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -189,7 +206,7 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads) {
     
     MNN::ScheduleConfig config;
     config.numThread = num_threads;
-    config.type = MNN_FORWARD_VULKAN;
+    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
     backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
     config.backendConfig = &backendCfg;
@@ -205,6 +222,10 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads) {
         last_error_ = "getSessionInput failed";
         return false;
     }
+    
+    // Host-side scratch tensor reused every frame (see detect/detectFromYuv).
+    input_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+        new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType()));
     
     // Get actual input dimensions from model
     auto shape = input_tensor_->shape();
@@ -222,7 +243,9 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads) {
         }
     }
     
-    FACE_LOGI("Face detector model loaded: %dx%dx%d", input_w_, input_h_, input_c_);
+    FACE_LOGI("Face detector model loaded: %dx%dx%d (backend=%s, threads=%d)",
+              input_w_, input_h_, input_c_,
+              use_vulkan ? "Vulkan" : "CPU", num_threads);
     
     // Generate anchors for the model
     generateAnchors();
@@ -454,7 +477,7 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
         s_first_frame_dumped = true;
     }
     
-    if (!interpreter_ || !session_ || !input_tensor_) {
+    if (!interpreter_ || !session_ || !input_tensor_ || !input_host_tensor_) {
         last_error_ = "Model not loaded";
         return results;
     }
@@ -474,9 +497,6 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
     float pad_w = (static_cast<float>(input_w_) - new_w) / 2.0f;
     float pad_h = (static_cast<float>(input_h_) - new_h) / 2.0f;
     
-    std::shared_ptr<MNN::Tensor> input_nchw(
-        new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType()));
-    
     MNN::CV::ImageProcess::Config norm_cfg;
     const float mean_vals[3] = {127.5f, 127.5f, 127.5f};
     const float norm_vals[3] = {1.0f / 127.5f, 1.0f / 127.5f, 1.0f / 127.5f};
@@ -487,8 +507,17 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
     norm_cfg.filterType = MNN::CV::BILINEAR;
     norm_cfg.wrap = MNN::CV::ZERO;
     
-    auto norm_proc = std::shared_ptr<MNN::CV::ImageProcess>(
-        MNN::CV::ImageProcess::create(norm_cfg));
+    // Reuse the cached ImageProcess when the source format did not change.
+    if (!image_process_ ||
+        image_process_format_ != static_cast<int>(norm_cfg.sourceFormat)) {
+        image_process_ = std::shared_ptr<MNN::CV::ImageProcess>(
+            MNN::CV::ImageProcess::create(norm_cfg));
+        image_process_format_ = static_cast<int>(norm_cfg.sourceFormat);
+    }
+    if (!image_process_) {
+        last_error_ = "ImageProcess::create failed";
+        return results;
+    }
     
     MNN::CV::Matrix trans;
     trans.setIdentity();
@@ -496,10 +525,11 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
     trans.postTranslate(pad_w, pad_h);
     MNN::CV::Matrix inv;
     trans.invert(&inv);
-    norm_proc->setMatrix(inv);
-    norm_proc->convert(img_data, width, height, width * 3, input_nchw.get());
+    image_process_->setMatrix(inv);
+    image_process_->convert(img_data, width, height, width * 3,
+                            input_host_tensor_.get());
     
-    input_tensor_->copyFromHostTensor(input_nchw.get());
+    input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
@@ -531,13 +561,23 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
         return results;
     }
     
-    MNN::Tensor host_bbox(bbox_tensor, bbox_tensor->getDimensionType());
-    MNN::Tensor host_score(score_tensor, score_tensor->getDimensionType());
-    bbox_tensor->copyToHostTensor(&host_bbox);
-    score_tensor->copyToHostTensor(&host_score);
+    // Reuse the host output tensors: the regressor output is ~57 KB and would
+    // otherwise be heap-allocated again on every frame.
+    if (!bbox_host_tensor_ ||
+        bbox_host_tensor_->elementSize() != bbox_tensor->elementSize()) {
+        bbox_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(bbox_tensor, bbox_tensor->getDimensionType()));
+    }
+    if (!score_host_tensor_ ||
+        score_host_tensor_->elementSize() != score_tensor->elementSize()) {
+        score_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(score_tensor, score_tensor->getDimensionType()));
+    }
+    bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+    score_tensor->copyToHostTensor(score_host_tensor_.get());
     
-    const float* raw_boxes = host_bbox.host<float>();
-    const float* raw_scores = host_score.host<float>();
+    const float* raw_boxes = bbox_host_tensor_->host<float>();
+    const float* raw_scores = score_host_tensor_->host<float>();
     
     std::vector<FaceDetection> detections;
     decodeBoxes(raw_boxes, raw_scores, detections, score_threshold);
@@ -607,7 +647,7 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     PERF_START(total_timer);
     std::vector<FaceDetection> results;
     
-    if (!interpreter_ || !session_ || !input_tensor_) {
+    if (!interpreter_ || !session_ || !input_tensor_ || !input_host_tensor_) {
         last_error_ = "Model not loaded";
         return results;
     }
@@ -620,11 +660,10 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
         s_first_frame_dumped = true;
     }
     
-    // Prepare YUV buffer
+    // Prepare YUV buffer (reuses the member buffer: resize only, no re-alloc)
     auto yuvFormat = yuv::detectFormat(uvPixelStride, uData, vData);
-    std::vector<uint8_t> yuvBuffer;
     yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
-                       width, height, yuvFormat, yuvBuffer);
+                       width, height, yuvFormat, yuv_buffer_);
     
     // Calculate output dimensions after rotation
     int srcWidth = width;
@@ -642,9 +681,6 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     float pad_w = (static_cast<float>(input_w_) - new_w) / 2.0f;
     float pad_h = (static_cast<float>(input_h_) - new_h) / 2.0f;
     
-    std::shared_ptr<MNN::Tensor> input_nchw(
-        new MNN::Tensor(input_tensor_, input_tensor_->getDimensionType()));
-    
     // Configure MNN ImageProcess: YUV -> RGB with rotation + scale + normalize
     MNN::CV::ImageProcess::Config config;
     config.sourceFormat = yuvFormat;
@@ -657,8 +693,17 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     ::memcpy(config.mean, mean_vals, sizeof(mean_vals));
     ::memcpy(config.normal, norm_vals, sizeof(norm_vals));
     
-    auto process = std::shared_ptr<MNN::CV::ImageProcess>(
-        MNN::CV::ImageProcess::create(config));
+    // Reuse the cached ImageProcess when the source format did not change.
+    if (!image_process_ ||
+        image_process_format_ != static_cast<int>(config.sourceFormat)) {
+        image_process_ = std::shared_ptr<MNN::CV::ImageProcess>(
+            MNN::CV::ImageProcess::create(config));
+        image_process_format_ = static_cast<int>(config.sourceFormat);
+    }
+    if (!image_process_) {
+        last_error_ = "ImageProcess::create failed";
+        return results;
+    }
     
     // Build transformation matrix
     MNN::CV::Matrix trans;
@@ -678,9 +723,10 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
         trans.postTranslate(cx_src, cy_src);
     }
     
-    process->setMatrix(trans);
-    process->convert(yuvBuffer.data(), srcWidth, srcHeight, 0, input_nchw.get());
-    input_tensor_->copyFromHostTensor(input_nchw.get());
+    image_process_->setMatrix(trans);
+    image_process_->convert(yuv_buffer_.data(), srcWidth, srcHeight, 0,
+                            input_host_tensor_.get());
+    input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
@@ -712,13 +758,23 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
         return results;
     }
     
-    MNN::Tensor host_bbox(bbox_tensor, bbox_tensor->getDimensionType());
-    MNN::Tensor host_score(score_tensor, score_tensor->getDimensionType());
-    bbox_tensor->copyToHostTensor(&host_bbox);
-    score_tensor->copyToHostTensor(&host_score);
+    // Reuse the host output tensors: the regressor output is ~57 KB and would
+    // otherwise be heap-allocated again on every frame.
+    if (!bbox_host_tensor_ ||
+        bbox_host_tensor_->elementSize() != bbox_tensor->elementSize()) {
+        bbox_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(bbox_tensor, bbox_tensor->getDimensionType()));
+    }
+    if (!score_host_tensor_ ||
+        score_host_tensor_->elementSize() != score_tensor->elementSize()) {
+        score_host_tensor_ = std::unique_ptr<MNN::Tensor>(
+            new MNN::Tensor(score_tensor, score_tensor->getDimensionType()));
+    }
+    bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+    score_tensor->copyToHostTensor(score_host_tensor_.get());
     
     std::vector<FaceDetection> detections;
-    decodeBoxes(host_bbox.host<float>(), host_score.host<float>(), 
+    decodeBoxes(bbox_host_tensor_->host<float>(), score_host_tensor_->host<float>(), 
                 detections, score_threshold);
     nms(detections, results, iou_threshold);
     

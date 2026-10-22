@@ -2,6 +2,8 @@ package com.example.virtualfacecapture
 
 import android.content.Context
 import android.graphics.*
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.View
 import com.example.commondata.FaceLandmarkIndices
@@ -21,15 +23,29 @@ class CameraPreviewView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
     
-    // Double-buffered bitmap using AtomicReference for thread-safe swap
+    // ---- 双缓冲：不再每帧 Bitmap.copy() --------------------------------------
+    // 相机线程只写「当前没在展示」的那一块 Bitmap，写完再原子发布；UI 线程只读发布出去
+    // 的那一块。每帧只有一次 setPixels，不再有整帧 ARGB_8888 拷贝（480x480 ≈ 900KB/帧）。
     private val displayBitmap = AtomicReference<Bitmap?>(null)
+
+    // 后台缓冲（相机线程写，UI 线程不读），始终不等于 displayBitmap
+    private var backBitmap: Bitmap? = null
+
+    // 缓冲尺寸：只有尺寸变化时才重建 Bitmap
+    private var frameWidth = 0
+    private var frameHeight = 0
+
+    /** UI 线程是否正在 onDraw 里读位图；绘制期间相机线程最多丢一帧，绝不覆写同一块。 */
+    @Volatile
+    private var uiDrawing = false
+
+    /** 保护 displayBitmap / backBitmap / frameWidth / frameHeight 的切换。 */
+    private val bitmapLock = Any()
+
+    /** 回收旧 Bitmap 统一走主线程，避免和 UI 线程正在进行的绘制撞车。 */
+    private val mainHandler = Handler(Looper.getMainLooper())
     
-    // Working bitmap (only accessed from update thread)
-    private var workingBitmap: Bitmap? = null
-    private var lastWidth = 0
-    private var lastHeight = 0
-    
-    // Reusable pixel array
+    // Reusable pixel array（只有相机线程访问）
     private var pixelBuffer: IntArray? = null
     
     private val bitmapPaint = Paint().apply {
@@ -182,17 +198,23 @@ class CameraPreviewView @JvmOverloads constructor(
     /**
      * Update camera frame - thread-safe with double buffering
      * Camera now outputs already-rotated frames, so no rotation needed here
+     *
+     * 只在相机线程调用。整数像素数组是相机线程私有的，位图是双缓冲的：
+     * 这里永远只写「没在展示」的那一块，写完再原子发布，UI 线程按引用读取。
      */
     fun updateCameraFrame(rgbBuffer: ByteBuffer, width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
         val pixelCount = width * height
         
-        // Reuse pixel buffer
-        if (pixelBuffer == null || pixelBuffer!!.size != pixelCount) {
-            pixelBuffer = IntArray(pixelCount)
+        // Reuse pixel buffer（尺寸不变时零分配）
+        val cached = pixelBuffer
+        val pixels = if (cached != null && cached.size == pixelCount) {
+            cached
+        } else {
+            IntArray(pixelCount).also { pixelBuffer = it }
         }
-        val pixels = pixelBuffer!!
         
-        // Convert RGB to ARGB
+        // Convert RGB to ARGB（写的是相机线程私有数组，不需要加锁）
         rgbBuffer.rewind()
         for (i in pixels.indices) {
             val r = rgbBuffer.get().toInt() and 0xFF
@@ -202,29 +224,40 @@ class CameraPreviewView @JvmOverloads constructor(
         }
         rgbBuffer.rewind()
         
-        // Create or reuse bitmap
-        if (workingBitmap == null || lastWidth != width || lastHeight != height) {
-            workingBitmap?.recycle()
-            workingBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            lastWidth = width
-            lastHeight = height
-        }
+        // UI 正在绘制：这一帧直接丢掉，保证下面要写的那块位图一定没人在读
+        if (uiDrawing) return
         
-        workingBitmap!!.setPixels(pixels, 0, width, 0, 0, width, height)
-        
-        // No rotation needed - camera already outputs correctly oriented frames
-        // Just copy the bitmap for display
-        val newDisplayBitmap = workingBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
-        
-        // Atomic swap
-        val oldBitmap = displayBitmap.getAndSet(newDisplayBitmap)
-        
-        oldBitmap?.let { old ->
-            post {
-                if (!old.isRecycled) {
-                    old.recycle()
-                }
+        synchronized(bitmapLock) {
+            // 尺寸变了：摘掉发布出去的引用，旧图交给主线程回收后重建
+            if (frameWidth != width || frameHeight != height) {
+                recycleOnMain(displayBitmap.getAndSet(null))
+                recycleOnMain(backBitmap)
+                backBitmap = null
+                frameWidth = width
+                frameHeight = height
             }
+            
+            val displayed = displayBitmap.get()
+            var reusable = backBitmap
+            if (reusable != null && (reusable === displayed || reusable.isRecycled ||
+                    reusable.width != width || reusable.height != height)
+            ) {
+                // 后台缓冲不能再用：不是展示中的那块才回收，否则只丢引用等 GC
+                if (reusable !== displayed && !reusable.isRecycled) {
+                    recycleOnMain(reusable)
+                }
+                reusable = null
+            }
+            val buffer = reusable
+                ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            
+            buffer.setPixels(pixels, 0, width, 0, 0, width, height)
+            
+            // 原子发布：UI 下一次 onDraw 拿到的就是刚写完的这块
+            val previous = displayBitmap.getAndSet(buffer)
+            // 上一块「展示中」的位图退回给相机线程当后台缓冲。它可能还被本帧之前发起的
+            // 那次 onDraw 读着，所以下一帧写它之前会先检查 uiDrawing。
+            backBitmap = if (previous !== buffer) previous else null
         }
         
         postInvalidate()
@@ -235,20 +268,53 @@ class CameraPreviewView @JvmOverloads constructor(
         postInvalidate()
     }
     
+    /**
+     * 把旧 Bitmap 丢给主线程回收。
+     *
+     * 相机线程不能直接 recycle：UI 线程可能正在 onDraw 里读同一块位图。
+     * 重复进入这里也没关系，回收前会再确认一次 isRecycled。
+     */
+    private fun recycleOnMain(bitmap: Bitmap?) {
+        if (bitmap == null) return
+        mainHandler.post {
+            if (!bitmap.isRecycled) {
+                bitmap.recycle()
+            }
+        }
+    }
+    
+    /**
+     * 清空预览状态。
+     *
+     * 只在主线程调用（LaunchedEffect / onDetachedFromWindow）：主线程上不可能有正在
+     * 进行的 onDraw，所以这里可以立刻摘掉引用并回收。
+     */
     fun clear() {
-        displayBitmap.getAndSet(null)?.recycle()
-        workingBitmap?.recycle()
-        workingBitmap = null
+        synchronized(bitmapLock) {
+            recycleOnMain(displayBitmap.getAndSet(null))
+            recycleOnMain(backBitmap)
+            backBitmap = null
+            frameWidth = 0
+            frameHeight = 0
+        }
         visualizationDataRef.set(null)
         pixelBuffer = null
-        lastWidth = 0
-        lastHeight = 0
         postInvalidate()
     }
     
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         
+        // 告诉相机线程「UI 正在读发布出去的位图」：这段时间它只会丢帧，不会覆写同一块
+        uiDrawing = true
+        try {
+            drawBitmapFrame(canvas)
+        } finally {
+            uiDrawing = false
+        }
+    }
+    
+    private fun drawBitmapFrame(canvas: Canvas) {
         val bitmap = displayBitmap.get() ?: return
         if (bitmap.isRecycled) return
         

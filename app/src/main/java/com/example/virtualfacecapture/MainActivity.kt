@@ -36,18 +36,95 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.commondata.CameraDeviceInfo
-import com.example.commondata.FaceVisualizationData
 import com.example.commondata.HeadPoseData
 import com.example.virtualfacecapture.ui.theme.Live2DFacePipelineTheme
 import com.example.commondata.ARKitBlendShapes
+import com.example.mediapipefacelandmark.MnnBackend
 import com.example.virtualfacecapture.web.WebOutputManager
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 private const val CAMERA_PREFS_NAME = "face_capture_prefs"
 private const val KEY_PREFERRED_CAMERA_ID = "preferred_camera_id"
+
+/**
+ * 调试面板数据的合并快照。
+ *
+ * 面捕回调每秒触发 30~60 次，fps / BlendShape / 头部姿态原本对应三个独立的
+ * Compose state，每来一次回调就要写三次、让 DebugOverlay 整棵子树重组一次。
+ * 合并成一个不可变快照后，一次写入就能带齐三个字段。
+ */
+private data class DebugSnapshot(
+    val fps: Float = 0f,
+    val blendShapes: ARKitBlendShapes? = null,
+    val headPose: HeadPoseData = HeadPoseData(),
+)
+
+/** 调试面板的刷新间隔：10Hz 已经足够看清数值，重组次数降到原来的 1/6 以下。 */
+private const val DEBUG_SNAPSHOT_INTERVAL_MS = 100L
+
+/**
+ * 面捕回调 → Compose state 的合批器。
+ *
+ * 面捕回调和 UI 不在同一个线程（PipelineFaceTracker 在 Dispatchers.Default 上触发），
+ * 这里用普通字段累积「最新值」（加锁保证跨线程可见性），最多每 [intervalNanos]
+ * 毫秒才向 Compose state 写一次；[enabled] 为 false（调试面板收起）时一次都不写。
+ *
+ * sink 在回调线程上执行：Compose 的 SnapshotMutableState 本身允许跨线程写，
+ * 与改动前直接写 state 的行为一致。
+ */
+private class DebugSnapshotBatcher(
+    private val intervalNanos: Long,
+    private val sink: (DebugSnapshot) -> Unit,
+) {
+    private val lock = Any()
+
+    /** 调试面板是否可见；不可见时完全不写 Compose state。 */
+    @Volatile
+    var enabled: Boolean = false
+
+    private var fps: Float = 0f
+    private var blendShapes: ARKitBlendShapes? = null
+    private var headPose: HeadPoseData = HeadPoseData()
+    private var lastPublishNanos: Long = 0L
+
+    fun updateFps(value: Float) {
+        if (!enabled) return
+        synchronized(lock) { fps = value }
+        publishIfDue()
+    }
+
+    fun updateBlendShapes(value: ARKitBlendShapes) {
+        if (!enabled) return
+        synchronized(lock) { blendShapes = value }
+        publishIfDue()
+    }
+
+    fun updateHeadPose(value: HeadPoseData) {
+        if (!enabled) return
+        synchronized(lock) { headPose = value }
+        publishIfDue()
+    }
+
+    private fun publishIfDue() {
+        val now = System.nanoTime()
+        val snapshot: DebugSnapshot? = synchronized(lock) {
+            if (now - lastPublishNanos < intervalNanos) {
+                null
+            } else {
+                lastPublishNanos = now
+                DebugSnapshot(fps = fps, blendShapes = blendShapes, headPose = headPose)
+            }
+        }
+        if (snapshot != null) {
+            // 在锁外写 Compose state，避免把快照锁和 Compose 的全局锁叠在一起
+            sink(snapshot)
+        }
+    }
+}
 
 class MainActivity : ComponentActivity() {
     
@@ -172,10 +249,8 @@ fun FaceCapturePipelineScreen(
     isTracking: MutableState<Boolean>,
     webOutput: WebOutputManager
 ) {
-    var fps by remember { mutableStateOf(0f) }
-    var currentBlendShapes by remember { mutableStateOf<ARKitBlendShapes?>(null) }
-    var currentHeadPose by remember { mutableStateOf(HeadPoseData()) }
-    var currentVisualizationData by remember { mutableStateOf<FaceVisualizationData?>(null) }
+    // 调试面板数据：fps / BlendShape / 姿态合并为一个快照，且限制在 ≤10Hz（见 DebugSnapshotBatcher）
+    val debugSnapshotState = remember { mutableStateOf(DebugSnapshot()) }
     var showDebug by remember { mutableStateOf(true) }
     var showCameraPreview by remember { mutableStateOf(false) }
     var showModelSelector by remember { mutableStateOf(false) }
@@ -190,7 +265,26 @@ fun FaceCapturePipelineScreen(
     var currentModel by remember { mutableStateOf<Live2DModelManager.ModelInfo?>(null) }
     var isCalibrating by remember { mutableStateOf(false) }  // 校准状态
     var showControlPanel by rememberSaveable { mutableStateOf(true) }  // 侧边控制面板显示状态
+    // MNN 推理后端（Vulkan ⇄ CPU）：让用户在真机上实测哪一个能稳住 60 帧
+    var mnnBackend by remember { mutableStateOf(faceTracker.getMnnBackend()) }
+    var backendSwitching by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    // 面捕回调在后台线程触发，用 rememberUpdatedState 让回调 lambda 始终读到最新的开关值
+    val showCameraPreviewState = rememberUpdatedState(showCameraPreview)
+
+    // 合批器：回调线程只更新普通字段，最多 10Hz 写一次 Compose state
+    val debugBatcher = remember {
+        DebugSnapshotBatcher(
+            intervalNanos = DEBUG_SNAPSHOT_INTERVAL_MS * 1_000_000L,
+            sink = { snapshot -> debugSnapshotState.value = snapshot },
+        )
+    }
+
+    // 调试面板收起时（showDebug = false）合批器完全不写 state
+    SideEffect {
+        debugBatcher.enabled = showDebug
+    }
     
     // Camera preview view reference
     var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
@@ -198,28 +292,29 @@ fun FaceCapturePipelineScreen(
     // Set up callbacks
     LaunchedEffect(Unit) {
         faceTracker.onFpsUpdate = { newFps ->
-            fps = newFps
+            debugBatcher.updateFps(newFps)
         }
-        
+
         faceTracker.onBlendShapesUpdate = { blendShapes ->
-            currentBlendShapes = blendShapes
+            debugBatcher.updateBlendShapes(blendShapes)
         }
-        
+
         faceTracker.onHeadPoseUpdate = { headPose ->
-            currentHeadPose = headPose
+            debugBatcher.updateHeadPose(headPose)
         }
-        
+
         faceTracker.onVisualizationUpdate = { data ->
-            currentVisualizationData = data
-            // Update camera preview view with visualization data
-            cameraPreviewView?.updateVisualizationData(data)
-        }
-        
-        faceTracker.onCameraFrameUpdate = { frameData, width, height ->
-            // Only update camera preview if visible
-            if (showCameraPreview) {
-                cameraPreviewView?.updateCameraFrame(frameData, width, height)
+            // 只有相机预览真的在显示时才需要可视化数据（关掉预览后可能还会来一两帧，
+            // 用最新开关值挡掉，免得往已经 detached 的 View 上白画）
+            if (showCameraPreviewState.value) {
+                cameraPreviewView?.updateVisualizationData(data)
             }
+        }
+
+        faceTracker.onCameraFrameUpdate = { frameData, width, height ->
+            // 预览帧的生成已在相机线程上被 faceTracker.setCameraPreviewFramesEnabled() 门控，
+            // 关闭预览时不会有回调，这里不再重复判断（见 LaunchedEffect(showCameraPreview)）。
+            cameraPreviewView?.updateCameraFrame(frameData, width, height)
         }
         
         faceTracker.onCalibrationStatusUpdate = { calibrating ->
@@ -249,8 +344,11 @@ fun FaceCapturePipelineScreen(
         webOutput.modelName.value = currentModel?.name ?: ""
     }
     
-    // Clean up camera preview callback when not showing
+    // 相机预览帧门控 + 清理。
+    // 关闭预览时通知 SDK：相机线程不要再做整帧 YUV→RGB（每帧几百 KB 的内存写 + 几十万次
+    // 像素运算，而推理管线走 YUV 直通，根本用不到这份 RGB）；同时清掉预览 View 里的位图。
     LaunchedEffect(showCameraPreview) {
+        faceTracker.setCameraPreviewFramesEnabled(showCameraPreview)
         if (!showCameraPreview) {
             cameraPreviewView?.clear()
         }
@@ -302,17 +400,15 @@ fun FaceCapturePipelineScreen(
         
         // Debug overlay
         if (showDebug) {
-            DebugOverlay(
-                fps = fps,
+            DebugOverlayHost(
+                snapshot = debugSnapshotState,
                 isTracking = isTracking.value,
                 currentModel = currentModel?.name ?: "None",
-                blendShapes = currentBlendShapes,
-                headPose = currentHeadPose,
                 showCameraPreview = showCameraPreview,
+                faceTracker = faceTracker,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(16.dp),
-                faceTracker = faceTracker
             )
         }
         
@@ -485,11 +581,72 @@ fun FaceCapturePipelineScreen(
                         blinkSpeedScale = newSpeed
                         faceTracker.blinkCurveProcessor.blinkSpeedScale = newSpeed
                         Log.d("FaceCapturePipeline", "Blink speed scale: $newSpeed")
+                    },
+                    mnnBackend = mnnBackend,
+                    backendSwitching = backendSwitching,
+                    onToggleMnnBackend = {
+                        // 后端切换 = 销毁 → 重建推理 session，耗时可达数百毫秒，
+                        // 必须放到 IO 线程，否则会把主线程卡住（掉帧/ANR）。
+                        if (!backendSwitching) {
+                            val target = if (mnnBackend == MnnBackend.VULKAN) {
+                                MnnBackend.CPU
+                            } else {
+                                MnnBackend.VULKAN
+                            }
+                            backendSwitching = true
+                            Log.i("FaceCapturePipeline", "Switching MNN backend to $target ...")
+                            scope.launch(Dispatchers.IO) {
+                                val ok = try {
+                                    faceTracker.setMnnBackend(target)
+                                } catch (t: Throwable) {
+                                    // 老 .so 没有 nativeSetBackend 时可能抛 UnsatisfiedLinkError，
+                                    // 任何异常都不能把 UI 卡在「切换中」
+                                    Log.e("FaceCapturePipeline", "Switching MNN backend failed", t)
+                                    false
+                                }
+                                // 以 SDK 的真实状态为准：失败时它仍停在原后端
+                                mnnBackend = faceTracker.getMnnBackend()
+                                backendSwitching = false
+                                Log.i(
+                                    "FaceCapturePipeline",
+                                    "MNN backend switch (ok=$ok) -> ${faceTracker.getMnnBackend()}"
+                                )
+                            }
+                        }
                     }
                 )
             }
         }
     }
+}
+
+/**
+ * 把 [DebugSnapshot] 的读取关在一个独立的重组作用域里。
+ *
+ * 如果直接在 [FaceCapturePipelineScreen] 的函数体里读快照，每次数据更新都会让整个
+ * 屏幕（包括 Live2D 的 AndroidView、控制面板）重新走一遍组合；放到这里以后只有
+ * 这一小块会随面捕数据（≤10Hz）重组。
+ */
+@Composable
+private fun DebugOverlayHost(
+    snapshot: State<DebugSnapshot>,
+    isTracking: Boolean,
+    currentModel: String,
+    showCameraPreview: Boolean,
+    faceTracker: PipelineFaceTracker,
+    modifier: Modifier = Modifier
+) {
+    val value = snapshot.value
+    DebugOverlay(
+        fps = value.fps,
+        isTracking = isTracking,
+        currentModel = currentModel,
+        blendShapes = value.blendShapes,
+        headPose = value.headPose,
+        showCameraPreview = showCameraPreview,
+        modifier = modifier,
+        faceTracker = faceTracker
+    )
 }
 
 @Composable
@@ -792,6 +949,9 @@ fun ControlPanel(
     onBlinkSpeedChange: (Float) -> Unit,
     onOpenCameraSelector: () -> Unit,
     onOpenWebOutput: () -> Unit,
+    mnnBackend: MnnBackend,
+    backendSwitching: Boolean,
+    onToggleMnnBackend: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -931,6 +1091,30 @@ fun ControlPanel(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+            }
+
+            // Control buttons - fifth row：MNN 推理后端（Vulkan ⇄ CPU）
+            // 切换会重建推理 session（管线短暂重启），按钮在切换期间禁用并显示进度文案。
+            Button(
+                onClick = onToggleMnnBackend,
+                enabled = !backendSwitching,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = when (mnnBackend) {
+                        MnnBackend.VULKAN -> Color(0xFF7C4DFF)   // GPU：紫色
+                        MnnBackend.CPU -> Color(0xFF00897B)      // CPU：青绿
+                    }
+                )
+            ) {
+                Text(
+                    text = when {
+                        backendSwitching -> "Backend: switching..."
+                        mnnBackend == MnnBackend.VULKAN -> "Backend: Vulkan (tap for CPU)"
+                        else -> "Backend: CPU (tap for Vulkan)"
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // 眨眼速度滑块（仅在 Blink Curve 启用时显示）

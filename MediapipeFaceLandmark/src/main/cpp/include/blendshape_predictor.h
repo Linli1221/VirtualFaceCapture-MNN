@@ -40,9 +40,14 @@ public:
      * @brief Load the blendshape prediction model
      * @param mnn_path Path to the MNN model file
      * @param num_threads Number of threads for inference
+     * @param use_vulkan true = MNN_FORWARD_VULKAN, false = MNN_FORWARD_CPU
      * @return true if successful
+     *
+     * Can be called again on a live instance to switch the backend: the old
+     * session/model is released first.
      */
-    bool loadModel(const std::string& mnn_path, int num_threads = 2);
+    bool loadModel(const std::string& mnn_path, int num_threads = 2,
+                   bool use_vulkan = true);
 
     /**
      * @brief Predict blendshapes from facial landmarks
@@ -79,6 +84,12 @@ private:
     std::shared_ptr<MNN::Interpreter> interpreter_;
     MNN::Session* session_ = nullptr;
     MNN::Tensor* input_tensor_ = nullptr;
+
+    // ---- Reusable per-frame resources (avoid re-allocating on the hot path) ----
+    // Host tensor the landmark subset is written into before uploading.
+    std::unique_ptr<MNN::Tensor> input_host_tensor_;
+    // Host tensor for the model output, created lazily after the first run.
+    std::unique_ptr<MNN::Tensor> output_host_tensor_;
 
     // Input dimensions: [1, 146, 2] - 146 landmarks with X, Y coordinates
     int input_h_ = 146;

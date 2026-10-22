@@ -10,6 +10,7 @@ import com.example.commondata.HeadPoseData
 import com.example.commondata.Point3D
 import com.example.mediapipefacelandmark.Camera2Manager
 import com.example.mediapipefacelandmark.MediaPipeFaceDetector
+import com.example.mediapipefacelandmark.MnnBackend
 import com.example.mediapipefacelandmark.YuvFrameData
 import com.live2d.facecapture.BlinkCurveProcessor
 import com.live2d.facecapture.FaceCapturePipeline
@@ -18,7 +19,10 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -55,6 +59,23 @@ class PipelineFaceTracker(private val context: Context) {
         private const val PROCESSING_CHANNEL_CAPACITY = 4
         private const val FPS_UPDATE_INTERVAL = 1000L
 
+        /**
+         * 稳定追踪时人脸检测的最小间隔（毫秒）。
+         *
+         * 人脸框在 100ms 内的位移极小，但每次检测都要占满一次完整推理并和
+         * landmark 阶段抢 CPU/GPU。按 10Hz 的节奏刷新脸框，把省下来的算力留给
+         * landmark（真正的瓶颈），帧时间会更平稳。
+         *
+         * 脸框失效（掉脸 / 低置信度主动重置）时会忽略该间隔、立即重检。
+         */
+        private const val DETECTION_INTERVAL_MS_STABLE = 100L
+
+        /**
+         * 帧年龄上限（毫秒）。超过这个年龄才被处理到的帧只会增加延迟，
+         * 对流畅度没有任何帮助，直接丢弃。
+         */
+        private const val MAX_FRAME_AGE_MS = 300L
+
         // Performance profiling
         private const val ENABLE_PERF_PROFILING = true
         private const val PERF_LOG_INTERVAL = 60
@@ -85,9 +106,19 @@ class PipelineFaceTracker(private val context: Context) {
     private var perfFrameCount = 0
     private val perfLock = Any()
 
+    // ---- 帧间隔抖动统计 ----------------------------------------------------
+    // 「稳定 60 帧」看的是抖动（p95 / max），不只是平均帧率：平均 60 但每 10 帧
+    // 卡一次 40ms 的体验比稳定 55 帧还差。这里只保留最近 120 个帧间隔（约 2s）。
+    private val FRAME_INTERVAL_WINDOW = 120
+    private val frameIntervalsMs = FloatArray(FRAME_INTERVAL_WINDOW)
+    private var frameIntervalCursor = 0
+    private var frameIntervalFilled = 0
+    private var lastProcessedFrameNanos = 0L
+
     private var detectionRunCount = 0
     private var detectionSkipCount = 0
     private var redetectTriggerCount = 0
+    private var staleFrameDropCount = 0
 
     // Core components
     private val camera2Manager = Camera2Manager(context)
@@ -98,14 +129,36 @@ class PipelineFaceTracker(private val context: Context) {
     @Volatile private var lastFaceBox: MediaPipeFaceDetector.FaceBox? = null
     private val faceBoxLock = Any()
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val faceDetectionDispatcher = Dispatchers.Default.limitedParallelism(1)
+    /** 累计的 stop() 请求数，用于在 setMnnBackend() 里识别外部并发停止。 */
+    private val stopRequestCount = AtomicInteger(0)
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val landmarkDispatcher = Dispatchers.Default.limitedParallelism(1)
+    /**
+     * 每个流水线阶段独占一条常驻线程。
+     *
+     * 之前用的是 `Dispatchers.Default.limitedParallelism(1)`：它只限制并发度为 1，
+     * 实际执行仍会落在共享线程池的任意线程上，还会和 GC / 其它 Default 任务抢
+     * 调度。换成独立线程 + 略高的线程优先级后，各阶段的帧时间抖动明显更小 ——
+     * 对「稳住 60 帧」来说，抖动比平均值更致命。
+     */
+    private val faceDetectionDispatcher: ExecutorCoroutineDispatcher =
+        newStageThread("face-detect").asCoroutineDispatcher()
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val processingDispatcher = Dispatchers.Default.limitedParallelism(1)
+    private val landmarkDispatcher: ExecutorCoroutineDispatcher =
+        newStageThread("face-landmark").asCoroutineDispatcher()
+
+    private val processingDispatcher: ExecutorCoroutineDispatcher =
+        newStageThread("face-process").asCoroutineDispatcher()
+
+    private val outputDispatcher: ExecutorCoroutineDispatcher =
+        newStageThread("face-output").asCoroutineDispatcher()
+
+    private fun newStageThread(stage: String): ExecutorService =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "fc-$stage").apply {
+                // NORM_PRIORITY(5) + 2 = 7：高于普通后台线程，低于 UI 线程
+                priority = Thread.NORM_PRIORITY + 2
+            }
+        }
 
     // Channels are recreated on every start() because Channel.close() is one-shot.
     // Keeping them mutable also lets stop() drop any in-flight frames (whose
@@ -115,6 +168,16 @@ class PipelineFaceTracker(private val context: Context) {
     private var landmarkFrameChannel: Channel<FrameData> = newFrameChannel()
     private var landmarkChannel: Channel<LandmarkData> = newLandmarkChannel()
 
+    /**
+     * 处理完成、等待派发回调的帧。
+     *
+     * 历史上这一步是「每帧 `pipelineScope.launch(Dispatchers.Default)`」——
+     * 60fps 下等于每秒创建 60 个协程 + 60 次线程调度，而且回调一旦变慢就会
+     * 无上限地堆积协程。改成单消费者 + 容量 1 的 DROP_OLDEST 通道后：没有逐帧
+     * 协程开销，回调变慢时只保留最新一帧，延迟也不会滚雪球。
+     */
+    private var outputChannel: Channel<OutputFrame> = newOutputChannel()
+
     private fun newFrameChannel() = Channel<FrameData>(
         capacity = DETECTION_CHANNEL_CAPACITY,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -122,6 +185,11 @@ class PipelineFaceTracker(private val context: Context) {
 
     private fun newLandmarkChannel() = Channel<LandmarkData>(
         capacity = PROCESSING_CHANNEL_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    private fun newOutputChannel() = Channel<OutputFrame>(
+        capacity = 1,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
@@ -135,6 +203,9 @@ class PipelineFaceTracker(private val context: Context) {
     private val isRunning = AtomicBoolean(false)
     @Volatile private var isInitialized = false
     private var lastHeadPose = HeadPoseData()
+
+    /** 初始化时实际使用的 MNN 推理线程数（仅用于性能日志）。 */
+    private var mnnThreadCount = 0
 
     private val trackingConfidenceDetector by lazy { TrackingConfidenceDetector() }
 
@@ -238,6 +309,24 @@ class PipelineFaceTracker(private val context: Context) {
         val presenceScore: Float = 1f,
     )
 
+    /** 一帧的完整后处理结果，用于派发到下游回调。 */
+    private class OutputFrame(
+        val frameId: Long,
+        val blendShapes: ARKitBlendShapes,
+        val headPose: HeadPoseData,
+        val rawPose: HeadPoseData,
+        val landmarks: List<Point3D>,
+        val width: Int,
+        val height: Int,
+        val presenceScore: Float,
+        val isCalibrating: Boolean,
+        val fps: Float,
+    )
+
+    /** 相机预览（调试画面）的 RGB 帧是否需要生成。默认关闭，按需打开。 */
+    @Volatile
+    private var cameraPreviewFramesRequested = false
+
     /** Use direct YUV processing (recommended; avoids Kotlin-side YUV->RGB conversion). */
     var useDirectYuvMode: Boolean = true
 
@@ -251,10 +340,16 @@ class PipelineFaceTracker(private val context: Context) {
     fun initialize(): Boolean {
         Log.i(TAG, "Initializing pipeline face tracker...")
 
-        if (!faceDetector.initialize(numThreads = 2)) {
+        // 线程数按 CPU 核数自适应：Vulkan 后端下 numThread 基本不参与计算，
+        // 一旦切到 CPU 后端，它直接决定 landmark 推理耗时（也就是能不能上 60fps）。
+        // 上限 4，避免长时间跑满大核之后触发降频、反而让帧率抖动。
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+        if (!faceDetector.initialize(numThreads = threads)) {
             Log.e(TAG, "Failed to initialize face detector")
             return false
         }
+        mnnThreadCount = threads
+        Log.i(TAG, "MNN inference threads: $threads")
 
         val dumpDir = context.cacheDir.absolutePath
         faceDetector.setDumpDirectory(dumpDir)
@@ -278,6 +373,7 @@ class PipelineFaceTracker(private val context: Context) {
         frameChannel = newFrameChannel()
         landmarkFrameChannel = newFrameChannel()
         landmarkChannel = newLandmarkChannel()
+        outputChannel = newOutputChannel()
         yuvFrameChannel = newYuvChannel(DETECTION_CHANNEL_CAPACITY)
         yuvLandmarkFrameChannel = newYuvChannel(LANDMARK_CHANNEL_CAPACITY)
 
@@ -292,12 +388,15 @@ class PipelineFaceTracker(private val context: Context) {
             startLandmarkStage()
         }
         startProcessingStage()
+        startOutputStage()
 
         var frameId = 0L
 
         if (useDirectYuvMode) {
             camera2Manager.useDirectYuvMode = true
-            camera2Manager.enablePreviewInYuvMode = true
+            // 预览 RGB 帧默认不生成：整帧 YUV→RGB 是相机线程上的大头开销，
+            // 只有调试预览真的可见时才需要。
+            camera2Manager.enablePreviewInYuvMode = cameraPreviewFramesRequested
 
             camera2Manager.setFrameCallback { frameData, width, height ->
                 onCameraFrameUpdate?.invoke(frameData.duplicate(), width, height)
@@ -358,6 +457,10 @@ class PipelineFaceTracker(private val context: Context) {
     }
 
     fun stop() {
+        // Count every stop request (even the ones that find us already stopped) so
+        // setMnnBackend() can tell "the stop I made myself" from "someone else asked
+        // us to stop while the backend was being reloaded".
+        stopRequestCount.incrementAndGet()
         if (!isRunning.getAndSet(false)) return
         Log.i(TAG, "Stopping pipeline face tracker...")
         // IMPORTANT: stop the camera FIRST so no further frames get enqueued,
@@ -369,6 +472,7 @@ class PipelineFaceTracker(private val context: Context) {
         frameChannel.close()
         landmarkFrameChannel.close()
         landmarkChannel.close()
+        outputChannel.close()
         yuvFrameChannel.close()
         yuvLandmarkFrameChannel.close()
     }
@@ -446,6 +550,69 @@ class PipelineFaceTracker(private val context: Context) {
 
     fun getLastHeadPose(): HeadPoseData = lastHeadPose
     fun getCurrentFps(): Float = currentFps
+
+    // ============================================================================
+    // Performance knobs
+    // ============================================================================
+
+    /**
+     * 打开/关闭相机预览（调试画面）的 RGB 帧生成。
+     *
+     * 关闭时相机线程不再做整帧 YUV→RGB —— 480p 下这一项每帧要花几毫秒 CPU，
+     * 而处理管线根本用不到它（推理走 YUV 直通）。只有在 UI 真的显示相机画面
+     * 时才需要打开。
+     *
+     * 可以随时调用，立即生效（相机线程下一帧就会看到新值）。
+     */
+    fun setCameraPreviewFramesEnabled(enabled: Boolean) {
+        cameraPreviewFramesRequested = enabled
+        camera2Manager.enablePreviewInYuvMode = enabled
+        Log.i(TAG, "Camera preview frames: ${if (enabled) "ON" else "OFF"}")
+    }
+
+    /** 相机预览 RGB 帧当前是否开启。 */
+    fun isCameraPreviewFramesEnabled(): Boolean = cameraPreviewFramesRequested
+
+    /**
+     * 运行时切换 MNN 推理后端（Vulkan ⇄ CPU）。
+     *
+     * 后端会话不能和推理并发重建，所以这里会先 [stop]（若正在追踪），
+     * 切换后按原状态自动 [start]。切换期间画面会中断一帧左右。
+     *
+     * @return true 表示切换成功；false 表示失败且仍停留在原后端（或原后端
+     *         已不可用，此时会尝试恢复）。
+     */
+    fun setMnnBackend(backend: MnnBackend): Boolean {
+        if (!isInitialized) {
+            Log.w(TAG, "setMnnBackend($backend) ignored: pipeline not initialized")
+            return false
+        }
+        if (backend == faceDetector.getBackend()) {
+            Log.i(TAG, "MNN backend already $backend")
+            return true
+        }
+
+        val wasRunning = isRunning.get()
+        val stopsBefore = stopRequestCount.get()
+        if (wasRunning) stop()
+
+        val switched = faceDetector.setBackend(backend)
+
+        // 切换期间外部又调用了 stop()（例如 Activity 进入后台）时不要再自动 start，
+        // 否则相机会在后台被重新打开。start()/stop() 本身都是幂等的，这里只是判断
+        // 「我这次 stop() 之外是否还有别人要求停止」。
+        val expectedStops = if (wasRunning) 1 else 0
+        val externalStopRequested = stopRequestCount.get() > stopsBefore + expectedStops
+
+        // 无论切换成功与否都要恢复追踪：失败时仍在原后端，不能把管线留在停止状态。
+        if (wasRunning && !externalStopRequested) start()
+
+        Log.i(TAG, "MNN backend switch to $backend -> $switched (now ${faceDetector.getBackend()})")
+        return switched
+    }
+
+    /** 当前生效的 MNN 推理后端。 */
+    fun getMnnBackend(): MnnBackend = faceDetector.getBackend()
 
     /**
      * Reset adaptive baseline for BlendShape extraction.
@@ -532,7 +699,7 @@ class PipelineFaceTracker(private val context: Context) {
                             landmarkOutputCount.set(0)
                             lastLandmarkFpsTime = now
                         }
-                        landmarkChannel.send(landmarkData)
+                        landmarkChannel.trySend(landmarkData)
                     }
                     if (ENABLE_PERF_PROFILING) {
                         synchronized(perfLock) {
@@ -550,9 +717,23 @@ class PipelineFaceTracker(private val context: Context) {
     private fun startYuvFaceDetectionStage() {
         pipelineScope.launch(faceDetectionDispatcher) {
             Log.i(TAG, "YUV Face detection stage started")
+            var lastDetectionMs = 0L
             for (frame in yuvFrameChannel) {
                 if (!isRunning.get()) break
                 try {
+                    // 检测节流：脸框在 100ms 内变化极小，但每次检测都要跑一遍完整
+                    // 推理并和 landmark 抢算力。稳定追踪时按固定节奏刷新脸框即可；
+                    // 脸框为空（掉脸 / 低置信度重置）时立即重检，不影响跟脸。
+                    val nowMs = System.currentTimeMillis()
+                    val hasFaceBox = synchronized(faceBoxLock) { lastFaceBox != null }
+                    if (hasFaceBox &&
+                        nowMs - lastDetectionMs < DETECTION_INTERVAL_MS_STABLE
+                    ) {
+                        synchronized(perfLock) { detectionSkipCount++ }
+                        continue
+                    }
+                    lastDetectionMs = nowMs
+
                     val startTime = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
                     val yuvData = frame.yuvData
                     val box = faceDetector.detectFaceFromYuv(
@@ -632,7 +813,7 @@ class PipelineFaceTracker(private val context: Context) {
                             landmarkOutputCount.set(0)
                             lastLandmarkFpsTime = now
                         }
-                        landmarkChannel.send(landmarkData)
+                        landmarkChannel.trySend(landmarkData)
                     }
                     if (ENABLE_PERF_PROFILING) {
                         synchronized(perfLock) {
@@ -653,6 +834,13 @@ class PipelineFaceTracker(private val context: Context) {
             for (data in landmarkChannel) {
                 if (!isRunning.get()) break
                 try {
+                    // 丢掉已经过期的帧：算力应该花在最新一帧上，否则延迟会累积
+                    val ageMs = System.currentTimeMillis() - data.timestamp
+                    if (ageMs > MAX_FRAME_AGE_MS) {
+                        synchronized(perfLock) { staleFrameDropCount++ }
+                        continue
+                    }
+
                     val stageStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
                     val headPose = data.headPose
                     val bsStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
@@ -685,7 +873,9 @@ class PipelineFaceTracker(private val context: Context) {
 
                     updateFps()
 
-                    blinkCurveProcessor.updateFrameRate(60f)
+                    // 眨眼曲线按真实帧率推进（之前写死 60fps，实际帧率不足时曲线
+                    // 会被拉长/压缩，眨眼的起落时间就不准了）
+                    blinkCurveProcessor.updateFrameRate(currentFps.coerceIn(15f, 120f))
 
                     val processedBlendShapes = if (blinkCurveProcessor.isEnabled) {
                         val (leftBlink, rightBlink) = blinkCurveProcessor.process(
@@ -701,51 +891,24 @@ class PipelineFaceTracker(private val context: Context) {
                         blendShapes
                     }
 
-                    val applyStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
-                    val currentBlendShapes = processedBlendShapes
-                    val currentHeadPoseData = headPoseData
-                    val currentLandmarks = data.landmarks
-                    val currentWidth = data.width
-                    val currentHeight = data.height
-
-                    pipelineScope.launch(Dispatchers.Default) {
-                        onFaceCaptureFrame?.invoke(currentBlendShapes, currentHeadPoseData)
-
-                        val detectionBox = calculateBoundingBox(currentLandmarks)
-                        val visualizationData = FaceVisualizationData(
-                            landmarks = currentLandmarks,
-                            detectionBox = detectionBox,
-                            headPose = currentHeadPoseData,
-                            imageWidth = currentWidth,
-                            imageHeight = currentHeight,
+                    // 只把结果推给派发阶段，本阶段不再创建协程、不碰 UI/渲染
+                    outputChannel.trySend(
+                        OutputFrame(
+                            frameId = data.frameId,
+                            blendShapes = processedBlendShapes,
+                            headPose = headPoseData,
+                            rawPose = rawPoseData,
+                            landmarks = data.landmarks,
+                            width = data.width,
+                            height = data.height,
+                            presenceScore = data.presenceScore,
+                            isCalibrating = result.isCalibrating,
+                            fps = currentFps,
                         )
+                    )
 
-                        // SDK-facing atomic snapshot: raw landmarks + post-processed
-                        // BlendShape / head-pose in a single payload, guaranteed to
-                        // belong to the same frame.
-                        onFaceCaptureResult?.invoke(
-                            SdkFaceCaptureFrame(
-                                frameId = data.frameId,
-                                landmarks = currentLandmarks,
-                                imageWidth = currentWidth,
-                                imageHeight = currentHeight,
-                                detectionBox = detectionBox,
-                                rawHeadPose = rawPoseData,
-                                relativeHeadPose = currentHeadPoseData,
-                                blendShapes = currentBlendShapes,
-                                presenceScore = data.presenceScore,
-                                isCalibrating = result.isCalibrating,
-                                fps = currentFps,
-                            )
-                        )
-
-                        onBlendShapesUpdate?.invoke(currentBlendShapes)
-                        onVisualizationUpdate?.invoke(visualizationData)
-                        onHeadPoseUpdate?.invoke(currentHeadPoseData)
-                    }
                     if (ENABLE_PERF_PROFILING) {
                         synchronized(perfLock) {
-                            perfApplyToLive2D.add((System.nanoTime() - applyStart) / 1_000_000.0)
                             perfProcessingTotal.add((System.nanoTime() - stageStart) / 1_000_000.0)
                             perfFrameCount++
                             if (perfFrameCount % PERF_LOG_INTERVAL == 0) {
@@ -759,6 +922,86 @@ class PipelineFaceTracker(private val context: Context) {
             }
             Log.i(TAG, "Processing stage stopped")
         }
+    }
+
+    /**
+     * 回调派发阶段。
+     *
+     * 单消费者：同一时刻最多一帧在派发；通道容量 1 + DROP_OLDEST 保证下游变慢
+     * 时只保留最新结果，不会像之前「每帧 launch 一个协程」那样无上限堆积。
+     */
+    private fun startOutputStage() {
+        pipelineScope.launch(outputDispatcher) {
+            Log.i(TAG, "Output stage started")
+            for (frame in outputChannel) {
+                if (!isRunning.get()) break
+                try {
+                    val dispatchStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
+                    dispatchOutput(frame)
+                    if (ENABLE_PERF_PROFILING) {
+                        // 现在测到的才是真正的「派发 + Live2D 参数写入」耗时
+                        synchronized(perfLock) {
+                            perfApplyToLive2D.add(
+                                (System.nanoTime() - dispatchStart) / 1_000_000.0
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Output dispatch error", e)
+                }
+            }
+            Log.i(TAG, "Output stage stopped")
+        }
+    }
+
+    private fun dispatchOutput(frame: OutputFrame) {
+        // 1) avatar 驱动：主链路，先派发
+        onFaceCaptureFrame?.invoke(frame.blendShapes, frame.headPose)
+
+        // 2) 检测框是每帧 O(478) 的额外遍历，只有真的有人订阅时才计算
+        val wantsResult = onFaceCaptureResult != null
+        val wantsVisualization = onVisualizationUpdate != null
+        val detectionBox = if (wantsResult || wantsVisualization) {
+            calculateBoundingBox(frame.landmarks)
+        } else {
+            DetectionBox(0f, 0f, 1f, 1f)
+        }
+
+        if (wantsResult) {
+            // SDK-facing atomic snapshot: raw landmarks + post-processed
+            // BlendShape / head-pose in a single payload, guaranteed to
+            // belong to the same frame.
+            onFaceCaptureResult?.invoke(
+                SdkFaceCaptureFrame(
+                    frameId = frame.frameId,
+                    landmarks = frame.landmarks,
+                    imageWidth = frame.width,
+                    imageHeight = frame.height,
+                    detectionBox = detectionBox,
+                    rawHeadPose = frame.rawPose,
+                    relativeHeadPose = frame.headPose,
+                    blendShapes = frame.blendShapes,
+                    presenceScore = frame.presenceScore,
+                    isCalibrating = frame.isCalibrating,
+                    fps = frame.fps,
+                )
+            )
+        }
+
+        if (wantsVisualization) {
+            onVisualizationUpdate?.invoke(
+                FaceVisualizationData(
+                    landmarks = frame.landmarks,
+                    detectionBox = detectionBox,
+                    headPose = frame.headPose,
+                    imageWidth = frame.width,
+                    imageHeight = frame.height,
+                )
+            )
+        }
+
+        onBlendShapesUpdate?.invoke(frame.blendShapes)
+        onHeadPoseUpdate?.invoke(frame.headPose)
     }
 
     // ============================================================================
@@ -785,11 +1028,16 @@ class PipelineFaceTracker(private val context: Context) {
         Log.i(TAG, "  Processing: %.2f ms".format(procAvg))
         Log.i(TAG, "    BlendShape: %.2f ms (%.1f%%)".format(
             perfBlendShape.avg(), if (procAvg > 0) 100.0 * perfBlendShape.avg() / procAvg else 0.0))
-        Log.i(TAG, "    Apply+UI:   %.2f ms (%.1f%%)".format(
-            perfApplyToLive2D.avg(), if (procAvg > 0) 100.0 * perfApplyToLive2D.avg() / procAvg else 0.0))
+        Log.i(TAG, "    Dispatch:   %.2f ms (callback + Live2D params)".format(
+            perfApplyToLive2D.avg()))
+        Log.i(TAG, "  Stale frames dropped: $staleFrameDropCount (> ${MAX_FRAME_AGE_MS}ms old)")
         Log.i(TAG, "  Bottleneck: Landmark (%.2f ms)".format(lmAvg))
         Log.i(TAG, "  Theoretical max FPS (1000/landmark_ms): %.0f FPS".format(theoreticalMaxFps))
         Log.i(TAG, "  Actual output FPS (UI display): %.1f FPS".format(currentFps))
+        frameJitterStats()?.let { (p50, p95, max) ->
+            Log.i(TAG, "  Frame interval p50=%.1fms p95=%.1fms max=%.1fms (target 16.7ms)".format(p50, p95, max))
+        }
+        Log.i(TAG, "  MNN backend: ${faceDetector.getBackend()}, MNN threads: $mnnThreadCount")
 
         perfDetectionTotal.reset()
         perfLandmarkTotal.reset()
@@ -799,6 +1047,7 @@ class PipelineFaceTracker(private val context: Context) {
         detectionRunCount = 0
         detectionSkipCount = 0
         redetectTriggerCount = 0
+        staleFrameDropCount = 0
     }
 
     private fun copyBuffer(source: ByteBuffer): ByteBuffer {
@@ -836,6 +1085,7 @@ class PipelineFaceTracker(private val context: Context) {
     }
 
     private fun updateFps() {
+        recordFrameInterval()
         frameCount.incrementAndGet()
         val now = System.currentTimeMillis()
         val elapsed = now - lastFpsTime
@@ -849,5 +1099,33 @@ class PipelineFaceTracker(private val context: Context) {
             Log.d(TAG, "UI FPS update: count=$finalCount, elapsed=${finalElapsed}ms, fps=%.1f".format(currentFps))
             onFpsUpdate?.invoke(currentFps)
         }
+    }
+
+    /** 记录一帧的处理间隔，用于统计 jitter（p50 / p95 / max）。 */
+    private fun recordFrameInterval() {
+        val now = System.nanoTime()
+        val last = lastProcessedFrameNanos
+        if (last != 0L) {
+            val deltaMs = (now - last) / 1_000_000.0f
+            frameIntervalsMs[frameIntervalCursor] = deltaMs
+            frameIntervalCursor = (frameIntervalCursor + 1) % FRAME_INTERVAL_WINDOW
+            if (frameIntervalFilled < FRAME_INTERVAL_WINDOW) frameIntervalFilled++
+        }
+        lastProcessedFrameNanos = now
+    }
+
+    /**
+     * @return Triple(p50, p95, max) 帧间隔（毫秒），样本不足时返回 null。
+     */
+    private fun frameJitterStats(): Triple<Float, Float, Float>? {
+        val n = frameIntervalFilled
+        if (n < 10) return null
+        // 每 60 帧才调用一次，这里的一次性排序开销可以忽略
+        val sorted = FloatArray(n)
+        System.arraycopy(frameIntervalsMs, 0, sorted, 0, n)
+        java.util.Arrays.sort(sorted)
+        val p50 = sorted[(n * 0.50f).toInt().coerceIn(0, n - 1)]
+        val p95 = sorted[(n * 0.95f).toInt().coerceIn(0, n - 1)]
+        return Triple(p50, p95, sorted[n - 1])
     }
 }

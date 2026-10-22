@@ -38,8 +38,20 @@ class FaceCapturePipeline {
     private var calibrationYawSum: Float = 0f
     private var calibrationRollSum: Float = 0f
 
-    // 用于点位平均的累积数据（只累积 landmarks，因为 FaceKeyPoints 结构复杂）
-    private var calibrationLandmarksAccumulator: MutableList<List<Point3D>> = mutableListOf()
+    // ============ 点位平均的累积求和器（常数内存） ============
+    //
+    // 旧实现 calibrationLandmarksAccumulator 把校准窗口内每一帧的 landmarks 列表都保存下来，
+    // 窗口结束时再逐点求平均。窗口按 1000ms 计，60 FPS 下等于同时持有 ~60 × 478 个 Point3D
+    // 引用（约 2.8 万个引用 / 230KB+，外加 60 个 ArrayList），是启动后最集中的一次内存与
+    // GC 峰值，而且启动阶段一旦 GC 就会拖慢首秒的校准帧率。
+    //
+    // 新实现：每帧把坐标累加进 3 个 DoubleArray（478 个求和槽，约 11.5KB 常数内存），
+    // 窗口结束时用同一个求和结果求平均。累加顺序与旧实现的 `sumOf { it[i].x.toDouble() }`
+    // 完全一致（坐标维度上按帧顺序累加），因此平均值逐位可复现。
+    private var calibrationLandmarkFrameCount: Int = 0
+    private var calibrationLandmarkSumX: DoubleArray? = null
+    private var calibrationLandmarkSumY: DoubleArray? = null
+    private var calibrationLandmarkSumZ: DoubleArray? = null
 
     /**
      * 处理结果
@@ -93,8 +105,8 @@ class FaceCapturePipeline {
             calibrationYawSum += rawYaw
             calibrationRollSum += rawRoll
 
-            // 累积点位数据
-            calibrationLandmarksAccumulator.add(landmarks)
+            // 累积点位数据（常数内存：3 × 478 个 Double 求和槽，不再保存每帧列表）
+            accumulateCalibrationLandmarks(landmarks)
 
             val elapsedMs = SystemClock.uptimeMillis() - calibrationStartTimestampMs
             val windowReady = elapsedMs >= CALIBRATION_DURATION_MS &&
@@ -144,15 +156,15 @@ class FaceCapturePipeline {
      * 在自动校准完成时调用
      */
     private fun calibrateWithAccumulatedData() {
-        if (calibrationLandmarksAccumulator.isEmpty()) {
+        if (calibrationLandmarkFrameCount == 0) {
             Log.w("FaceCapturePipeline", "No accumulated data for calibration")
             return
         }
 
-        val accumulatedCount = calibrationLandmarksAccumulator.size
+        val accumulatedCount = calibrationLandmarkFrameCount
 
-        // 计算平均 landmarks
-        val avgLandmarks = averageLandmarks(calibrationLandmarksAccumulator)
+        // 计算平均 landmarks（由求和槽还原，不再遍历每帧列表）
+        val avgLandmarks = averageAccumulatedLandmarks()
 
         // 从平均 landmarks 提取 keyPoints
         val avgKeyPoints = FaceLandmarkIndices.extractKeyPoints(avgLandmarks)
@@ -163,33 +175,84 @@ class FaceCapturePipeline {
         // 设置嘴部补偿的校准姿态（使用原始姿态角的平均值）
         extractor.setCalibrationPose(baselinePitch, baselineYaw, baselineRoll)
 
-        // 清空累积数据
-        calibrationLandmarksAccumulator.clear()
+        // 释放累积槽
+        clearCalibrationLandmarkAccumulator()
 
         Log.i("FaceCapturePipeline",
             "✅ Expression calibrated with $accumulatedCount frames average landmarks")
     }
 
     /**
-     * 计算 landmarks 的平均值
+     * 把一帧 landmarks 累加到求和槽里。
+     *
+     * 只做加法，不持有列表引用；窗口内内存占用恒定。
      */
-    private fun averageLandmarks(landmarksList: List<List<Point3D>>): List<Point3D> {
-        if (landmarksList.isEmpty()) {
+    private fun accumulateCalibrationLandmarks(landmarks: List<Point3D>) {
+        if (landmarks.isEmpty()) return
+
+        if (calibrationLandmarkSumX == null) {
+            val size = landmarks.size
+            calibrationLandmarkSumX = DoubleArray(size)
+            calibrationLandmarkSumY = DoubleArray(size)
+            calibrationLandmarkSumZ = DoubleArray(size)
+        }
+
+        val sumX = calibrationLandmarkSumX ?: return
+        val sumY = calibrationLandmarkSumY ?: return
+        val sumZ = calibrationLandmarkSumZ ?: return
+
+        // 帧尺寸与首帧不一致时跳过该帧并告警：旧实现在这种情况下会在求平均时越界崩溃，
+        // 这里选择丢弃这一帧（不参与平均），不会污染基线数值。
+        if (landmarks.size != sumX.size) {
+            Log.w("FaceCapturePipeline",
+                "Skip landmark frame with mismatched size: ${landmarks.size}, expected ${sumX.size}")
+            return
+        }
+
+        val size = landmarks.size
+        for (i in 0 until size) {
+            val point = landmarks[i]
+            sumX[i] += point.x.toDouble()
+            sumY[i] += point.y.toDouble()
+            sumZ[i] += point.z.toDouble()
+        }
+        calibrationLandmarkFrameCount++
+    }
+
+    /**
+     * 由求和槽还原平均 landmarks。
+     *
+     * 数值路径与旧实现保持一致：先在 Double 中求和 → 转 Float → 再除以 Float 帧数，
+     * 因此结果与「逐帧 sumOf().toFloat() / n」逐位相同。
+     */
+    private fun averageAccumulatedLandmarks(): List<Point3D> {
+        val sumX = calibrationLandmarkSumX
+        val sumY = calibrationLandmarkSumY
+        val sumZ = calibrationLandmarkSumZ
+        if (sumX == null || sumY == null || sumZ == null || calibrationLandmarkFrameCount == 0) {
             return emptyList()
         }
-        if (landmarksList.size == 1) {
-            return landmarksList[0]
-        }
 
-        val n = landmarksList.size.toFloat()
-        val size = landmarksList[0].size
-
-        return (0 until size).map { i ->
-            val avgX = landmarksList.sumOf { it[i].x.toDouble() }.toFloat() / n
-            val avgY = landmarksList.sumOf { it[i].y.toDouble() }.toFloat() / n
-            val avgZ = landmarksList.sumOf { it[i].z.toDouble() }.toFloat() / n
-            Point3D(avgX, avgY, avgZ)
+        val n = calibrationLandmarkFrameCount.toFloat()
+        val size = sumX.size
+        val avgLandmarks = ArrayList<Point3D>(size)
+        for (i in 0 until size) {
+            val avgX = sumX[i].toFloat() / n
+            val avgY = sumY[i].toFloat() / n
+            val avgZ = sumZ[i].toFloat() / n
+            avgLandmarks.add(Point3D(avgX, avgY, avgZ))
         }
+        return avgLandmarks
+    }
+
+    /**
+     * 清空（释放）点位累积槽
+     */
+    private fun clearCalibrationLandmarkAccumulator() {
+        calibrationLandmarkFrameCount = 0
+        calibrationLandmarkSumX = null
+        calibrationLandmarkSumY = null
+        calibrationLandmarkSumZ = null
     }
 
     /**
@@ -260,7 +323,7 @@ class FaceCapturePipeline {
         calibrationRollSum = 0f
 
         // 重置累积数据
-        calibrationLandmarksAccumulator.clear()
+        clearCalibrationLandmarkAccumulator()
 
         // 重置表情提取器
         extractor.reset()
