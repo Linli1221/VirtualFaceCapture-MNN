@@ -4,6 +4,7 @@ import android.content.Context
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.util.Log
+import android.view.WindowManager
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -158,13 +159,16 @@ private fun resolveDisplayRefreshRate(context: Context): Float {
         }
     }
 
-    val metrics = try {
-        context.resources.displayMetrics.refreshRate
+    // 所有 API 级别都能用的兜底。
+    // 注意：不能用 resources.displayMetrics.refreshRate —— 它是 @hide 字段，编译期不可见。
+    val legacy = try {
+        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        windowManager?.defaultDisplay?.refreshRate
     } catch (t: Throwable) {
-        0f
+        null
     }
-    if (metrics.isFinite() && metrics > 0f) {
-        return metrics
+    if (legacy != null && legacy.isFinite() && legacy > 0f) {
+        return legacy
     }
     return 60f
 }
