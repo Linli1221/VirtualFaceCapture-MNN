@@ -4,8 +4,13 @@
 
     <!-- Camera permission for face tracking -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-feature android:name="android.hardware.camera" android:required="true" />
+    <!-- 浏览器输出（OBS 浏览器源）：在本机监听 HTTP / WebSocket，供局域网内浏览器访问 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 支持前置 / 后置 / 外接（USB）摄像头：任意摄像头即可运行，具体朝向均为可选能力 -->
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.external" android:required="false" />
 
     <application
         android:allowBackup="true"

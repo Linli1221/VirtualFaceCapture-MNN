@@ -5,23 +5,31 @@ import android.util.Log
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
-import com.live2d.demo.GLRenderer
+import com.example.virtualfacecapture.web.GlCaptureSink
 import com.live2d.demo.JniBridgeJava
 
 /**
  * Live2D View for Jetpack Compose
  * Wraps GLSurfaceView with Live2D rendering
  * 使用 Live2DModelManager 来管理模型加载
+ *
+ * @param captureSink 可选：浏览器输出（OBS）的抓帧接收方。为 null 时行为与之前完全一致，
+ *                    只是画面会多经过一次离屏 FBO + 贴回窗口（视觉上无差别）。
  */
 @Composable
 fun Live2DView(
     modifier: Modifier = Modifier,
     modelManager: Live2DModelManager,
     onModelLoadComplete: () -> Unit = {},
-    onModelLoadError: () -> Unit = {}
+    onModelLoadError: () -> Unit = {},
+    captureSink: GlCaptureSink? = null
 ) {
     var glSurfaceView: GLSurfaceView? by remember { mutableStateOf(null) }
     var isInitialized by remember { mutableStateOf(false) }
+
+    // 用 rememberUpdatedState 包一层：抓帧接收方变化时不需要重建 GLSurfaceView
+    val captureSinkState = rememberUpdatedState(captureSink)
+    val renderer = remember { Live2DCaptureRenderer { captureSinkState.value } }
     
     DisposableEffect(Unit) {
         onDispose {
@@ -66,7 +74,8 @@ fun Live2DView(
             // Create GLSurfaceView
             GLSurfaceView(context).apply {
                 setEGLContextClientVersion(2)
-                setRenderer(GLRenderer())
+                // 使用带「离屏 FBO + 抓帧」能力的渲染器；OBS 输出关闭时它等同于原 GLRenderer
+                setRenderer(renderer)
                 renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
                 
                 Log.i("Live2DView", "GLSurfaceView created with OpenGL ES 2.0")

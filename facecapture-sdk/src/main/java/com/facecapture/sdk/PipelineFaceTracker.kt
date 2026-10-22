@@ -3,6 +3,7 @@ package com.facecapture.sdk
 import android.content.Context
 import android.util.Log
 import com.example.commondata.ARKitBlendShapes
+import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.DetectionBox
 import com.example.commondata.FaceVisualizationData
 import com.example.commondata.HeadPoseData
@@ -132,6 +133,7 @@ class PipelineFaceTracker(private val context: Context) {
     private val pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val isRunning = AtomicBoolean(false)
+    @Volatile private var isInitialized = false
     private var lastHeadPose = HeadPoseData()
 
     private val trackingConfidenceDetector by lazy { TrackingConfidenceDetector() }
@@ -157,6 +159,15 @@ class PipelineFaceTracker(private val context: Context) {
     var onVisualizationUpdate: ((FaceVisualizationData) -> Unit)? = null
     var onFpsUpdate: ((Float) -> Unit)? = null
     var onCalibrationStatusUpdate: ((Boolean) -> Unit)? = null
+
+    /**
+     * Invoked when the active camera changes (initial start / camera switch).
+     *
+     * The payload is the camera actually opened; `null` means no camera could
+     * be opened. It fires on the thread that called [start] / [switchCamera]
+     * (usually the main thread), so UI updates are safe.
+     */
+    var onCameraChanged: ((CameraDeviceInfo?) -> Unit)? = null
 
     /**
      * 原子组合回调：BlendShape + HeadPose 同帧到达，专门给下游 avatar 驱动用。
@@ -248,6 +259,7 @@ class PipelineFaceTracker(private val context: Context) {
         val dumpDir = context.cacheDir.absolutePath
         faceDetector.setDumpDirectory(dumpDir)
 
+        isInitialized = true
         Log.i(TAG, "Pipeline face tracker initialized with parallel stages")
         return true
     }
@@ -330,13 +342,16 @@ class PipelineFaceTracker(private val context: Context) {
 
         camera2Manager.startCamera()
 
-        pipelineScope.launch(Dispatchers.Default) {
-            delay(500)
-            val fov = camera2Manager.cameraVerticalFovDegrees
-            faceDetector.setCameraFov(fov)
-            faceCapturePipeline.setCameraFov(fov)
-            Log.i(TAG, "Camera FOV set to face detector: $fov degrees")
-        }
+        // The selected camera is known synchronously (before the async camera
+        // open completes), so UI can update mirroring/labels immediately and
+        // the first processed frame already uses the right FOV — important when
+        // switching between cameras with different lenses.
+        onCameraChanged?.invoke(camera2Manager.selectedCameraInfo)
+
+        val fov = camera2Manager.cameraVerticalFovDegrees
+        faceDetector.setCameraFov(fov)
+        faceCapturePipeline.setCameraFov(fov)
+        Log.i(TAG, "Camera FOV set to face detector: $fov degrees")
 
         lastFpsTime = System.currentTimeMillis()
         frameCount.set(0)
@@ -360,6 +375,7 @@ class PipelineFaceTracker(private val context: Context) {
 
     fun release() {
         stop()
+        isInitialized = false
         faceDetector.release()
         pipelineScope.cancel()
         Log.i(TAG, "Pipeline face tracker released")
@@ -367,6 +383,67 @@ class PipelineFaceTracker(private val context: Context) {
 
     fun hasPermission(): Boolean = camera2Manager.hasPermission()
     fun isTracking(): Boolean = isRunning.get()
+
+    // ============================================================================
+    // Camera selection / switching
+    // ============================================================================
+
+    /** List every camera exposed by the platform (front / back / external). */
+    fun getAvailableCameras(): List<CameraDeviceInfo> = camera2Manager.getAvailableCameras()
+
+    /** Camera selected by the current / most recent session, or null before start. */
+    fun getCurrentCamera(): CameraDeviceInfo? = camera2Manager.selectedCameraInfo
+
+    /** Camera id requested for the next start, or null for automatic front-first. */
+    fun getPreferredCameraId(): String? = camera2Manager.getPreferredCameraId()
+
+    /** Select the camera used by the next [start]; takes effect on the next start. */
+    fun setPreferredCamera(cameraId: String?) {
+        camera2Manager.setPreferredCamera(cameraId)
+    }
+
+    /**
+     * Switch cameras while keeping the caller-visible tracking state.
+     *
+     * The pipeline is stopped and restarted so Camera2 releases the previous
+     * device before opening the new one. The pose / expression baseline is
+     * reset afterwards because FOV and sensor geometry usually differ between
+     * cameras (especially front ↔ back ↔ external).
+     *
+     * @return true if the camera id exists and the switch was applied.
+     */
+    fun switchCamera(cameraId: String): Boolean {
+        val target = camera2Manager.getAvailableCameras().firstOrNull { it.id == cameraId }
+        if (target == null) {
+            Log.e(TAG, "Cannot switch camera: id $cameraId is not available")
+            return false
+        }
+
+        val wasRunning = isRunning.get()
+        val alreadyActive = wasRunning && camera2Manager.selectedCameraInfo?.id == target.id
+        Log.i(TAG, "Switching camera to ${target.label} (id=${target.id}), running=$wasRunning, alreadyActive=$alreadyActive")
+        camera2Manager.setPreferredCamera(target.id)
+
+        if (alreadyActive) {
+            // Same camera selected again — keep the session, just refresh the UI.
+            onCameraChanged?.invoke(target)
+            return true
+        }
+
+        if (wasRunning) {
+            stop()
+            start()
+        } else {
+            onCameraChanged?.invoke(target)
+        }
+
+        if (isInitialized) {
+            // Fresh neutral baseline for the new camera geometry.
+            resetAdaptiveBaseline()
+        }
+        return true
+    }
+
     fun getLastHeadPose(): HeadPoseData = lastHeadPose
     fun getCurrentFps(): Float = currentFps
 

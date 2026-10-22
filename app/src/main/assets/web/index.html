@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>VirtualFaceCapture Web Output</title>
+<style>
+  /*
+   * OBS「浏览器源」页面：默认完全透明、无任何可见 UI。
+   * 注意：html / body 都不能设置不透明背景色，否则 OBS 采集不到 alpha 通道。
+   */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+    cursor: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* 满屏画布：实际像素尺寸由 JS 按 dpr 设置，CSS 尺寸始终铺满视口 */
+  #c {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+    background: transparent;
+    cursor: none;
+  }
+
+  /*
+   * 状态胶囊：只有 hud=1（或按 h）才显示，默认 display:none，断线时也不显示文字。
+   * 固定在左上角，最大宽度 46vw，不会盖住画面中心。
+   */
+  #hud {
+    display: none;
+    position: fixed;
+    left: 12px;
+    top: 12px;
+    z-index: 10;
+    align-items: center;
+    gap: 7px;
+    box-sizing: border-box;
+    max-width: 46vw;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(12, 14, 20, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: #fff;
+    font: 12px/1.35 ui-monospace, "Cascadia Mono", Consolas, Menlo, "Courier New", monospace;
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+    pointer-events: none;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+  }
+  #hud.on { display: flex; }
+
+  /* 连接状态点：绿色=已连接，红色=断开/连接中 */
+  #dot {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ff4d4f;
+  }
+  #dot.ok { background: #35d06b; }
+
+  #state { font-weight: 600; }
+  #hud .sep { opacity: 0.35; }
+  #fps, #res, #model { overflow: hidden; text-overflow: ellipsis; }
+  #model { opacity: 0.85; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<!-- 状态条（HUD）。默认隐藏；内容仅在运行时更新，hud=0 时页面上没有任何可见文字。 -->
+<div id="hud">
+  <span id="dot"></span>
+  <span id="state">连接中…</span>
+  <span class="sep">·</span>
+  <span>输出 <span id="fps">--</span> fps</span>
+  <span class="sep">·</span>
+  <span id="res">--×--</span>
+  <span class="sep">·</span>
+  <span id="model">--</span>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * 1. 解析查询参数（全部带默认值）
+   *    bg=transparent|black|white|green  默认 transparent
+   *    fit=contain|cover|stretch         默认 contain（居中不裁切）
+   *    mirror=0|1                        默认 0
+   *    hud=0|1                           默认 0
+   *    dpr=1|2|auto                      默认 auto（OBS 下建议 1）
+   * ============================================================ */
+  var params = new URLSearchParams(window.location.search);
+
+  var bgMap = {
+    transparent: null,
+    black: '#000000',
+    white: '#ffffff',
+    green: '#00ff00'
+  };
+  var bgName = (params.get('bg') || 'transparent').toLowerCase();
+  var bgColor = Object.prototype.hasOwnProperty.call(bgMap, bgName) ? bgMap[bgName] : null;
+
+  var fit = (params.get('fit') || 'contain').toLowerCase();
+  if (fit !== 'contain' && fit !== 'cover' && fit !== 'stretch') {
+    fit = 'contain';
+  }
+
+  var mirror = params.get('mirror') === '1';
+  var hudOn = params.get('hud') === '1';
+
+  var dprParam = (params.get('dpr') || 'auto').toLowerCase();
+
+  // 计算实际使用的 DPR：dpr=1/2 固定，auto 跟随设备像素比
+  function pickDpr() {
+    if (dprParam === '1') { return 1; }
+    if (dprParam === '2') { return 2; }
+    var d = window.devicePixelRatio || 1;
+    return d > 0 ? d : 1;
+  }
+  var dpr = pickDpr();
+
+  /* ============================================================
+   * 2. DOM / 画布
+   * ============================================================ */
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var hudEl = document.getElementById('hud');
+  var dotEl = document.getElementById('dot');
+  var stateEl = document.getElementById('state');
+  var fpsEl = document.getElementById('fps');
+  var resEl = document.getElementById('res');
+  var modelEl = document.getElementById('model');
+
+  // 视口尺寸（CSS 像素）；画布 backing store 尺寸 = 视口尺寸 × dpr
+  var viewW = 1;
+  var viewH = 1;
+
+  // 最近一帧解码后的位图，用于重绘 / 断线时保留最后一帧
+  var lastBmp = null;
+
+  // 服务端上报的状态（≤1Hz 文本消息）
+  var stat = { fps: null, width: null, height: null, model: null };
+
+  /* ============================================================
+   * 3. 绘制
+   * ============================================================ */
+  function computeRect(iw, ih, cw, ch) {
+    // stretch：直接铺满；contain/cover 按比例缩放并居中
+    if (fit === 'stretch') {
+      return { x: 0, y: 0, w: cw, h: ch };
+    }
+    var scale = fit === 'cover' ? Math.max(cw / iw, ch / ih) : Math.min(cw / iw, ch / ih);
+    var w = iw * scale;
+    var h = ih * scale;
+    return { x: (cw - w) / 2, y: (ch - h) / 2, w: w, h: h };
+  }
+
+  // 绘制一帧：clearRect → 可选背景色 → 按 fit 计算矩形 → drawImage（可镜像）
+  // bmp 为 null 时只画背景（启动阶段 / 断线且尚无帧）
+  function drawFrame(bmp) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (bgColor !== null) {
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    if (!bmp) { return; }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    var r = computeRect(bmp.width, bmp.height, viewW, viewH);
+
+    if (mirror) {
+      // 水平镜像：平移到右边缘后翻转 X 轴（在 CSS 像素坐标系下）
+      ctx.save();
+      ctx.translate(viewW, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(bmp, r.x, r.y, r.w, r.h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(bmp, r.x, r.y, r.w, r.h);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  function drawCurrent() {
+    drawFrame(lastBmp);
+  }
+
+  // 视口尺寸变化（OBS 调整源大小、旋转屏幕等）时重新设置画布并重绘最后一帧
+  function resize() {
+    dpr = pickDpr();
+    viewW = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    viewH = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    canvas.width = Math.max(1, Math.round(viewW * dpr));
+    canvas.height = Math.max(1, Math.round(viewH * dpr));
+    drawCurrent();
+  }
+
+  /* ============================================================
+   * 4. 解码：WebSocket 二进制帧（WebP 带 alpha 或 JPEG）
+   *    - binaryType = 'arraybuffer'
+   *    - createImageBitmap(new Blob([data]))
+   *    - 解码失败 catch，保留上一帧
+   *    - 上一帧未解码完时丢弃新帧，只保留最新一帧（低延迟）
+   * ============================================================ */
+  var decoding = false;
+  var pendingData = null;
+
+  function closeBmp(bmp) {
+    if (!bmp) { return; }
+    try {
+      if (typeof bmp.close === 'function') { bmp.close(); }
+    } catch (e) { /* 忽略释放失败 */ }
+  }
+
+  // 优先 createImageBitmap；旧环境退化为 <img> + objectURL（WebP 同样可解）
+  function decodeImage(data) {
+    if (typeof window.createImageBitmap === 'function') {
+      return window.createImageBitmap(new Blob([data]));
+    }
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(new Blob([data]));
+      var img = new Image();
+      img.onload = function () {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        reject(new Error('image decode failed'));
+      };
+      img.src = url;
+    });
+  }
+
+  function decodeAndDraw(data) {
+    decoding = true;
+    decodeImage(data).then(function (bmp) {
+      closeBmp(lastBmp);
+      lastBmp = bmp;
+      drawFrame(bmp);
+      updateHud();
+    }).catch(function () {
+      // 解码失败：丢弃该帧，保留上一帧，不显示任何文字
+    }).then(function () {
+      decoding = false;
+      if (pendingData !== null) {
+        var next = pendingData;
+        pendingData = null;
+        decodeAndDraw(next);
+      }
+    });
+  }
+
+  function onFrameData(data) {
+    if (decoding) {
+      // 正在解码上一帧：丢弃旧帧，只保留最新一帧
+      pendingData = data;
+      return;
+    }
+    decodeAndDraw(data);
+  }
+
+  /* ============================================================
+   * 5. 服务端文本消息（≤1Hz）：{"type":"status","fps":29.8,...}
+   * ============================================================ */
+  function handleTextMessage(text) {
+    var msg;
+    try {
+      msg = JSON.parse(text);
+    } catch (e) {
+      return;
+    }
+    if (!msg || msg.type !== 'status') { return; }
+
+    if (typeof msg.fps === 'number' && isFinite(msg.fps)) { stat.fps = msg.fps; }
+    if (typeof msg.width === 'number' && msg.width > 0) { stat.width = msg.width; }
+    if (typeof msg.height === 'number' && msg.height > 0) { stat.height = msg.height; }
+    if (typeof msg.model === 'string') { stat.model = msg.model; }
+    updateHud();
+  }
+
+  /* ============================================================
+   * 6. HUD 更新（只影响左上角胶囊；hud=0 时完全不可见）
+   * ============================================================ */
+  // 只在内容变化时写 DOM，避免 30fps 每帧都触发排版
+  function setText(el, value) {
+    if (el && el.textContent !== value) { el.textContent = value; }
+  }
+
+  function updateHud() {
+    setText(fpsEl, (stat.fps === null) ? '--' : String(Math.round(stat.fps * 10) / 10));
+
+    var w = stat.width;
+    var h = stat.height;
+    if ((!w || !h) && lastBmp) {
+      w = lastBmp.width;
+      h = lastBmp.height;
+    }
+    setText(resEl, (w && h) ? (w + '×' + h) : '--×--');
+    setText(modelEl, stat.model ? stat.model : '--');
+  }
+
+  function setConnState(s) {
+    if (!dotEl || !stateEl) { return; }
+    if (s === 'open') {
+      if (dotEl.className !== 'ok') { dotEl.className = 'ok'; }
+      setText(stateEl, '已连接');
+    } else if (s === 'closed') {
+      if (dotEl.className !== '') { dotEl.className = ''; }
+      setText(stateEl, '已断开，重连中…');
+    } else {
+      if (dotEl.className !== '') { dotEl.className = ''; }
+      setText(stateEl, '连接中…');
+    }
+  }
+
+  function applyHud() {
+    if (!hudEl) { return; }
+    hudEl.className = hudOn ? 'on' : '';
+  }
+
+  /* ============================================================
+   * 7. WebSocket：ws://<host>/ws
+   *    断线自动重连：0.5s 起指数退避，上限 5s
+   *    断线期间保留最后一帧，不闪白 / 不闪黑
+   * ============================================================ */
+  var ws = null;
+  var backoff = 500;          // 首次重连等待 0.5s
+  var MAX_BACKOFF = 5000;     // 上限 5s
+  var reconnectTimer = null;
+  var pingTimer = null;
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') +
+              (window.location.host || '127.0.0.1:8765') + '/ws';
+
+  function clearReconnectTimer() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function stopPing() {
+    if (pingTimer !== null) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  }
+
+  // 心跳：协议允许客户端发 {"type":"ping"}，服务端回 pong，用于保持连接
+  function startPing() {
+    stopPing();
+    pingTimer = setInterval(function () {
+      try {
+        if (ws && ws.readyState === 1) {
+          ws.send('{"type":"ping"}');
+        }
+      } catch (e) { /* 忽略发送失败 */ }
+    }, 10000);
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer !== null) { return; }
+    var wait = backoff;
+    backoff = Math.min(backoff * 2, MAX_BACKOFF);
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      connect(false);
+    }, wait);
+  }
+
+  function handleMessage(ev) {
+    var data = ev.data;
+    if (typeof data === 'string') {
+      handleTextMessage(data);
+      return;
+    }
+    if (data instanceof ArrayBuffer) {
+      onFrameData(data);
+      return;
+    }
+    // 兜底：某些实现即使设置了 binaryType 仍可能给出 Blob
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      var reader = new FileReader();
+      reader.onload = function () { onFrameData(reader.result); };
+      reader.readAsArrayBuffer(data);
+    }
+  }
+
+  function connect(force) {
+    clearReconnectTimer();
+    if (force) { backoff = 500; }
+
+    // 关闭旧连接（主动重连时避免重复连接）
+    if (ws) {
+      var old = ws;
+      ws = null;
+      stopPing();
+      try {
+        old.onopen = null;
+        old.onmessage = null;
+        old.onerror = null;
+        old.onclose = null;
+        old.close();
+      } catch (e) { /* 忽略 */ }
+    }
+
+    setConnState('connecting');
+
+    var sock;
+    try {
+      sock = new WebSocket(wsUrl);
+    } catch (e) {
+      setConnState('closed');
+      scheduleReconnect();
+      return;
+    }
+    ws = sock;
+    try {
+      sock.binaryType = 'arraybuffer';
+    } catch (e) { /* 忽略 */ }
+
+    sock.onopen = function () {
+      if (sock !== ws) { return; }
+      backoff = 500; // 连接成功后重置退避
+      setConnState('open');
+      startPing();
+    };
+
+    sock.onmessage = function (ev) {
+      if (sock !== ws) { return; }
+      handleMessage(ev);
+    };
+
+    sock.onerror = function () {
+      // 出错后浏览器通常会继续触发 onclose，统一交给 onclose 处理重连
+    };
+
+    sock.onclose = function () {
+      if (sock !== ws) { return; }
+      stopPing();
+      setConnState('closed');
+      scheduleReconnect();
+    };
+  }
+
+  /* ============================================================
+   * 8. 快捷键：h 切 HUD，m 切镜像，r 立即重连
+   *    提示只出现在 HUD 内，不在页面上打印文字
+   * ============================================================ */
+  document.addEventListener('keydown', function (ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) { return; }
+    var key = (ev.key || '').toLowerCase();
+    if (key === 'h') {
+      hudOn = !hudOn;
+      applyHud();
+      ev.preventDefault();
+    } else if (key === 'm') {
+      mirror = !mirror;
+      drawCurrent();
+      ev.preventDefault();
+    } else if (key === 'r') {
+      connect(true);
+      ev.preventDefault();
+    }
+  });
+
+  /* ============================================================
+   * 9. 初始化
+   * ============================================================ */
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  resize();            // 设置画布尺寸并绘制（此时还没有帧，只画背景/透明）
+  applyHud();          // 按 hud 参数决定胶囊是否显示
+  setConnState('connecting');
+  updateHud();
+  connect(false);      // 建立连接，之后断线自动重连
+})();
+</script>
+</body>
+</html>

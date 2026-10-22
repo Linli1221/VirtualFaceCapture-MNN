@@ -112,7 +112,10 @@ interface FaceCaptureEngine {
          * v0.1.0: the engine drives its own Camera2 capture internally —
          * after [initialize], cast the returned instance to
          * `com.facecapture.sdk.internal.FaceCaptureEngineImpl` and call
-         * `startInternalCamera()` / `stopInternalCamera()`. The
+         * `startInternalCamera()` / `stopInternalCamera()`. For multi-camera
+         * (front / back / external) enumeration and switching use the public
+         * [PipelineFaceTracker] API (`getAvailableCameras()` /
+         * `switchCamera(id)`), which is also what the demo app uses. The
          * [pushFrame] entry points are reserved for v0.2.0.
          *
          * If you need the full power-user surface today, instantiate

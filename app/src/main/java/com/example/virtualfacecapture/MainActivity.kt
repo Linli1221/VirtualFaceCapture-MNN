@@ -1,6 +1,9 @@
 package com.example.virtualfacecapture
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
@@ -27,16 +30,24 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.FaceVisualizationData
 import com.example.commondata.HeadPoseData
 import com.example.virtualfacecapture.ui.theme.Live2DFacePipelineTheme
 import com.example.commondata.ARKitBlendShapes
+import com.example.virtualfacecapture.web.WebOutputManager
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
+
+private const val CAMERA_PREFS_NAME = "face_capture_prefs"
+private const val KEY_PREFERRED_CAMERA_ID = "preferred_camera_id"
 
 class MainActivity : ComponentActivity() {
     
@@ -45,6 +56,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var modelManager: Live2DModelManager
     // Live2D 适配器：把面捕输出转成 JniBridgeJava 调用，是面捕↔Live2D 的唯一桥梁
     private val live2DAvatarAdapter = Live2DAvatarAdapter()
+    // 浏览器输出（OBS 浏览器源）：把 Live2D 渲染结果推到局域网给浏览器
+    private lateinit var webOutput: WebOutputManager
     private var isTracking = mutableStateOf(false)
     
     private val requestPermissionLauncher = registerForActivityResult(
@@ -80,6 +93,13 @@ class MainActivity : ComponentActivity() {
         // Initialize face tracker (using pipeline for parallel processing)
         faceTracker = PipelineFaceTracker(this)
 
+        // 恢复上次选择的摄像头（如果该 id 在本次开机后不存在，相机会自动回退到默认前置）
+        val cameraPrefs = getSharedPreferences(CAMERA_PREFS_NAME, MODE_PRIVATE)
+        faceTracker.setPreferredCamera(cameraPrefs.getString(KEY_PREFERRED_CAMERA_ID, null))
+
+        // 浏览器输出（OBS）：默认关闭，用户可在控制面板里开启
+        webOutput = WebOutputManager(this)
+
         // 把面捕输出接到 Live2D 适配器。这是 app 模块里唯一的"面捕→Live2D"桥接点，
         // PipelineFaceTracker 本身不再依赖 JniBridgeJava，可独立打入 facecapture-sdk AAR。
         faceTracker.onFaceCaptureFrame = { blendShapes, headPose ->
@@ -99,7 +119,8 @@ class MainActivity : ComponentActivity() {
                     faceTracker = faceTracker,
                     modelManager = modelManager,
                     avatarAdapter = live2DAvatarAdapter,
-                    isTracking = isTracking
+                    isTracking = isTracking,
+                    webOutput = webOutput
                 )
             }
         }
@@ -121,6 +142,7 @@ class MainActivity : ComponentActivity() {
     
     override fun onDestroy() {
         super.onDestroy()
+        webOutput.dispose()
         faceTracker.release()
     }
     
@@ -147,7 +169,8 @@ fun FaceCapturePipelineScreen(
     faceTracker: PipelineFaceTracker,
     modelManager: Live2DModelManager,
     avatarAdapter: Live2DAvatarAdapter,
-    isTracking: MutableState<Boolean>
+    isTracking: MutableState<Boolean>,
+    webOutput: WebOutputManager
 ) {
     var fps by remember { mutableStateOf(0f) }
     var currentBlendShapes by remember { mutableStateOf<ARKitBlendShapes?>(null) }
@@ -156,6 +179,11 @@ fun FaceCapturePipelineScreen(
     var showDebug by remember { mutableStateOf(true) }
     var showCameraPreview by remember { mutableStateOf(false) }
     var showModelSelector by remember { mutableStateOf(false) }
+    var showWebOutputDialog by remember { mutableStateOf(false) }
+    var showCameraSelectorDialog by remember { mutableStateOf(false) }
+    var availableCameras by remember { mutableStateOf<List<CameraDeviceInfo>>(emptyList()) }
+    var currentCamera by remember { mutableStateOf<CameraDeviceInfo?>(null) }
+    val context = LocalContext.current
     var blinkCurveEnabled by remember { mutableStateOf(faceTracker.blinkCurveProcessor.isEnabled) }
     var blinkSpeedScale by remember { mutableStateOf(faceTracker.blinkCurveProcessor.blinkSpeedScale) }
     var availableModels by remember { mutableStateOf<List<Live2DModelManager.ModelInfo>>(emptyList()) }
@@ -197,10 +225,28 @@ fun FaceCapturePipelineScreen(
         faceTracker.onCalibrationStatusUpdate = { calibrating ->
             isCalibrating = calibrating
         }
+
+        faceTracker.onCameraChanged = { camera ->
+            currentCamera = camera
+            // 前置预览习惯性镜像，后置 / 外接相机保持真实方向
+            cameraPreviewView?.mirrorHorizontal = camera?.isFrontFacing ?: true
+        }
         
         // Load available models
         availableModels = modelManager.getAvailableModels()
         currentModel = modelManager.getCurrentModel()
+
+        // 摄像头列表 + 初始选中项（用于在 Start 之前就显示正确的标签/镜像）
+        availableCameras = faceTracker.getAvailableCameras()
+        currentCamera = faceTracker.getCurrentCamera()
+            ?: availableCameras.firstOrNull { it.id == faceTracker.getPreferredCameraId() }
+            ?: availableCameras.firstOrNull { it.isFrontFacing }
+            ?: availableCameras.firstOrNull()
+    }
+
+    // 把当前模型名同步给浏览器输出的状态栏（/status 与网页 HUD 用）
+    LaunchedEffect(currentModel) {
+        webOutput.modelName.value = currentModel?.name ?: ""
     }
     
     // Clean up camera preview callback when not showing
@@ -208,6 +254,11 @@ fun FaceCapturePipelineScreen(
         if (!showCameraPreview) {
             cameraPreviewView?.clear()
         }
+    }
+
+    // 摄像头切换后同步预览镜像方向（前置镜像、后置/外接不镜像）
+    LaunchedEffect(currentCamera) {
+        cameraPreviewView?.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -221,7 +272,7 @@ fun FaceCapturePipelineScreen(
                         it.drawLandmarks = true
                         it.drawDetectionBox = true
                         it.drawKeyPoints = true
-                        it.mirrorHorizontal = true
+                        it.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
                     }
                 },
                 modifier = Modifier.fillMaxSize()
@@ -237,7 +288,8 @@ fun FaceCapturePipelineScreen(
                 },
                 onModelLoadError = {
                     Log.e("FaceCapturePipeline", "✗ Failed to load Live2D model in UI")
-                }
+                },
+                captureSink = webOutput
             )
         }
         
@@ -289,6 +341,47 @@ fun FaceCapturePipelineScreen(
             )
         }
         
+        // 浏览器输出（OBS）设置对话框
+        if (showWebOutputDialog) {
+            WebOutputDialog(
+                manager = webOutput,
+                onDismiss = { showWebOutputDialog = false }
+            )
+        }
+
+        // 多摄像头选择对话框
+        if (showCameraSelectorDialog) {
+            CameraSelectorDialog(
+                cameras = availableCameras,
+                currentCameraId = currentCamera?.id ?: faceTracker.getPreferredCameraId(),
+                onCameraSelected = { camera ->
+                    showCameraSelectorDialog = false
+                    scope.launch {
+                        val wasTracking = isTracking.value
+                        val switched = faceTracker.switchCamera(camera.id)
+                        if (switched) {
+                            currentCamera = camera
+                            context.getSharedPreferences(CAMERA_PREFS_NAME, MODE_PRIVATE)
+                                .edit()
+                                .putString(KEY_PREFERRED_CAMERA_ID, camera.id)
+                                .apply()
+                            // 相机几何 / FOV 变了，重置 avatar 归一化窗口等待重新校准
+                            avatarAdapter.reset()
+                            Log.i(
+                                "FaceCapturePipeline",
+                                "Camera switched to ${camera.label} (${camera.id}), " +
+                                    "wasTracking=$wasTracking"
+                            )
+                        } else {
+                            Log.e("FaceCapturePipeline", "Failed to switch camera to ${camera.id}")
+                            availableCameras = faceTracker.getAvailableCameras()
+                        }
+                    }
+                },
+                onDismiss = { showCameraSelectorDialog = false }
+            )
+        }
+
         // Control panel - 底部可折叠面板（向下隐藏）
         Column(
             modifier = Modifier
@@ -339,6 +432,15 @@ fun FaceCapturePipelineScreen(
                     showDebug = showDebug,
                     showCameraPreview = showCameraPreview,
                     currentModelName = currentModel?.name ?: "Loading...",
+                    currentCameraName = currentCamera?.label ?: "Auto",
+                    webOutputEnabled = webOutput.isRunning.value,
+                    onOpenCameraSelector = {
+                        availableCameras = faceTracker.getAvailableCameras()
+                        showCameraSelectorDialog = true
+                    },
+                    onOpenWebOutput = {
+                        showWebOutputDialog = true
+                    },
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
@@ -441,6 +543,12 @@ fun DebugOverlay(
                         text = if (showCameraPreview) "View: Camera" else "View: Live2D",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Magenta
+                    )
+
+                    Text(
+                        text = "Camera: ${faceTracker.getCurrentCamera()?.label ?: "Auto"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Cyan
                     )
                 }
                 
@@ -671,8 +779,10 @@ fun ControlPanel(
     showDebug: Boolean,
     showCameraPreview: Boolean,
     currentModelName: String,
+    currentCameraName: String,
     blinkCurveEnabled: Boolean,
     blinkSpeedScale: Float,
+    webOutputEnabled: Boolean,
     onToggleTracking: () -> Unit,
     onToggleDebug: () -> Unit,
     onToggleCameraPreview: () -> Unit,
@@ -680,6 +790,8 @@ fun ControlPanel(
     onResetBaseline: () -> Unit,
     onToggleBlinkCurve: () -> Unit,
     onBlinkSpeedChange: (Float) -> Unit,
+    onOpenCameraSelector: () -> Unit,
+    onOpenWebOutput: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -785,6 +897,42 @@ fun ControlPanel(
                 }
             }
 
+            // Control buttons - fourth row：摄像头选择 + 浏览器输出（OBS 浏览器源）
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = onOpenCameraSelector,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = "Camera: $currentCameraName",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Button(
+                    onClick = onOpenWebOutput,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (webOutputEnabled)
+                            Color(0xFF2196F3)   // 运行中：蓝色
+                        else
+                            MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = if (webOutputEnabled) "Web Output: ON" else "Web Output",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
             // 眨眼速度滑块（仅在 Blink Curve 启用时显示）
             if (blinkCurveEnabled) {
                 Column {
@@ -881,4 +1029,210 @@ fun ModelSelectorDialog(
             }
         }
     )
+}
+
+/**
+ * 多摄像头选择对话框。
+ *
+ * 列出 Camera2 暴露的全部摄像头（前置 / 后置 / 逻辑多摄 / 外接 USB 摄像头），
+ * 选择后若正在追踪会原地重启采集管线而不改变追踪开关状态。
+ */
+@Composable
+fun CameraSelectorDialog(
+    cameras: List<CameraDeviceInfo>,
+    currentCameraId: String?,
+    onCameraSelected: (CameraDeviceInfo) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Select Camera") },
+        text = {
+            if (cameras.isEmpty()) {
+                Text(
+                    text = "No camera found. Check the camera permission and try again.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error
+                )
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(cameras) { camera ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onCameraSelected(camera) }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = camera.id == currentCameraId,
+                                onClick = { onCameraSelected(camera) }
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = camera.label,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                                Text(
+                                    text = "ID ${camera.id} · sensor ${camera.sensorOrientation}° · " +
+                                        "FOV %.0f°".format(camera.verticalFovDegrees),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
+}
+
+/** 「浏览器输出」可选高度（px）。 */
+private val WEB_OUTPUT_HEIGHTS = listOf(360, 480, 640, 720, 1080)
+
+/**
+ * 浏览器输出（OBS 浏览器源）设置对话框。
+ *
+ * 打开后在浏览器 / OBS 里访问 `http://<手机IP>:8765/` 即可看到 Live2D 画面，
+ * 页面默认透明背景，可直接作为 OBS 的浏览器源叠加到画面上。
+ */
+@Composable
+fun WebOutputDialog(
+    manager: WebOutputManager,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val running = manager.isRunning.value
+    val clients = manager.clientCount.value
+    val outputFps = manager.outputFps.value
+    val error = manager.errorMessage.value
+    val captureHeight = manager.captureHeight.value
+    val targetFps = manager.targetFps.value
+    val quality = manager.quality.value
+    val urls = remember(running) { manager.lanUrls() }
+    val heightIndex = WEB_OUTPUT_HEIGHTS.indexOf(captureHeight).coerceAtLeast(0)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("浏览器输出 (OBS)") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = if (running) {
+                        "状态：运行中 · 客户端 $clients · 输出 %.0f fps".format(outputFps)
+                    } else {
+                        "状态：已停止"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (running) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (urls.isEmpty()) {
+                    Text(
+                        text = "未找到局域网地址，请先连接 Wi-Fi / 热点",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                } else {
+                    urls.forEach { url ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = url,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF2196F3),
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = { copyToClipboard(context, url) }) {
+                                Text("复制")
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = { if (manager.isRunning.value) manager.stop() else manager.start() },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (running)
+                            MaterialTheme.colorScheme.error
+                        else
+                            Color(0xFF2196F3)
+                    )
+                ) {
+                    Text(if (running) "停止输出" else "启动输出")
+                }
+
+                error?.let {
+                    Text(
+                        text = "启动失败：$it",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+
+                Text(
+                    text = "输出高度：$captureHeight px",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = heightIndex.toFloat(),
+                    onValueChange = { value ->
+                        val index = value.roundToInt().coerceIn(0, WEB_OUTPUT_HEIGHTS.lastIndex)
+                        manager.captureHeight.value = WEB_OUTPUT_HEIGHTS[index]
+                    },
+                    valueRange = 0f..(WEB_OUTPUT_HEIGHTS.size - 1).toFloat(),
+                    steps = WEB_OUTPUT_HEIGHTS.size - 2
+                )
+
+                Text(
+                    text = "输出帧率：$targetFps fps",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = targetFps.toFloat(),
+                    onValueChange = { manager.targetFps.value = it.roundToInt() },
+                    valueRange = 15f..60f,
+                    steps = 8
+                )
+
+                Text(
+                    text = "编码质量：$quality",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = quality.toFloat(),
+                    onValueChange = { manager.quality.value = it.roundToInt() },
+                    valueRange = 40f..95f,
+                    steps = 10
+                )
+
+                Text(
+                    text = "提示：手机与电脑需在同一局域网；输出期间请保持 App 在前台。" +
+                        "OBS → 来源 → 浏览器，URL 填上面的地址，页面默认透明背景。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭")
+            }
+        }
+    )
+}
+
+private fun copyToClipboard(context: Context, text: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText("VirtualFaceCapture", text))
 }

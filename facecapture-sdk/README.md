@@ -12,13 +12,14 @@
 |--------------------------|-----------------------------------------------------------------------------------------|-----------------------------|
 | Native inference         | `libMNN.so`, `libMNN_Express.so`, `libmediapipefacelandmark.so`, `face_*.mnn` models    | `:MediapipeFaceLandmark`    |
 | Post-processing          | ARKit-52 BlendShape extraction, head-pose recovery, blink-curve, smoothing, calibration | `:OpenSeeFaceProcess`       |
-| Shared data types        | `Point3D`, `ARKitBlendShapes`, `HeadPose`, `FaceKeyPoints`, `FaceLandmarkIndices`, …    | `:CommonData`               |
+| Shared data types        | `Point3D`, `ARKitBlendShapes`, `HeadPose`, `FaceKeyPoints`, `FaceLandmarkIndices`, `CameraDeviceInfo`, … | `:CommonData`               |
 | Public facade            | `FaceCaptureEngine` interface + `FaceCaptureConfig` + `CameraFrame` + `FaceCaptureResult` | `:facecapture-sdk` (this)   |
 
 What it intentionally **does not** ship:
 - Live2D Cubism renderer (lives in `:Live2D`).
-- Camera2/CameraX wiring (`Camera2Manager` is currently in the inference
-  module but the SDK contract is camera-agnostic — see §4).
+- CameraX / external capture wiring — the AAR bundles its own Camera2 capture
+  (including multi-camera selection, see §4.1), and the `pushFrame` contract
+  remains camera-agnostic for custom capture stacks.
 - ARKit→Live2D parameter mapping (UI/demo code, lives in `:app`).
 
 ---
@@ -98,6 +99,48 @@ Two equivalent input paths are exposed:
 > CPU tensors, so a GL texture would round-trip through `glReadPixels` anyway.
 > If you have a GL texture, the cheapest route is to feed CameraX an
 > `ImageAnalysis` use-case in parallel with your `Preview` use-case.
+
+### 4.1 Bundled Camera2 capture & multi-camera selection
+
+`PipelineFaceTracker` (and the internal-camera mode of `FaceCaptureEngineImpl`)
+can enumerate and switch cameras at runtime:
+
+```kotlin
+// All front / back / logical / external cameras on the device.
+val cameras: List<CameraDeviceInfo> = tracker.getAvailableCameras()
+
+cameras.forEach { cam ->
+    Log.i("Camera", "${cam.label} id=${cam.id} fov=${cam.verticalFovDegrees}")
+}
+
+// Switch at runtime. If tracking, the capture pipeline restarts in place and
+// the pose/expression baseline is reset (FOV and sensor geometry differ).
+tracker.switchCamera(cameras.first { it.isBackFacing }.id)
+
+// The active camera is reported after every start / switch.
+tracker.onCameraChanged = { camera -> /* camera?.label, camera?.isFrontFacing */ }
+```
+
+Key points:
+- Front camera is preferred by default; back / external are used when no front
+  camera exists, preserving single-camera behavior.
+- Rotation, vertical FOV, preview mirroring and AF / FPS capability probing are
+  recalculated per camera inside `Camera2Manager`.
+- The selection is only a preference: pass a stale id and it safely falls back
+  to the automatic choice.
+- Only one camera stream is active at a time; concurrent multi-camera capture
+  is not part of this API.
+
+The same operations are available on the public `PipelineFaceTracker`
+export without any internal cast:
+
+```kotlin
+val tracker = PipelineFaceTracker(context)
+tracker.initialize()
+tracker.getAvailableCameras()
+tracker.getCurrentCamera()
+tracker.switchCamera(cameraId)
+```
 
 ---
 

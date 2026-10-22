@@ -14,6 +14,8 @@ import android.util.Size
 import android.view.Surface
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
+import com.example.commondata.CameraDeviceInfo
+import com.example.commondata.CameraLensFacing
 import java.nio.ByteBuffer
 
 /**
@@ -35,9 +37,16 @@ data class YuvFrameData(
 )
 
 /**
- * Camera2 Manager for capturing front-facing camera frames
- * Provides RGB frame data for MediaPipe face detection
- * Also supports direct YUV output for zero-copy processing
+ * Camera2 Manager for capturing camera frames.
+ *
+ * Supports **any** camera exposed by [CameraManager] — front, back, logical
+ * multi-cameras and external (USB / capture-card) cameras. The caller can list
+ * the available devices via [getAvailableCameras], pick one with
+ * [setPreferredCamera], and the manager recalculates the sensor orientation,
+ * field of view and rotation formula for that specific device.
+ *
+ * Provides RGB frame data for MediaPipe face detection and direct YUV output
+ * for zero-copy processing.
  */
 class Camera2Manager(private val context: Context) {
     
@@ -46,6 +55,27 @@ class Camera2Manager(private val context: Context) {
     private var imageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+
+    // Characteristics of the camera currently being opened. Needed when
+    // building the CaptureRequest (AF / FPS capabilities differ per device).
+    private var cameraCharacteristics: CameraCharacteristics? = null
+
+    // LENS_FACING_* of the selected camera (front / back / external).
+    @Volatile private var lensFacing: Int = CameraCharacteristics.LENS_FACING_FRONT
+
+    // Camera id the caller asked for ("null" = automatic front-first choice).
+    @Volatile private var preferredCameraId: String? = null
+
+    /**
+     * Metadata of the camera selected by the most recent [startCamera] call.
+     * Set synchronously before the asynchronous `openCamera` callback runs, so
+     * callers can update their UI right after start / switch.
+     */
+    @Volatile var selectedCameraInfo: CameraDeviceInfo? = null
+        private set
+
+    /** Id of the currently selected camera, or null before the first start. */
+    val selectedCameraId: String? get() = selectedCameraInfo?.id
     
     // Legacy RGB callback (with YUV->RGB conversion)
     private var frameCallback: ((ByteBuffer, Int, Int) -> Unit)? = null
@@ -69,7 +99,6 @@ class Camera2Manager(private val context: Context) {
 
     companion object {
         private const val TAG = "Camera2Manager"
-        private const val CAMERA_FACING = CameraCharacteristics.LENS_FACING_FRONT
         
         // Model input dimensions for reference
         // - Face Detection: 128x128
@@ -94,7 +123,82 @@ class Camera2Manager(private val context: Context) {
             Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
     }
-    
+
+    /**
+     * List every camera reported by the platform.
+     *
+     * The list covers front / back cameras, logical multi-cameras and external
+     * cameras such as USB webcams or capture cards. Entries are sorted front →
+     * back → external so the default (front-first) ordering is predictable.
+     *
+     * Device capabilities are read per camera here; cameras that cannot be
+     * queried are skipped instead of failing the whole enumeration.
+     */
+    fun getAvailableCameras(): List<CameraDeviceInfo> {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return emptyList()
+
+        val ids = try {
+            manager.cameraIdList
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to enumerate cameras: ${e.message}")
+            return emptyList()
+        }
+
+        val raw = mutableListOf<CameraDeviceInfo>()
+        for (id in ids) {
+            try {
+                val characteristics = manager.getCameraCharacteristics(id)
+                raw += CameraDeviceInfo(
+                    id = id,
+                    lensFacing = mapLensFacing(characteristics.get(CameraCharacteristics.LENS_FACING)),
+                    // Filled in below once we know how many cameras share a facing.
+                    label = "",
+                    sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
+                    verticalFovDegrees = calculateFovDegrees(characteristics),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Skipping camera $id: ${e.message}")
+            }
+        }
+
+        val facingCounts = raw.groupingBy { it.lensFacing }.eachCount()
+        val facingSeen = mutableMapOf<CameraLensFacing, Int>()
+        val labelled = raw.map { info ->
+            val index = (facingSeen[info.lensFacing] ?: 0) + 1
+            facingSeen[info.lensFacing] = index
+            val base = when (info.lensFacing) {
+                CameraLensFacing.FRONT -> "Front"
+                CameraLensFacing.BACK -> "Back"
+                CameraLensFacing.EXTERNAL -> "External"
+                CameraLensFacing.UNKNOWN -> "Camera"
+            }
+            info.copy(
+                label = if ((facingCounts[info.lensFacing] ?: 0) > 1) "$base $index" else base,
+            )
+        }
+
+        return labelled.sortedWith(
+            compareBy({ facingPriority(it.lensFacing) }, { it.id }),
+        )
+    }
+
+    /**
+     * Choose the camera used by the next [startCamera] call.
+     *
+     * @param cameraId a [CameraDeviceInfo.id] from [getAvailableCameras], or
+     *                 `null` to fall back to the automatic front-first choice.
+     *                 The id is validated only when the camera is opened, so
+     *                 stale ids from a previous device simply fall back to auto.
+     */
+    fun setPreferredCamera(cameraId: String?) {
+        preferredCameraId = cameraId
+        Log.i(TAG, "Preferred camera: ${cameraId ?: "auto (front-first)"}")
+    }
+
+    /** Camera id requested via [setPreferredCamera], or null for automatic choice. */
+    fun getPreferredCameraId(): String? = preferredCameraId
+
     /**
      * Set callback for frame processing (legacy RGB mode)
      * The callback receives rotated RGB data
@@ -116,14 +220,25 @@ class Camera2Manager(private val context: Context) {
     }
     
     /**
-     * Start camera capture
+     * Start camera capture using the preferred camera (see [setPreferredCamera]).
+     *
+     * If no preference is set (or it is no longer present), the first front
+     * camera is used, then back, then external — so existing behavior is
+     * preserved on single-camera phones.
      */
     fun startCamera() {
         if (!hasPermission()) {
             Log.e(TAG, "Camera permission not granted")
             return
         }
-        
+
+        // Guard against double-start (e.g. rapid Start taps or a switch while
+        // the previous session is still tearing down).
+        if (backgroundThread != null || cameraDevice != null) {
+            Log.w(TAG, "Camera already started, releasing the previous session first")
+            stopCamera()
+        }
+
         startBackgroundThread()
         openCamera()
     }
@@ -165,29 +280,38 @@ class Camera2Manager(private val context: Context) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         
         try {
-            val cameraId = getCameraId(manager) ?: run {
-                Log.e(TAG, "No front-facing camera found")
+            val cameras = getAvailableCameras()
+            val info = chooseCamera(cameras) ?: run {
+                Log.e(TAG, "No camera available on this device")
                 return
             }
-            
-            val characteristics = manager.getCameraCharacteristics(cameraId)
-            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            
-            // Get sensor orientation from camera characteristics
-            sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-            Log.i(TAG, "Camera sensor orientation: $sensorOrientation degrees")
-            
-            // Calculate vertical FOV from camera characteristics
-            calculateCameraFov(characteristics)
-            Log.i(TAG, "Camera vertical FOV: $cameraVerticalFovDegrees degrees")
 
-            // Choose optimal preview size
+            val characteristics = manager.getCameraCharacteristics(info.id)
+            cameraCharacteristics = characteristics
+
+            // Remember the device we actually opened so callers can react
+            // synchronously (preview mirroring, debug HUD, camera picker).
+            selectedCameraInfo = info
+            lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                ?: CameraCharacteristics.LENS_FACING_FRONT
+            sensorOrientation = info.sensorOrientation
+            cameraVerticalFovDegrees = info.verticalFovDegrees
+
+            Log.i(
+                TAG,
+                "Camera selected: ${info.label} (id=${info.id}), sensor=$sensorOrientation°, " +
+                    "fov=$cameraVerticalFovDegrees°"
+            )
+
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+
+            // Choose optimal preview size for this camera
             val previewSize = chooseOptimalSize(
                 map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
             )
-            
+
             Log.i(TAG, "Selected preview size: ${previewSize.width}x${previewSize.height}")
-            
+
             // Create ImageReader for frame capture
             // Use 4 buffers to prevent frame drops when processing takes longer
             imageReader = ImageReader.newInstance(
@@ -198,51 +322,80 @@ class Camera2Manager(private val context: Context) {
             ).apply {
                 setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             }
-            
-            manager.openCamera(cameraId, stateCallback, backgroundHandler)
-            
+
+            manager.openCamera(info.id, stateCallback, backgroundHandler)
+
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error opening camera", e)
         } catch (e: SecurityException) {
             Log.e(TAG, "Camera permission denied", e)
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "Camera configuration rejected", e)
         }
     }
-    
-    private fun getCameraId(manager: CameraManager): String? {
-        return manager.cameraIdList.find { id ->
-            val characteristics = manager.getCameraCharacteristics(id)
-            characteristics.get(CameraCharacteristics.LENS_FACING) == CAMERA_FACING
-        }
-    }
-    
-    /**
-     * Calculate vertical FOV from camera characteristics
-     * Uses focal length and sensor physical size
-     */
-    private fun calculateCameraFov(characteristics: CameraCharacteristics) {
-        try {
-            // Get physical sensor size
-            val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
 
-            // Get focal lengths (use first available)
-            val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+    /**
+     * Resolve the camera to open: explicit preference first, then front, back,
+     * external. A stale preference (camera unplugged / different device) is
+     * ignored with a warning.
+     */
+    private fun chooseCamera(cameras: List<CameraDeviceInfo>): CameraDeviceInfo? {
+        if (cameras.isEmpty()) return null
+
+        val preferred = preferredCameraId
+        if (preferred != null) {
+            val match = cameras.firstOrNull { it.id == preferred }
+            if (match != null) return match
+            Log.w(TAG, "Preferred camera $preferred is unavailable, falling back to auto")
+        }
+
+        return cameras.firstOrNull { it.isFrontFacing }
+            ?: cameras.firstOrNull { it.isBackFacing }
+            ?: cameras.first()
+    }
+
+    private fun facingPriority(facing: CameraLensFacing): Int = when (facing) {
+        CameraLensFacing.FRONT -> 0
+        CameraLensFacing.BACK -> 1
+        CameraLensFacing.EXTERNAL -> 2
+        CameraLensFacing.UNKNOWN -> 3
+    }
+
+    private fun mapLensFacing(raw: Int?): CameraLensFacing = when (raw) {
+        CameraCharacteristics.LENS_FACING_FRONT -> CameraLensFacing.FRONT
+        CameraCharacteristics.LENS_FACING_BACK -> CameraLensFacing.BACK
+        CameraCharacteristics.LENS_FACING_EXTERNAL -> CameraLensFacing.EXTERNAL
+        else -> CameraLensFacing.UNKNOWN
+    }
+
+    /**
+     * Calculate vertical FOV from camera characteristics.
+     * Uses focal length and physical sensor height; falls back to 63° when the
+     * camera does not report those fields (common for some external cameras).
+     */
+    private fun calculateFovDegrees(characteristics: CameraCharacteristics): Float {
+        return try {
+            val sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val focalLengths =
+                characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
 
             if (sensorSize != null && focalLengths != null && focalLengths.isNotEmpty()) {
-                val sensorHeight = sensorSize.height // Physical sensor height in mm
-                val focalLength = focalLengths[0] // Focal length in mm
+                val sensorHeight = sensorSize.height
+                val focalLength = focalLengths[0]
 
-                // Calculate vertical FOV using formula: FOV = 2 * atan(sensorHeight / (2 * focalLength))
-                val fovRadians = 2.0 * kotlin.math.atan((sensorHeight / (2.0 * focalLength)).toDouble())
-                cameraVerticalFovDegrees = Math.toDegrees(fovRadians).toFloat()
-
-                Log.i(TAG, "Camera FOV calculation: sensorHeight=${sensorHeight}mm, " +
-                        "focalLength=${focalLength}mm, verticalFOV=${cameraVerticalFovDegrees}°")
+                if (sensorHeight > 0f && focalLength > 0f) {
+                    val fovRadians =
+                        2.0 * kotlin.math.atan((sensorHeight / (2.0 * focalLength)).toDouble())
+                    Math.toDegrees(fovRadians).toFloat()
+                } else {
+                    63.0f
+                }
             } else {
-                Log.w(TAG, "Could not get camera sensor info, using default FOV: $cameraVerticalFovDegrees°")
+                63.0f
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error calculating camera FOV: ${e.message}")
-            // Keep default value
+            Log.w(TAG, "Error calculating camera FOV: ${e.message}")
+            63.0f
         }
     }
 
@@ -385,11 +538,7 @@ class Camera2Manager(private val context: Context) {
                 CameraDevice.TEMPLATE_PREVIEW
             ).apply {
                 addTarget(surface)
-                // Set auto-focus and auto-exposure for better face detection
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                // Request high frame rate (target 30-60 FPS)
-                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 60))
+                applyCaptureRequestTuning(this)
             }
             
             camera.createCaptureSession(
@@ -420,6 +569,43 @@ class Camera2Manager(private val context: Context) {
             
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error creating capture session", e)
+        }
+    }
+
+    /**
+     * Tune auto-focus / exposure / frame rate for the selected camera.
+     *
+     * Device capabilities differ a lot — external UVC cameras often do not
+     * support CONTINUOUS_PICTURE autofocus, and the 30-60 FPS range is not
+     * universal. Probe the characteristics first and only apply values the
+     * camera actually advertises, otherwise session configuration can fail.
+     */
+    private fun applyCaptureRequestTuning(builder: CaptureRequest.Builder) {
+        val characteristics = cameraCharacteristics
+
+        val aeModes = characteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
+        if (aeModes == null || aeModes.contains(CaptureRequest.CONTROL_AE_MODE_ON)) {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        }
+
+        val afModes = characteristics?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+        if (afModes == null || afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
+            builder.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            )
+        }
+
+        val fpsRanges = characteristics
+            ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        if (fpsRanges == null || fpsRanges.isEmpty()) {
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 60))
+        } else {
+            // Prefer the highest upper bound while still starting at <= 30 FPS
+            // (30-60 on phones, 30-30 on cameras that cap at 30, etc.).
+            val chosen = fpsRanges.filter { it.lower <= 30 }.maxByOrNull { it.upper }
+                ?: fpsRanges.maxByOrNull { it.upper }
+            chosen?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
         }
     }
     
@@ -556,14 +742,21 @@ class Camera2Manager(private val context: Context) {
     }
     
     /**
-     * Calculate the rotation needed to convert camera output to portrait orientation
-     * For front camera, the sensor orientation and display rotation combine differently
+     * Calculate the clockwise rotation needed to make the camera frame upright.
+     *
+     * The formula depends on the lens facing:
+     *  - front:    (sensor + displayRotation) % 360  — the preview is mirrored,
+     *              so the mirrored-rotation convention is used here;
+     *  - back:     (sensor - displayRotation + 360) % 360;
+     *  - external: sensor orientation only — a USB camera is physically fixed
+     *              to its own body, display rotation does not apply;
+     *  - unknown:  back-camera formula as the generic fallback.
      */
     private fun getRotationDegrees(): Int {
         val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         @Suppress("DEPRECATION")
         val displayRotation = windowManager.defaultDisplay.rotation
-        
+
         val deviceRotation = when (displayRotation) {
             Surface.ROTATION_0 -> 0
             Surface.ROTATION_90 -> 90
@@ -571,15 +764,12 @@ class Camera2Manager(private val context: Context) {
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-        
-        // For front camera:
-        // The image needs to be rotated to account for sensor orientation
-        // Formula for front camera: (sensorOrientation - deviceRotation + 360) % 360
-        // But since we also mirror the image, we use: (sensorOrientation + deviceRotation) % 360
-        // 
-        // However, based on dump result needing counter-clockwise 90° rotation,
-        // if sensorOrientation is 270 and deviceRotation is 0, we need rotation = 270
-        val rotation = (sensorOrientation + deviceRotation) % 360
+
+        val rotation = when (lensFacing) {
+            CameraCharacteristics.LENS_FACING_FRONT -> (sensorOrientation + deviceRotation) % 360
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> sensorOrientation % 360
+            else -> (sensorOrientation - deviceRotation + 360) % 360
+        }
         return rotation
     }
     

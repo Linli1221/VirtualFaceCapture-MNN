@@ -2,6 +2,7 @@ package com.facecapture.sdk.internal
 
 import android.content.Context
 import android.media.Image
+import com.example.commondata.CameraDeviceInfo
 import com.facecapture.sdk.CameraFrame
 import com.facecapture.sdk.FaceCaptureConfig
 import com.facecapture.sdk.FaceCaptureEngine
@@ -13,9 +14,10 @@ import java.util.concurrent.atomic.AtomicLong
  * Default [FaceCaptureEngine] implementation.
  *
  * v0.1.0 wraps the bundled [PipelineFaceTracker] in its **internal camera**
- * mode — the engine opens the front camera via the bundled `Camera2Manager`
- * and dispatches frames internally. The [pushFrame] entry points are
- * therefore not used in this release and will throw.
+ * mode — the engine opens a camera via the bundled `Camera2Manager` (front
+ * camera by default, or the device picked with [switchCamera]) and dispatches
+ * frames internally. The [pushFrame] entry points are therefore not used in
+ * this release and will throw.
  *
  * In v0.2.0+ this class will gain a "push" mode that bypasses the internal
  * camera and feeds the pipeline from user-supplied `CameraFrame` /
@@ -122,4 +124,22 @@ internal class FaceCaptureEngineImpl : FaceCaptureEngine {
     fun stopInternalCamera() {
         underlying?.stop()
     }
+
+    /**
+     * List all cameras reported by the platform (front / back / external).
+     * Empty before [initialize] or when camera enumeration is unavailable.
+     */
+    fun listAvailableCameras(): List<CameraDeviceInfo> =
+        underlying?.getAvailableCameras() ?: emptyList()
+
+    /** Camera used by the internal capture, or null before the first start. */
+    fun currentCamera(): CameraDeviceInfo? = underlying?.getCurrentCamera()
+
+    /**
+     * Switch the internal camera, restarting capture if it is running.
+     *
+     * @return false when the id is unknown — call [listAvailableCameras] first.
+     */
+    fun switchCamera(cameraId: String): Boolean =
+        underlying?.switchCamera(cameraId) ?: false
 }

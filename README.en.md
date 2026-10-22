@@ -194,6 +194,8 @@ the screen with the current Live2D model name on top. All buttons and sliders:
 | **Select Model** | — | Open a dialog to pick a Live2D model from `assets/` (sensi / ATRI / … bundled). |
 | **Reset Baseline** | — | Recalibrate: treat the current frame as the "neutral face" for head pose and expressions. Recommended whenever you put on glasses, change lighting, or hand the phone to a different person. |
 | **Blink Curve: ON / OFF** | Green ↔ secondary | Toggle the **natural-blink curve shaper**. When on, raw blink events are reshaped into a smoother ~230 ms curve (no jitter / half-blinks). When off, the raw EAR is passed through. |
+| **Camera: Front / Back / External** | — | Open the **camera picker**: lists every camera exposed by the device (front / back / logical multi-cam / USB external) and switches capture instantly. The choice is remembered across launches. |
+| **Web Output** | — | Open the **Web Output** dialog: start / stop the server, copy the LAN URL, tune output height / FPS / quality and watch the connection status. See "Web Output / OBS" below. |
 
 ### Sliders
 
@@ -205,6 +207,124 @@ the screen with the current Live2D model name on top. All buttons and sliders:
 > 💡 TIP: On a fresh run, or after switching model / user, look straight at the
 > camera once and tap **Reset Baseline**, then nudge **Eye Sensitivity** until
 > blinks register reliably for your eye shape.
+
+### Multi-camera support
+
+The demo can **switch between cameras** (one active camera at a time, not
+simultaneous multi-camera capture):
+
+- Enumerates every camera reported by `CameraManager`: front, back, logical
+  multi-cameras and external USB cameras;
+- Front-first by default; falls back to back / external when no front camera
+  exists, so single-camera devices keep the old behavior;
+- Tap **Camera: …** in the control panel to switch at any time. While tracking,
+  the capture pipeline restarts in place — the Start/Stop state and the Live2D
+  avatar stay up;
+- Sensor orientation and vertical FOV are re-read per camera and used for frame
+  rotation and head-pose calibration; switching triggers a fresh neutral-face
+  calibration so front/back FOV differences do not skew the head pose;
+- Preview mirroring follows the lens facing: front is mirrored (selfie view),
+  back / external stay true to the scene;
+- The selected camera id is persisted and restored on the next launch. If it is
+  no longer present (e.g. USB camera unplugged), the app safely falls back to
+  the default camera.
+
+> ⚠️ Only one camera stream is active at a time. Simultaneous multi-camera
+> capture requires device-level concurrent streaming support
+> (`LOGICAL_MULTI_CAMERA` / concurrent streams) and is out of scope here.
+
+---
+
+## 📺 Web Output / OBS
+
+The demo app ships a **Web Output** feature: the Live2D frame rendered on the
+phone is encoded on the fly and pushed to a browser over **HTTP / WebSocket on
+your LAN**, so you can add it to OBS as a **Browser Source** and overlay the
+avatar on your stream or recording. The page background is **transparent by
+default**, so OBS captures the alpha channel as-is — no keying required.
+
+> 💡 Great for the "game footage / desktop + avatar" overlay: the alpha channel
+> travels with the WebP frames pushed over WebSocket, so the PC needs no extra
+> streaming tool or virtual camera.
+
+### How to open it
+
+The bottom control panel has a new **Web Output** button that opens a dialog:
+
+| Item | Description |
+|------|-------------|
+| **Start / Stop** | Start / stop the Web Output server, **off by default** |
+| **Address** | LAN URL such as `http://192.168.1.23:8765/`, copyable |
+| **Output Height** | 360 / 480 / 640 / 720 / 1080, default 640 |
+| **Output FPS** | 15 – 60 FPS, default 30 |
+| **Quality** | 40 – 95, default 75; higher = sharper, but bigger bitrate |
+| **Status** | Whether it is running, connected client count, actual output fps |
+| **OBS hint** | Short OBS usage tips shown inside the dialog |
+
+The server always listens on `0.0.0.0:8765` (port is fixed); when the phone's
+IP changes, the URL changes with it.
+
+### Page URL & parameters
+
+The main page `http://<phone-IP>:8765/` streams **WebP frames with alpha** over
+WebSocket, and accepts these query parameters:
+
+| Parameter | Values | Default | Meaning |
+|-----------|--------|---------|---------|
+| `bg` | `transparent` / `black` / `white` / `green` | `transparent` | Background fill; `green` is meant for OBS chroma key |
+| `fit` | `contain` / `cover` / `stretch` | `contain` | Scaling mode; `contain` centers without cropping |
+| `mirror` | `0` / `1` | `0` | `1` flips horizontally for a mirror-like view |
+| `hud` | `0` / `1` | `0` | `1` shows a status bar (connection / fps / resolution / model) in the top-left corner |
+| `dpr` | `1` / `2` / `auto` | `auto` | Page render scale; use `1` under OBS |
+
+Chain them on the URL with `&`:
+
+```
+http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
+```
+
+Fallback endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `http://<phone-IP>:8765/stream.mjpg` | Fallback MJPEG stream, **no alpha channel**; fine for simple cases or other MJPEG-capable software |
+| `http://<phone-IP>:8765/status` | Returns JSON status, handy for troubleshooting |
+
+Page hotkeys: `h` toggles the status bar, `m` toggles mirroring, `r` reconnects.
+
+### OBS Browser Source setup
+
+1. Connect the phone and the PC to the **same Wi-Fi / LAN**;
+2. Open **Web Output** in the app and note the address shown in the dialog
+   (e.g. `http://192.168.1.23:8765/`);
+3. In OBS: **Sources** → `+` → **Browser**, paste that URL, set width / height as
+   needed (e.g. `720 × 720`), and tick **Shutdown source when not visible** and
+   **Refresh browser when scene becomes active**;
+4. The page is already transparent — just put the source over your game footage.
+   For a solid backdrop append `?bg=black` / `?bg=white`, or use `?bg=green`
+   together with a **Chroma Key** filter on the source.
+
+| Option | Effect |
+|--------|--------|
+| Shutdown source when not visible | Closes the page when the source is hidden — saves power and frees the phone-side connection |
+| Refresh browser when scene becomes active | Reloads the page whenever OBS refreshes the source, so URL parameter changes take effect |
+
+> 💡 Set the Browser Source's **custom frame rate** to the output FPS from the
+> dialog (e.g. 30). Otherwise OBS merely re-samples or drops frames and the
+> result can look *worse* than the phone-side output.
+
+### Notes & caveats
+
+- **LAN only**: the server has no authentication — never expose it on a public
+  network or untrusted Wi-Fi.
+- **The app must stay in the foreground**: backgrounding the app or locking the
+  screen stops rendering and the page freezes on the last frame (the app keeps
+  the screen awake automatically).
+- **Cost scales with settings**: higher height / FPS / quality means more
+  encoding pressure on the phone and more bandwidth. The defaults
+  (`30fps / 640 / 75`) are usually plenty.
+- **Only the WebSocket page carries alpha**; the MJPEG endpoint
+  (`/stream.mjpg`) is plain RGB with no transparency.
 
 ---
 
@@ -230,6 +350,12 @@ the screen with the current Live2D model name on top. All buttons and sliders:
   the inference code is still in the tree if you want to play with it :( .)
 - **Publishable AAR** — `:facecapture-sdk` is already wired with
   `maven-publish` for one-shot release.
+- **Multi-camera** — enumerate and switch front / back / external cameras at
+  runtime, with per-device rotation, vertical FOV and preview mirroring, and a
+  fresh baseline calibration after each switch.
+- **Web Output** — the rendered frame can be used directly as an OBS Browser
+  Source (transparent background, MJPEG fallback): the phone is the "streamer",
+  the PC installs nothing and needs no virtual camera.
 
 ---
 
