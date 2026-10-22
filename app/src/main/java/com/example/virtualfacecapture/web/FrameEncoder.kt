@@ -65,8 +65,10 @@ class FrameEncoder {
         // 组装：低 8 位 = R，高 8 位 = A。
         val source = rgba.duplicate()
         source.rewind()
+        // 先给 ByteBuffer 定好序，再建视图：asIntBuffer() 会继承创建那一刻的字节序
+        // （JDK 对该 bug 给出的 workaround 就是「duplicate/slice 之后重新设一次序」）。
         source.order(ByteOrder.LITTLE_ENDIAN)
-        val ints = source.asIntBuffer().order(ByteOrder.LITTLE_ENDIAN)
+        val ints = source.asIntBuffer()
         if (ints.capacity() < count) {
             return EncodedFrame(null, null)
         }
