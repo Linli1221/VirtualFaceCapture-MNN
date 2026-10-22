@@ -235,7 +235,7 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 | **Start / Stop** | camera + inference pipeline |
 | **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). Also remotely triggerable from the PC via `command: recalibrate` |
 | **Network output** | start/stop the tracking server, copy the `ws://` address, see client count, output fps and the active frame-buffer length, open the `/status` page |
-| **Camera: front / back / external** | enumerate and switch cameras; re-calibrates after switching, remembers the choice |
+| **Camera: front / back / external / ultra-wide** | enumerate and switch cameras, including physical ultra-wide / telephoto sensors hidden behind a logical multi-camera; re-calibrates after switching, remembers the choice; works in portrait and landscape |
 | **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |
 | **Landmark: GPU parallel** | cycles single / GPU×2 / GPU×3: several GPU engines steal frames from one queue to keep the GPU busy (restarts the pipeline briefly) |
 | **Blink curve / speed** | shape blinks into a natural 230 ms curve, adjustable speed |
@@ -469,8 +469,15 @@ To reuse the wire format, just copy `docs/tracking-protocol.md` — it was writt
 - **ARKit-52 solved in-house**: no third blendshape model — the shapes come from landmark
   geometry, saving an entire inference pass.
 - **Publishable AAR**: `:facecapture-sdk` is wired for `maven-publish`.
-- **Multi-camera**: enumerate and switch front / back / external cameras at runtime,
-  recomputing rotation, vertical FOV and preview mirroring, re-calibrating after a switch.
+- **Multi-camera (incl. physical ultra-wide)**: enumerate and switch front / back / external
+  cameras at runtime. On API 28+ the physical sensors hidden behind a logical multi-camera
+  (rear ultra-wide / telephoto) are exposed as selectable streams via
+  `OutputConfiguration.setPhysicalCameraId`, recomputing rotation, vertical FOV and preview
+  mirroring, and re-calibrating after a switch.
+- **Seamless portrait ↔ landscape**: `screenOrientation="sensor"` + `configChanges` keeps the
+  activity, camera session, pipeline and preview alive across rotation; frames are rotated
+  upright from `display.rotation` every frame, and the control panel / camera list adapt to
+  the available height.
 - **Streaming never blocks inference**: each WS client has a single "latest frame" slot, so
   slow networks drop frames instead of stalling the inference thread.
 - **Both ends are verifiable offline**: the phone has JVM unit tests for the protocol; the PC

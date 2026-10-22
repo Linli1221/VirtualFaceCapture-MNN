@@ -376,3 +376,39 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
   若机型 720p 只支持 30fps，会打印 `⚠ 720p ... caps it at 30.0 fps`，此时要么换支持
   720p60 的摄像头，要么把 `MAX_PIXEL_COUNT` 降到相机能跑 60fps 的尺寸（会落到策略 ②）。
 
+---
+
+## 9. 摄像头：物理超广角 + 横竖屏
+
+### 目标
+
+- 后置超广角（以及长焦）也能像普通摄像头一样在 App 内选择、切换。
+- 手机横过来（架在支架上）时，预览 / 面捕 / 输出照常工作，旋转不打断采集。
+
+### 问题
+
+- `CameraManager.cameraIdList` 只返回「逻辑相机」。很多机型把后置超广角藏在逻辑后置
+  相机后面，`cameraIdList` 里没有它，`openCamera(id)` 也打不开。
+- 旋转屏幕默认会重建 Activity：`onPause` 释放相机，新 Activity 里面捕管线是停的，
+  用户必须重新点「开始面捕」。
+
+### 实现
+
+| 位置 | 改动 |
+|---|---|
+| `Camera2Manager.getAvailableCameras()` | API 28+ 读取逻辑相机的 `physicalCameraIds`，把不在 `cameraIdList` 里、且支持 YUV 输出的物理镜头作为额外条目返回；`CameraDeviceInfo.key = "logical#physical"`；按 35mm 等效焦距打「超广角 / 长焦」标签并排序 |
+| `Camera2Manager.setPreferredCamera()` | 接受 `"logical#physical"` 组合键（兼容旧偏好 `"0"` 这类纯逻辑 id）；物理镜头不可用时退回同一逻辑相机 |
+| `Camera2Manager.openCamera()` | 逻辑相机负责 `openCamera` / 3A / 请求构建；尺寸、sensor 方向、FOV 改用物理镜头的 characteristics |
+| `Camera2Manager.createCaptureSession()` | 物理镜头用 `OutputConfiguration.setPhysicalCameraId()` + `SessionConfiguration`（API 28+）；API 29+ 先 `isSessionConfigurationSupported()` 预检；被 HAL 拒绝时自动退回逻辑相机 |
+| `app/AndroidManifest.xml` | `screenOrientation="sensor"` + `configChanges="orientation|screenSize|..."`：竖屏 / 左右横屏都允许，旋转不重建 Activity |
+| `MainActivity` | 控制面板最大高度按 `LocalConfiguration.screenHeightDp` 计算（横屏默认收起），摄像头选择列表高度自适应；选择按 `key` 记忆 |
+
+### 代价与验证
+
+- 物理镜头只保证「能出流」，不保证 720p60：超广角 sensor 往往只有 30fps，以
+  `Camera delivered` 为准；若 720p 物理流被 HAL 拒绝，日志会打印
+  `HAL rejects physical stream ...` 并自动回退到逻辑相机。
+- 横屏旋转时帧尺寸在 1280×720 / 720×1280 之间切换，预览与关键点按新尺寸重建位图，属预期。
+- 验证日志：`Camera selected: Back 超广角 (id=0 · physical 2), sensor=90°, fov=...`；
+  旋转屏幕时 logcat 不应再出现新的 `MainActivity onCreate`（Activity 不重建）。
+

@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -30,8 +31,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -244,7 +247,13 @@ fun FaceCaptureScreen(
     var showDebug by remember { mutableStateOf(true) }
     var showTrackingDialog by remember { mutableStateOf(false) }
     var showCameraSelectorDialog by remember { mutableStateOf(false) }
-    var showControlPanel by rememberSaveable { mutableStateOf(true) }
+    // 横屏适配：控制面板高度不能超过屏幕可用高度（否则面板顶部被顶出屏幕、滚不到），
+    // 横屏首次进入默认收起面板——否则 280dp 的面板会盖住几乎整个横屏画面。
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val controlPanelMaxHeight = (configuration.screenHeightDp.dp - 88.dp)
+        .coerceAtLeast(160.dp)
+    var showControlPanel by rememberSaveable { mutableStateOf(!isLandscape) }
 
     // 相机预览叠加层开关（关键点 / 检测框）
     var drawLandmarks by rememberSaveable { mutableStateOf(true) }
@@ -315,7 +324,7 @@ fun FaceCaptureScreen(
         // 摄像头列表 + 初始选中项（用于在 Start 之前就显示正确的标签/镜像）
         availableCameras = faceTracker.getAvailableCameras()
         currentCamera = faceTracker.getCurrentCamera()
-            ?: availableCameras.firstOrNull { it.id == faceTracker.getPreferredCameraId() }
+            ?: availableCameras.firstOrNull { it.key == faceTracker.getPreferredCameraId() }
             ?: availableCameras.firstOrNull { it.isFrontFacing }
             ?: availableCameras.firstOrNull()
     }
@@ -393,25 +402,25 @@ fun FaceCaptureScreen(
         if (showCameraSelectorDialog) {
             CameraSelectorDialog(
                 cameras = availableCameras,
-                currentCameraId = currentCamera?.id ?: faceTracker.getPreferredCameraId(),
+                currentCameraKey = currentCamera?.key ?: faceTracker.getPreferredCameraId(),
                 onCameraSelected = { camera ->
                     showCameraSelectorDialog = false
                     scope.launch {
-                        val switched = faceTracker.switchCamera(camera.id)
+                        val switched = faceTracker.switchCamera(camera.key)
                         if (switched) {
                             currentCamera = camera
                             context.getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
                                 .edit()
-                                .putString(KEY_PREFERRED_CAMERA_ID, camera.id)
+                                .putString(KEY_PREFERRED_CAMERA_ID, camera.key)
                                 .apply()
                             // 相机几何 / FOV 变了，重做基线校准，避免姿态与表情残留旧基线
                             faceTracker.resetAdaptiveBaseline()
                             Log.i(
                                 "FaceCapturePipeline",
-                                "Camera switched to " + camera.label + " (" + camera.id + ")"
+                                "Camera switched to " + camera.label + " (key=" + camera.key + ")"
                             )
                         } else {
-                            Log.e("FaceCapturePipeline", "Failed to switch camera to " + camera.id)
+                            Log.e("FaceCapturePipeline", "Failed to switch camera to " + camera.key)
                             availableCameras = faceTracker.getAvailableCameras()
                         }
                     }
@@ -479,6 +488,7 @@ fun FaceCaptureScreen(
                     backendSwitching = backendSwitching,
                     gpuChannels = gpuChannels,
                     gpuActiveChannels = gpuActiveChannels,
+                    maxHeight = controlPanelMaxHeight,
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
@@ -911,6 +921,7 @@ fun ControlPanel(
     backendSwitching: Boolean,
     gpuChannels: Int,
     gpuActiveChannels: Int,
+    maxHeight: Dp = 380.dp,
     onToggleTracking: () -> Unit,
     onResetBaseline: () -> Unit,
     onToggleDebug: () -> Unit,
@@ -940,7 +951,7 @@ fun ControlPanel(
         Column(
             modifier = Modifier
                 .padding(16.dp)
-                .heightIn(max = 380.dp)
+                .heightIn(max = maxHeight)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1185,10 +1196,13 @@ fun ControlPanel(
 @Composable
 fun CameraSelectorDialog(
     cameras: List<CameraDeviceInfo>,
-    currentCameraId: String?,
+    currentCameraKey: String?,
     onCameraSelected: (CameraDeviceInfo) -> Unit,
     onDismiss: () -> Unit
 ) {
+    // 横屏时屏幕高度只有 300dp 出头，固定 320dp 的列表会把按钮顶出屏幕
+    val maxListHeight = (LocalConfiguration.current.screenHeightDp.dp * 0.5f)
+        .coerceAtLeast(120.dp)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择摄像头") },
@@ -1200,7 +1214,7 @@ fun CameraSelectorDialog(
                     color = MaterialTheme.colorScheme.error
                 )
             } else {
-                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                LazyColumn(modifier = Modifier.heightIn(max = maxListHeight)) {
                     items(cameras) { camera ->
                         Row(
                             modifier = Modifier
@@ -1210,7 +1224,7 @@ fun CameraSelectorDialog(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             RadioButton(
-                                selected = camera.id == currentCameraId,
+                                selected = camera.key == currentCameraKey,
                                 onClick = { onCameraSelected(camera) }
                             )
                             Spacer(modifier = Modifier.width(8.dp))
@@ -1220,10 +1234,14 @@ fun CameraSelectorDialog(
                                     style = MaterialTheme.typography.bodyLarge
                                 )
                                 Text(
-                                    text = "ID " + camera.id + " · 传感器 " +
+                                    text = "ID " + camera.key + " · 传感器 " +
                                         camera.sensorOrientation + "° · FOV %.0f°".format(
                                         camera.verticalFovDegrees
-                                    ),
+                                    ) +
+                                        (camera.equivalentFocalLengthMm?.let {
+                                            " · 等效 %.0fmm".format(it)
+                                        } ?: "") +
+                                        (if (camera.isPhysical) " · 物理流" else ""),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = Color.Gray
                                 )

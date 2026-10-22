@@ -593,13 +593,20 @@ class PipelineFaceTracker(private val context: Context) {
     // Camera selection / switching
     // ============================================================================
 
-    /** List every camera exposed by the platform (front / back / external). */
+    /**
+     * List every camera exposed by the platform (front / back / external) plus
+     * the physical sensors hidden behind logical multi-cameras (API 28+), such
+     * as the rear ultra-wide lens.
+     */
     fun getAvailableCameras(): List<CameraDeviceInfo> = camera2Manager.getAvailableCameras()
 
     /** Camera selected by the current / most recent session, or null before start. */
     fun getCurrentCamera(): CameraDeviceInfo? = camera2Manager.selectedCameraInfo
 
-    /** Camera id requested for the next start, or null for automatic front-first. */
+    /**
+     * Camera key requested for the next start, or null for automatic front-first.
+     * `"0"` = logical camera, `"0#2"` = physical sensor of logical camera `0`.
+     */
     fun getPreferredCameraId(): String? = camera2Manager.getPreferredCameraId()
 
     /** Select the camera used by the next [start]; takes effect on the next start. */
@@ -613,21 +620,28 @@ class PipelineFaceTracker(private val context: Context) {
      * The pipeline is stopped and restarted so Camera2 releases the previous
      * device before opening the new one. The pose / expression baseline is
      * reset afterwards because FOV and sensor geometry usually differ between
-     * cameras (especially front ↔ back ↔ external).
+     * cameras (especially front ↔ back ↔ external / ultra-wide).
      *
-     * @return true if the camera id exists and the switch was applied.
+     * @param cameraId a [CameraDeviceInfo.key] (`"0"` for a logical camera,
+     *                 `"0#2"` for a physical sensor).
+     * @return true if the camera key exists and the switch was applied.
      */
     fun switchCamera(cameraId: String): Boolean {
-        val target = camera2Manager.getAvailableCameras().firstOrNull { it.id == cameraId }
+        val target = camera2Manager.getAvailableCameras().firstOrNull { it.key == cameraId }
         if (target == null) {
-            Log.e(TAG, "Cannot switch camera: id $cameraId is not available")
+            Log.e(TAG, "Cannot switch camera: key $cameraId is not available")
             return false
         }
 
         val wasRunning = isRunning.get()
-        val alreadyActive = wasRunning && camera2Manager.selectedCameraInfo?.id == target.id
-        Log.i(TAG, "Switching camera to ${target.label} (id=${target.id}), running=$wasRunning, alreadyActive=$alreadyActive")
-        camera2Manager.setPreferredCamera(target.id)
+        val alreadyActive = wasRunning &&
+            camera2Manager.selectedCameraInfo?.key == target.key
+        Log.i(
+            TAG,
+            "Switching camera to ${target.label} (key=${target.key}), " +
+                "running=$wasRunning, alreadyActive=$alreadyActive",
+        )
+        camera2Manager.setPreferredCamera(target.key)
 
         if (alreadyActive) {
             // Same camera selected again — keep the session, just refresh the UI.
