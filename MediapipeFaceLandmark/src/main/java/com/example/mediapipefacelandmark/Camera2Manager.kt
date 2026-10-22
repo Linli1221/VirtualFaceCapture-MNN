@@ -144,6 +144,9 @@ class Camera2Manager(private val context: Context) {
          * YUV 旋转/缩放/裁剪多做无用功，而且大尺寸的 YUV 输出往往拿不到 60fps。
          */
         private const val MAX_PIXEL_COUNT = 640 * 480
+
+        /** 面捕管线的目标帧率（用于钉住 SENSOR_FRAME_DURATION）。 */
+        private const val PINNED_FPS = 60
         
         // Aspect ratio preference (1.0 = perfect square)
         private const val MAX_ASPECT_RATIO = 1.5f  // Allow up to 3:2 ratio
@@ -275,6 +278,16 @@ class Camera2Manager(private val context: Context) {
         }
 
         startBackgroundThread()
+
+        // 重开相机时重置帧率统计窗口，否则第一段读数会被上一轮的陈旧窗口污染。
+        deliveredFrameCount = 0
+        deliveredWindowStartNs = 0L
+        cameraDeliveredFps = 0f
+        appliedFrameDurationNs = 0L
+        appliedExposureNs = 0L
+        appliedFpsRange = null
+        lastCaptureResultKey = null
+
         openCamera()
     }
     
@@ -574,28 +587,43 @@ class Camera2Manager(private val context: Context) {
         
         try {
             val surface = reader.surface
-            
-            val captureRequestBuilder = camera.createCaptureRequest(
-                CameraDevice.TEMPLATE_PREVIEW
-            ).apply {
-                addTarget(surface)
-                applyCaptureRequestTuning(this)
-            }
-            
+
             camera.createCaptureSession(
                 listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         Log.i(TAG, "Capture session configured")
                         captureSession = session
-                        
+
+                        val request = buildCaptureRequest(surface)
+                        if (request == null) {
+                            Log.e(TAG, "Failed to build capture request")
+                            return
+                        }
+
                         try {
                             // Start continuous capture
                             session.setRepeatingRequest(
-                                captureRequestBuilder.build(),
-                                null,
+                                request,
+                                captureCallback,
                                 backgroundHandler
                             )
+                        } catch (e: IllegalArgumentException) {
+                            // 个别 HAL 不接受显式 SENSOR_FRAME_DURATION，退回到只设 AE 区间。
+                            Log.w(TAG, "Repeating request rejected, retrying without pinned frame rate", e)
+                            pinFrameRate = false
+                            val fallback = buildCaptureRequest(surface)
+                            if (fallback != null) {
+                                try {
+                                    session.setRepeatingRequest(
+                                        fallback,
+                                        captureCallback,
+                                        backgroundHandler
+                                    )
+                                } catch (e2: Exception) {
+                                    Log.e(TAG, "Error starting capture (fallback)", e2)
+                                }
+                            }
                         } catch (e: CameraAccessException) {
                             Log.e(TAG, "Error starting capture", e)
                         }
@@ -610,6 +638,26 @@ class Camera2Manager(private val context: Context) {
             
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error creating capture session", e)
+        }
+    }
+
+    /**
+     * Build the repeating [CaptureRequest] for the current session output.
+     *
+     * Kept as a helper (instead of building inline) so that a HAL which rejects
+     * the pinned [CaptureRequest.SENSOR_FRAME_DURATION] can be retried with a
+     * plain request — see [createCaptureSession].
+     */
+    private fun buildCaptureRequest(surface: android.view.Surface): CaptureRequest? {
+        val camera = cameraDevice ?: return null
+        return try {
+            camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                applyCaptureRequestTuning(this)
+            }.build()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to build capture request", e)
+            null
         }
     }
 
@@ -639,9 +687,35 @@ class Camera2Manager(private val context: Context) {
 
         val fpsRanges = characteristics
             ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-        chooseTargetFpsRange(fpsRanges)?.let {
-            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
-            Log.i(TAG, "AE target FPS range: ${it.lower}-${it.upper}")
+        val chosen = chooseTargetFpsRange(fpsRanges)
+        if (chosen != null) {
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen)
+            activeFpsRange = chosen
+            Log.i(TAG, "AE target FPS range: ${chosen.lower}-${chosen.upper}")
+        }
+
+        // ⚠️ 关键：AE 区间是「允许范围」，不是「目标帧率」。
+        //
+        // 选到 (30,60) 这种可变区间后如果不管它，Camera2 的 AE 在室内灯光下会从
+        // 区间下端（33ms）开始跑 —— 为的是拿更长的曝光时间，代价是帧率直接砍半。
+        // 现象就是「CPU 和 GPU 都不忙，但只有 30 帧」：整条管线都在等相机喂帧。
+        //
+        // 面捕场景里「稳定的 60fps」比「暗光下亮一点」重要得多，所以这里显式把
+        // SENSOR_FRAME_DURATION 钉在区间上限（要求 >=60 时才钉，避免把 30fps 的
+        // 相机强行拉到它做不到的帧率）。AE 会自动改用 ISO / 降噪去补曝光。
+        if (pinFrameRate) {
+            val range = chosen
+            if (range != null && range.upper >= PINNED_FPS) {
+                builder.set(
+                    CaptureRequest.SENSOR_FRAME_DURATION,
+                    1_000_000_000L / PINNED_FPS
+                )
+                Log.i(
+                    TAG,
+                    "Pinned SENSOR_FRAME_DURATION = ${1_000_000_000L / PINNED_FPS} ns " +
+                        "(${PINNED_FPS} fps, AE range ${range.lower}-${range.upper})"
+                )
+            }
         }
     }
 
@@ -675,6 +749,82 @@ class Camera2Manager(private val context: Context) {
             ?: ranges.maxByOrNull { it.upper }
     }
     
+    /**
+     * 把 [CaptureRequest.SENSOR_FRAME_DURATION] 钉在 AE 区间上限所用的目标帧率。
+     * 只在该区间上限 >= 这个值时才钉，避免把 30fps 的相机拉到它做不到的帧率。
+     */
+    @Volatile
+    var pinFrameRate: Boolean = true
+
+    /** 实际下发的 AE 帧率区间（null = 未设置，交给 HAL 自己决定）。 */
+    @Volatile
+    var activeFpsRange: android.util.Range<Int>? = null
+        private set
+
+    /** HAL 在 CaptureResult 里回报的**实际生效** AE 区间（可能和请求值不同）。 */
+    @Volatile
+    var appliedFpsRange: android.util.Range<Int>? = null
+        private set
+
+    /** HAL 回报的实际帧时长（纳秒）。0 = 还没收到 CaptureResult。 */
+    @Volatile
+    var appliedFrameDurationNs: Long = 0L
+        private set
+
+    /** HAL 回报的实际曝光时间（纳秒），用于判断是不是 AE 在拿曝光换帧率。 */
+    @Volatile
+    var appliedExposureNs: Long = 0L
+        private set
+
+    /** 相机每秒**真正交付**的帧数（滚动 1 秒窗口）。 */
+    @Volatile
+    var cameraDeliveredFps: Float = 0f
+        private set
+
+    private var deliveredFrameCount = 0
+    private var deliveredWindowStartNs = 0L
+    private var lastCaptureResultKey: String? = null
+
+    /**
+     * 读取 HAL 真实生效的参数。
+     *
+     * `SENSOR_FRAME_DURATION` 是判断「相机到底吐了多少帧」的权威值：
+     * 如果它稳定在 33.3ms，说明传感器就是 30fps，后面无论怎么优化推理都没用。
+     * 只在参数变化时打日志，避免每帧刷屏（每帧只读几个字段，开销可忽略）。
+     */
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult,
+        ) {
+            val range = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)
+            val frameDuration = result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L
+            val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+
+            appliedFpsRange = range
+            appliedFrameDurationNs = frameDuration
+            appliedExposureNs = exposure
+
+            val key = "$range|$frameDuration|$iso"
+            if (key != lastCaptureResultKey) {
+                lastCaptureResultKey = key
+                val fps = if (frameDuration > 0) 1_000_000_000.0 / frameDuration else 0.0
+                Log.i(
+                    TAG,
+                    "Camera applied: AE range=$range, frameDuration=" +
+                        "%.2f ms (%.1f fps), exposure=%.2f ms, ISO=%d".format(
+                            frameDuration / 1_000_000.0,
+                            fps,
+                            exposure / 1_000_000.0,
+                            iso,
+                        )
+                )
+            }
+        }
+    }
+
     // Timing for YUV conversion performance tracking
     private var yuvConversionCount = 0
     private var yuvConversionTotalMs = 0L
@@ -714,7 +864,9 @@ class Camera2Manager(private val context: Context) {
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
-        
+
+        updateDeliveredFps()
+
         try {
             if (useDirectYuvMode && yuvFrameCallback != null) {
                 // Direct YUV mode - pass YUV data directly to JNI for zero-copy processing
@@ -733,6 +885,28 @@ class Camera2Manager(private val context: Context) {
         }
     }
     
+    /**
+     * 统计相机**实际交付**的帧率（滚动 1 秒窗口）。
+     *
+     * 这是区分「管线算不过来」和「相机根本只给 30 帧」最直接的数字：
+     * 如果它停在 30 附近，那么后面所有推理优化都是白做。
+     */
+    private fun updateDeliveredFps() {
+        val now = System.nanoTime()
+        if (deliveredWindowStartNs == 0L) {
+            // 第一帧：开窗，避免把「相机还没起来的那段时间」算进第一个窗口。
+            deliveredWindowStartNs = now
+            deliveredFrameCount = 0
+        }
+        deliveredFrameCount++
+        val elapsedNs = now - deliveredWindowStartNs
+        if (elapsedNs >= 1_000_000_000L) {
+            cameraDeliveredFps = deliveredFrameCount * 1e9f / elapsedNs
+            deliveredFrameCount = 0
+            deliveredWindowStartNs = now
+        }
+    }
+
     /**
      * Process image in direct YUV mode - pass YUV planes to JNI
      * This avoids the YUV->RGB conversion on Kotlin side

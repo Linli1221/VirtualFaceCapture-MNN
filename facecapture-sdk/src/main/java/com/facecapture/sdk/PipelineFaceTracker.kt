@@ -1039,6 +1039,22 @@ class PipelineFaceTracker(private val context: Context) {
         }
         Log.i(TAG, "  MNN backend: ${faceDetector.getBackend()}, MNN threads: $mnnThreadCount")
 
+        // 相机侧真相：CPU/GPU 都不忙却上不去 60，绝大多数情况就卡在这一行。
+        val camFps = camera2Manager.cameraDeliveredFps
+        val frameDurMs = camera2Manager.appliedFrameDurationNs / 1_000_000.0
+        Log.i(TAG, "  Camera delivered: %.1f FPS (applied frameDuration=%.2f ms)".format(camFps, frameDurMs))
+        Log.i(TAG, "    Requested AE range: ${camera2Manager.activeFpsRange}, " +
+            "applied: ${camera2Manager.appliedFpsRange}, " +
+            "exposure=${camera2Manager.appliedExposureNs / 1_000_000.0} ms, " +
+            "pinFrameRate=${camera2Manager.pinFrameRate}")
+        if (camFps > 0f && currentFps > 0f && currentFps < camFps * 0.85f) {
+            Log.w(TAG, "  ⚠ Camera delivers %.1f FPS but pipeline outputs %.1f FPS ".format(camFps, currentFps) +
+                "→ 瓶颈在推理/后处理，不是相机")
+        } else if (camFps > 0f && camFps < 55f) {
+            Log.w(TAG, "  ⚠ Camera only delivers %.1f FPS ".format(camFps) +
+                "→ 相机是瓶颈，先解决采集帧率再谈推理优化")
+        }
+
         perfDetectionTotal.reset()
         perfLandmarkTotal.reset()
         perfProcessingTotal.reset()

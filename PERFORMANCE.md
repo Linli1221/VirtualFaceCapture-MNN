@@ -35,6 +35,7 @@ Camera2 YUV ──► 人脸检测(MNN) ──► Landmark(MNN) ──► 后处
 | 8 | 原生每帧重复 `ImageProcess::create`、host tensor 分配 + **442 KB memcpy** | MNN 预处理 | 每帧固定浪费 |
 | 9 | 校准窗口持有 N 帧 × 478 点（60fps ≈ 230 KB+） | `FaceCapturePipeline` | 启动首秒 GC 尖峰，校准结束那一帧卡 1~2 ms |
 | 10 | 眨眼曲线帧率写死 `60f` | `PipelineFaceTracker` | 实际帧率不足时眨眼时长被拉伸 |
+| 11 | **AE 区间被当成目标帧率**：`(30,60)` 只是一个「允许范围」，没设 `SENSOR_FRAME_DURATION` 时 AE 会从区间下端跑 | `Camera2Manager.applyCaptureRequestTuning` | **传感器稳定跑 30fps**，整条管线在等相机喂帧 —— CPU/GPU 双闲却只有 30 帧（详见第 7 节） |
 
 另外还有若干「白做功」：相机预览尺寸没有像素上限、AE FPS 区间可能选到 30fps 封顶、
 检测框每帧都要遍历 478 点（即便没人订阅）、每帧 4 次 `String.format` 打日志、
@@ -266,3 +267,60 @@ adb logcat -s PipelineFaceTracker Camera2Manager MediaPipeFaceDetector
    是两趟 478 遍历，可以合并成一趟。
 6. 混合后端（检测/Blendshape 走 CPU、landmark 走 Vulkan）—— 检测已经降到 10Hz，
    收益可能不大，但如果 CPU 后端下检测变成新瓶颈，值得试。
+
+---
+
+## 7. 追加修复：AE 把传感器按在 30fps
+
+### 现象
+
+第一轮改动上线后实测：**帧率仍然上不去，但 CPU 和 GPU 都没有跑满。**
+这条信息本身就很关键 —— 它排除掉「算力不够」，指向「整条链路在**等**」。
+
+### 根因
+
+Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目标帧率。
+`chooseTargetFpsRange()` 在没有 `(60,60)` 的机型上会选 `(30,60)`，这样写：
+
+| 写法 | 结果 |
+|---|---|
+| 只设 `(30,60)`，不设 `SENSOR_FRAME_DURATION` | AE 从区间下端起步 → **稳定 33.3ms/帧 = 30fps**，多出来的 16ms 全拿去延长曝光换亮度 |
+| 同时钉 `SENSOR_FRAME_DURATION = 1/60s` | 传感器被强制 16.67ms 出帧，AE 改用 ISO / 降噪补曝光 → **60fps**（画面略暗） |
+
+面捕是「动作跟随」的场景，**稳态帧率比暗光画质重要得多**，所以应该钉帧率。
+
+### 改动
+
+| 位置 | 内容 |
+|---|---|
+| `Camera2Manager.applyCaptureRequestTuning` | 新增 `pinFrameRate`（默认 `true`）：当所选 AE 区间上限 ≥ 60 时，显式 `set(SENSOR_FRAME_DURATION, 1e9/60)`。上限 < 60 的相机不动，避免强行拉到它做不到的帧率 |
+| `Camera2Manager.createCaptureSession` | 抽出 `buildCaptureRequest()`；若 HAL 拒绝这个 key 抛 `IllegalArgumentException`，自动 `pinFrameRate = false` 重建一次请求重试（旧机型兜底） |
+| `Camera2Manager.captureCallback` | 新增 `CaptureCallback`，从 `TotalCaptureResult` 读**真实生效**的 `CONTROL_AE_TARGET_FPS_RANGE` / `SENSOR_FRAME_DURATION` / `SENSOR_EXPOSURE_TIME` / `SENSOR_SENSITIVITY`，仅在变化时打日志 |
+| `Camera2Manager.updateDeliveredFps` | `onImageAvailable` 里统计滚动 1 秒窗口的**实际交付帧率** |
+| `PipelineFaceTracker.logPerfStats` | perf 块新增相机侧两行 + 自动判语 |
+
+### 新增日志
+
+```
+  Camera delivered: 59.8 FPS (applied frameDuration=16.72 ms)
+    Requested AE range: [30, 60], applied: [30, 60], exposure=12.4 ms, pinFrameRate=true
+```
+
+- `Camera delivered` 就是**权威答案**：读数是 30 说明相机只给 30 帧，后面所有推理优化都是白做；
+  读数 60 而 `Actual output FPS` 只有 40，才是推理/后处理的问题。
+- `applied frameDuration` 稳定在 33.3ms → AE 仍然在拿曝光换帧率（`pinFrameRate` 没生效，
+  看是不是走了上面那个 `IllegalArgumentException` 回退分支）。
+- 日志还会自动印一行结论：
+  - `⚠ Camera only delivers 30.0 FPS → 相机是瓶颈…`
+  - `⚠ Camera delivers 60.0 FPS but pipeline outputs 41.2 FPS → 瓶颈在推理/后处理…`
+
+### 如果钉了帧率仍然不到 60
+
+那就不是 AE 的问题了，按顺序排查：
+
+1. `Camera delivered` < 60 且 `applied frameDuration` 仍是 33.3ms → 该机型在该分辨率下
+   就不会给 60fps。可以试：把 `MAX_PIXEL_COUNT` 降到 `640*360`，或换 `(60,60)` 广播的
+   分辨率（部分机型 720p 支持 60、480p 反而只到 30）。
+2. `Camera delivered` ≈ 60 但输出 FPS 低 → 瓶颈在推理：先点 **Backend 切到 CPU** A/B，
+   再看 `Landmark Detection` 耗时。
+3. 两者都正常但画面看着不 60 → 渲染侧：高刷屏节流、Live2D 参数更新频率、OBS 抓帧。
