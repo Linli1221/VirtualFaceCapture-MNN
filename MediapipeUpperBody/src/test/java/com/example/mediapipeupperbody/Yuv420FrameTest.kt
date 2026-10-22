@@ -94,9 +94,12 @@ class Yuv420FrameTest {
         // 180°
         assertEquals(639, YuvGeometry.sourceX(0, 0, 640, 480, 180))
         assertEquals(479, YuvGeometry.sourceY(0, 0, 640, 480, 180))
-        // 0°
-        assertEquals(0, YuvGeometry.sourceX(10, 20, 640, 480, 0))
+        // 0°：恒等映射（这里要断言「输出坐标原样回到源坐标」，不是左上角 0）
+        assertEquals(10, YuvGeometry.sourceX(10, 20, 640, 480, 0))
         assertEquals(20, YuvGeometry.sourceY(10, 20, 640, 480, 0))
+        // 90° / 270° 映射同样应该带上非零输出偏移
+        assertEquals(20, YuvGeometry.sourceX(10, 20, 640, 480, 90))
+        assertEquals(469, YuvGeometry.sourceY(10, 20, 640, 480, 90))
     }
 
     @Test
