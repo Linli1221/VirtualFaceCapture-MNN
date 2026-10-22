@@ -39,6 +39,17 @@ object TrackingProtocol {
     /** 每处理 N 帧发 1 帧；1 = 全量。 */
     const val DEFAULT_DECIMATION = 1
 
+    /**
+     * 手机端发送帧缓冲时长（毫秒）：追踪帧先攒够这段时间再匀速发给 PC。
+     *
+     * 「算完一帧就发一帧」会把推理耗时抖动、系统调度、Wi-Fi 突发原样传给客户端，
+     * PC 端的 Live2D 看起来就是一卡一卡。固定 0.5 s 的缓冲能把输出帧间隔抹平，
+     * 代价是端到端延迟固定多 0.5 s（协议 §7.1 / §9）。
+     *
+     * 设为 0 即关闭缓冲，退化为「算完就发」的最低延迟模式。
+     */
+    const val FRAME_BUFFER_MS = 500L
+
     /** 唯一的 command 名，等价于 UI 上的 Reset Baseline。 */
     const val COMMAND_RECALIBRATE = "recalibrate"
 

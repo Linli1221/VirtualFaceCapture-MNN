@@ -24,6 +24,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * 面捕追踪数据服务端（HTTP + WebSocket），协议见 docs/tracking-protocol.md。
@@ -35,8 +37,9 @@ import java.util.concurrent.atomic.AtomicReference
  *    WS  /ws          -> 追踪数据长连接（协议 §4）
  *    GET /favicon.ico -> 204
  *
- * 数据流：面捕管线的每帧结果由 [submitTrack] 推进来 → 手写 JSON → 每个客户端各自一个
- * “最新一帧”槽位（覆盖式写入），网络慢的客户端只会丢帧，绝不会拖慢推理线程。
+ * 数据流：面捕管线的每帧结果由 [submitTrack] 推进来 → 手写 JSON → 进**发送帧缓冲**
+ * （默认 0.5 s，见 [TrackingFrameBuffer]）→ 缓冲线程按生产节奏匀速放行 → 每个客户端
+ * 各自一个「最新一帧」槽位（覆盖式写入）。网络慢的客户端只会丢帧，绝不会拖慢推理线程。
  * 控制类消息（hello / calib / pong / ack / bye）走独立小队列，不会被数据帧冲掉。
  */
 class TrackingServer(
@@ -44,6 +47,8 @@ class TrackingServer(
     private val deviceName: String,
     private val appName: String,
     private val onRecalibrate: () -> Unit = {},
+    /** 发送帧缓冲时长（毫秒）；0 = 关闭缓冲，算完就发。见 [TrackingProtocol.FRAME_BUFFER_MS]。 */
+    private val frameBufferMs: Long = TrackingProtocol.FRAME_BUFFER_MS,
 ) {
 
     companion object {
@@ -68,6 +73,11 @@ class TrackingServer(
 
         /** presenceScore 高于该阈值才认为本帧真的检测到人脸（与 SDK 判定一致）。 */
         private const val FACE_PRESENCE_THRESHOLD = 0.5f
+
+        /** 缓冲放行线程的最长休眠时间：没有待发帧时也定期醒来检查退出/断线。 */
+        private const val PLAYOUT_IDLE_WAIT_MS = 50L
+
+        private const val PLAYOUT_IDLE_WAIT_NANOS = PLAYOUT_IDLE_WAIT_MS * 1_000_000L
     }
 
     // ------------------------------------------------------------- 对外状态
@@ -121,6 +131,22 @@ class TrackingServer(
     /** 最近一个统计窗口内真正广播出去的帧数。 */
     private val framesInWindow = AtomicInteger(0)
 
+    /**
+     * 发送帧缓冲：先攒 [frameBufferMs] 再匀速放行（协议 §7.1）。
+     *
+     * 内部不是线程安全的，[frameBuffer] 的每一次访问都要在 [frameBufferLock] 里；
+     * 入队 / 停止后 signal [frameBufferCondition]，让 [playoutThread] 立刻重算到期时间。
+     */
+    private val frameBuffer = TrackingFrameBuffer(frameBufferMs)
+    private val frameBufferLock = ReentrantLock()
+    private val frameBufferCondition = frameBufferLock.newCondition()
+
+    @Volatile
+    private var playoutThread: Thread? = null
+
+    /** 放行线程的代次：stop()/start() 时 +1，旧线程看到代次变了就立刻退出。 */
+    private val playoutGeneration = AtomicInteger(0)
+
     @Volatile
     private var serverSocket: ServerSocket? = null
 
@@ -167,6 +193,7 @@ class TrackingServer(
         framesInWindow.set(0)
         sentFps = 0f
         lastCalibActive = false
+        frameBufferLock.withLock { frameBuffer.clear() }
 
         acceptThread = Thread({ acceptLoop(socket) }, "tracking-accept").also {
             it.isDaemon = true
@@ -175,6 +202,14 @@ class TrackingServer(
         statsThread = Thread({ statsLoop() }, "tracking-stats").also {
             it.isDaemon = true
             it.start()
+        }
+        // 缓冲关闭时不需要放行线程：dispatch() 直接广播
+        if (frameBufferMs > 0L) {
+            val playoutId = playoutGeneration.incrementAndGet()
+            playoutThread = Thread({ playoutLoop(playoutId) }, "tracking-playout").also {
+                it.isDaemon = true
+                it.start()
+            }
         }
 
         Log.i(TAG, "追踪服务已启动: http://0.0.0.0:" + port + TrackingProtocol.PATH_INFO)
@@ -213,6 +248,14 @@ class TrackingServer(
         acceptThread = null
         statsThread?.interrupt()
         statsThread = null
+        playoutGeneration.incrementAndGet()
+        playoutThread?.interrupt()
+        playoutThread = null
+        // 丢掉缓冲里还没放行的帧：服务已经停了，再发出去只会让客户端看到旧表情
+        frameBufferLock.withLock {
+            frameBuffer.clear()
+            frameBufferCondition.signalAll()
+        }
 
         sentFps = 0f
         Log.i(TAG, "追踪服务已停止")
@@ -236,12 +279,12 @@ class TrackingServer(
         val seq = sequence.getAndIncrement()
         val now = System.currentTimeMillis()
 
-        // 校准窗口边界：进入 / 结束各发一次 calib（协议 §4.3）
+        // 校准窗口边界：进入 / 结束各发一次 calib（协议 §4.3）。
+        // calib 也走帧缓冲，否则它会被提前 0.5 s 送出去、和 track 的顺序错开。
         if (calibrating != lastCalibActive) {
             lastCalibActive = calibrating
             if (wsClients.isNotEmpty()) {
-                val calib = TrackingProtocol.buildCalib(calibrating, seq, now)
-                for (client in wsClients) client.offerControl(calib)
+                dispatch(TrackingProtocol.buildCalib(calibrating, seq, now), control = true)
             }
         }
 
@@ -261,8 +304,76 @@ class TrackingServer(
             fps = fps,
             calibrating = calibrating,
         )
-        for (client in wsClients) client.offerTrack(message)
-        framesInWindow.incrementAndGet()
+        dispatch(message)
+    }
+
+    /**
+     * 把一条已序列化的报文投给发送链路（协议 §7.1）。
+     *
+     * [frameBufferMs] > 0 时先入帧缓冲，由 [playoutThread] 攒够延迟后匀速放行；
+     * 为 0 时退化成「算完就发」，和旧行为完全一致（`control` 决定走哪个槽位）。
+     *
+     * @param control true = calib 这类控制消息；关闭缓冲时走 [TrackingWsConnection.offerControl]，
+     *   保证不会被紧随其后的 track 帧覆盖。
+     */
+    private fun dispatch(message: String, control: Boolean = false) {
+        if (frameBufferMs <= 0L) {
+            for (client in wsClients) {
+                if (control) client.offerControl(message) else client.offerTrack(message)
+            }
+            if (!control) framesInWindow.incrementAndGet()
+            return
+        }
+        frameBufferLock.withLock {
+            // 缓冲队列是单生产者（面捕派发线程）写入的 FIFO，calib 与 track 的顺序天然保持
+            frameBuffer.enqueue(message, System.nanoTime())
+            // 放行线程可能正睡在 await() 里，入队后立刻叫醒它重算到期时间
+            frameBufferCondition.signalAll()
+        }
+    }
+
+    /**
+     * 帧缓冲放行线程：按 [TrackingFrameBuffer] 的到期时刻，一条一条把帧交给客户端。
+     *
+     * 不忙等：没有到期的帧就 `await()` 到下一帧的到期时间（最多 [PLAYOUT_IDLE_WAIT_MS]），
+     * 入队 / 停止会 signal 把它叫醒。
+     */
+    private fun playoutLoop(playoutId: Int) {
+        Log.i(TAG, "发送帧缓冲已启用: " + frameBufferMs + " ms")
+        // 旧线程（上一轮 start 起的）看到的代次已经不同，必须立刻退出，不能抢新会话的帧
+        while (running && playoutGeneration.get() == playoutId) {
+            var message: String? = null
+            var interrupted = false
+
+            frameBufferLock.withLock {
+                val now = System.nanoTime()
+                message = frameBuffer.poll(now)
+                if (message == null) {
+                    val due = frameBuffer.nextDueNanos()
+                    val waitNanos = if (due == Long.MAX_VALUE) {
+                        PLAYOUT_IDLE_WAIT_NANOS
+                    } else {
+                        // 最多睡到下一帧到期，但不超过空闲上限，保证 stop() 能及时退出
+                        (due - now).coerceIn(1_000_000L, PLAYOUT_IDLE_WAIT_NANOS)
+                    }
+                    try {
+                        frameBufferCondition.awaitNanos(waitNanos)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        interrupted = true
+                    }
+                }
+            }
+
+            if (interrupted) break
+            val frame = message ?: continue
+
+            // 每个客户端只有一个「最新一帧」槽位：这里赶上网络慢的客户端时也是覆盖式丢帧
+            for (client in wsClients) client.offerTrack(frame)
+            // 缓冲里混着极少数 calib（每次会话最多 2 条），一并在 sentFps 里计数，影响可忽略
+            framesInWindow.incrementAndGet()
+        }
+        Log.i(TAG, "帧缓冲放行线程已退出")
     }
 
     // ---------------------------------------------------------------- accept
@@ -432,6 +543,11 @@ class TrackingServer(
 
                 override fun onClosed() {
                     wsClients.remove(connection)
+                    // 最后一个客户端也走了：清掉缓冲里还没放行的帧，
+                    // 否则下一个客户端一连上会先收到 0.5 s 之前的老表情。
+                    if (wsClients.isEmpty()) {
+                        frameBufferLock.withLock { frameBuffer.clear() }
+                    }
                     Log.i(TAG, "WebSocket 客户端断开，剩余 " + wsClients.size)
                 }
             },

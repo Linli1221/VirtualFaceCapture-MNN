@@ -198,7 +198,7 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 |---------|--------------|
 | **Start / Stop** | camera + inference pipeline |
 | **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). Also remotely triggerable from the PC via `command: recalibrate` |
-| **Network output** | start/stop the tracking server, copy the `ws://` address, see client count and output fps, open the `/status` page |
+| **Network output** | start/stop the tracking server, copy the `ws://` address, see client count, output fps and the active frame-buffer length, open the `/status` page |
 | **Camera: front / back / external** | enumerate and switch cameras; re-calibrates after switching, remembers the choice |
 | **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |
 | **Blink curve / speed** | shape blinks into a natural 230 ms curve, adjustable speed |
@@ -220,6 +220,10 @@ auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Y
 
 Disconnects reconnect automatically (0.5 s → 1 s → 2 s → 5 s, capped) and the avatar returns to
 its default pose instead of freezing on the last frame.
+Rendering is capped at a **60 fps** target (high-refresh displays no longer spin at their refresh
+rate); when the phone delivers fewer than 60 fps, the client interpolates the recent input frames on
+a timeline so the motion stays smooth. See [`windows-client/README.md`](windows-client/README.md)
+and `?fps=<n>`.
 
 ---
 
@@ -245,6 +249,13 @@ Key rules: `bs` is **MediaPipe order, 52 values** (index 0 is always neutral); `
 **relative to the baseline** `[pitch, yaw, roll]` in degrees (`pitch>0` = look down,
 `yaw>0` = turn left); the client drops stale frames by `seq`, and a slow client can never
 stall the phone (each connection only keeps the newest frame).
+
+> **Phone-side 0.5 s frame buffer**: tracking frames are queued and only released once the
+> queue holds 0.5 s of data, then played out at the observed production cadence
+> (`TrackingProtocol.FRAME_BUFFER_MS = 500`). Frame intervals reaching the PC therefore stay
+> even when inference time, scheduling or Wi-Fi hiccups jitter — at the cost of a constant
+> ~0.5 s of extra end-to-end latency. Set it to `0` to disable the buffer and send immediately.
+> The phone's *Network output* dialog shows the active buffer length.
 
 ---
 
@@ -286,6 +297,7 @@ Query parameters:
 | `ws` | `ws://ip:8765/ws` | `ws://127.0.0.1:8765/ws` | phone address (remembered if omitted) |
 | `model` | folder name, e.g. `ATRI` | last used / first | initial model |
 | `transparent` | `0` / `1` | `0` | transparent background (Electron passes it itself) |
+| `fps` | integer, `0` = uncapped | `60` | PC render target; high-refresh displays are capped at 60 fps |
 
 > 💡 Browser sources sample at 30 fps; window capture has no such limit — prefer it for feel.
 
@@ -412,7 +424,7 @@ VirtualFaceCapture-MNN/
 │   └── src/main/java/.../tracking/   # TrackingServer / TrackingProtocol / TrackingOutputManager
 ├── windows-client/              # Windows renderer (Electron + Cubism Web)
 │   ├── electron/                #   desktop shell (transparent / borderless / always-on-top / click-through)
-│   ├── renderer/                #   page, mapping.js, live2d.js
+│   ├── renderer/                #   page, mapping.js, live2d.js, interp.js
 │   ├── server.js                #   zero-dependency static server (127.0.0.1:17890)
 │   └── models/                  #   Live2D models (auto-discovered)
 ├── MediapipeFaceLandmark/       # MNN inference + NEON core

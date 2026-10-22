@@ -20,7 +20,9 @@ import kotlin.math.roundToInt
  *
  * 与旧的 WebOutputManager（编码 + 推 WebP 帧）的区别：
  *  - 没有任何图像编码 / GL 抓帧，手机端零编码开销；
- *  - 一帧只做一次 JSON 序列化（不做图像），慢客户端只会丢帧。
+ *  - 一帧只做一次 JSON 序列化（不做图像），慢客户端只会丢帧；
+ *  - 发送前先过 **0.5 s 发送帧缓冲**（[TrackingProtocol.FRAME_BUFFER_MS]），
+ *    把推理耗时抖动 / Wi-Fi 突发抹平成均匀的帧间隔，代价是端到端延迟 +0.5 s。
  *
  * UI 直接读这里的 Compose State 即可。
  */
@@ -33,6 +35,9 @@ class TrackingOutputManager(
         private const val TAG = "TrackingOutputManager"
         const val PORT = TrackingProtocol.PORT
     }
+
+    /** 手机端发送帧缓冲时长（毫秒），供 UI 展示；0 表示未启用缓冲。 */
+    val frameBufferMs: Long = TrackingProtocol.FRAME_BUFFER_MS
 
     // ---- UI 状态 ----------------------------------------------------------
 
@@ -100,6 +105,7 @@ class TrackingOutputManager(
             deviceName = deviceName,
             appName = appName,
             onRecalibrate = onRecalibrate,
+            frameBufferMs = frameBufferMs,
         )
         newServer.trackingActive = trackingFlag
 

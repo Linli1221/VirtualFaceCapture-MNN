@@ -1228,6 +1228,20 @@ fun TrackingOutputDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    // 0.5s 发送帧缓冲：先攒满再匀速发，用来吸收推理耗时 / Wi-Fi 抖动
+                    Text(
+                        text = if (manager.frameBufferMs > 0L) {
+                            "帧缓冲: %d ms（先攒满再匀速发送，端到端延迟 +%.1f s）".format(
+                                manager.frameBufferMs,
+                                manager.frameBufferMs / 1000f,
+                            )
+                        } else {
+                            "帧缓冲: 已关闭（最低延迟，帧间隔直接跟随推理耗时）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
 
                 Text(
@@ -1297,6 +1311,14 @@ fun TrackingOutputDialog(
                         "Windows 客户端连接上面的 ws:// 地址，按 track.seq 丢弃旧帧；" +
                         "可发 ping 保活、发 command:recalibrate 让手机重做中性脸基线校准。" +
                         "手机与电脑需在同一局域网，输出期间请保持 App 在前台。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Text(
+                    text = "帧缓冲：追踪帧先攒够 " + manager.frameBufferMs +
+                        " ms 再按生产节奏匀速发给电脑，用来抹平推理耗时 / Wi-Fi 突发带来的帧间隔抖动；" +
+                        "代价是端到端延迟固定多这么多。把 TrackingProtocol.FRAME_BUFFER_MS 改成 0 即可关闭。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
