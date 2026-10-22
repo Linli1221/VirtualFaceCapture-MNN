@@ -1,0 +1,123 @@
+# 每次修改都通过 GitHub Actions 构建 Android 安装包（APK）。
+#
+# 触发条件：
+#   - 任意分支的 push / 任意 PR：构建 Debug + Release APK 与 SDK AAR，上传为 Artifact
+#   - 推送 v* 标签（如 v1.0.0）：额外创建 GitHub Release 并附带安装包
+#   - workflow_dispatch：手动触发
+#
+# 产物下载：仓库 → Actions → 对应运行 → Artifacts
+# Release 发布：git tag v1.0.0 && git push origin v1.0.0
+name: Android CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+# 同一分支连续推送时，取消旧的构建，始终为最新一次修改出包
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ThirdParty/MNN 子模块只用到头文件（include/），
+      # 用 sparse + partial clone 只拉取 include，避免整仓下载
+      - name: Fetch MNN headers (sparse submodule)
+        run: |
+          set -euo pipefail
+          if [ ! -d ThirdParty/MNN/include/MNN ]; then
+            rm -rf ThirdParty/MNN
+            git submodule update --init --depth 1 --filter=blob:none --sparse ThirdParty/MNN || {
+              echo "::warning::Sparse submodule checkout failed, falling back to full shallow checkout"
+              rm -rf ThirdParty/MNN
+              git submodule update --init --depth 1 ThirdParty/MNN
+            }
+            git -C ThirdParty/MNN sparse-checkout set include || true
+          fi
+          test -d ThirdParty/MNN/include/MNN
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 版本号与 gradle/wrapper、version.gradle 保持一致：
+      # compileSdk 36 / NDK 28.2.13676358 / CMake 3.22.1 (MediapipeFaceLandmark) & 3.18.1 (Live2D)
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.22.1" \
+            "cmake;3.18.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # versionCode = run_number（单调递增，可直接覆盖安装旧包）
+      # versionName = 1.0.<run_number>+<commit>（区分每次修改的产物）
+      - name: Build APKs
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug :app:assembleRelease :facecapture-sdk:assembleRelease \
+            -PversionCodeOverride="${{ github.run_number }}" \
+            -PversionNameOverride="1.0.${{ github.run_number }}+${GITHUB_SHA:0:7}" \
+            --stacktrace
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/VirtualFaceCapture-${short_sha}-debug.apk"
+          cp app/build/outputs/apk/release/app-release.apk "dist/VirtualFaceCapture-${short_sha}-release.apk"
+          cp facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar "dist/facecapture-sdk-${short_sha}.aar"
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualFaceCapture-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: VirtualFaceCapture-${{ github.sha }}
+          path: dist
+
+      - name: Create release with APKs
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

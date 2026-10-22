@@ -3,6 +3,8 @@
 
 > 🌐 中文版 README: [README.md](./README.md)
 
+[![Android CI](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml/badge.svg)](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml)
+
 ___
 
 ## 🧠 Overview
@@ -116,6 +118,7 @@ Standard multi-module Gradle project:
 ```bash
 git clone https://github.com/<your-name>/VirtualFaceCapture-MNN.git
 cd VirtualFaceCapture-MNN
+git submodule update --init --depth 1 ThirdParty/MNN   # only the MNN headers are needed
 ./gradlew :app:assembleDebug
 # Or just open the project in Android Studio and hit Run.
 ```
@@ -123,6 +126,27 @@ cd VirtualFaceCapture-MNN
 Grant the camera permission on first launch, keep your face in frame, tap
 **Start**, and the Live2D avatar will mirror your expression & head pose
 in real time.
+
+### GitHub Actions (every change gets a build)
+
+[Android CI](.github/workflows/android-ci.yml) builds the installable APK for
+**every modification**:
+
+- **Every push (any branch) / every PR** builds the Debug + Release APKs plus the
+  SDK AAR; download them from `Actions` → the run → `Artifacts` (kept 30 days);
+- CI artifacts carry the version `1.0.<run number>+<commit>` (monotonic
+  versionCode), so they install straight over older builds;
+- **To publish a release**: push a `v*` tag and a GitHub Release with the APKs is
+  created automatically:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+> 💡 No local Android toolchain needed — just grab the APK from the Actions
+> artifacts. For local builds, run the `git submodule update` above first to get
+> the MNN headers.
 
 ### Use as an SDK
 

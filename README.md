@@ -2,6 +2,8 @@
 > ✨ Android 端虚拟角色面捕驱动系统，推理框架基于 [alibaba-MNN](https://github.com/alibaba/MNN).
 
 > 🌐 English README: [README.en.md](./README.en.md)
+
+[![Android CI](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml/badge.svg)](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml)
 ___
 
 ## 🧠 简介
@@ -108,12 +110,30 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
 ```bash
 git clone https://github.com/<your-name>/VirtualFaceCapture-MNN.git
 cd VirtualFaceCapture-MNN
+git submodule update --init --depth 1 ThirdParty/MNN   # 仅需 MNN 头文件
 ./gradlew :app:assembleDebug
 # 或直接在 Android Studio 中打开并运行 app
 ```
 
 首次启动需授予相机权限，之后保持人脸在画面内，点击 Start ，即可看到 Live2D 角色随着
 表情 / 头部姿态实时联动。
+
+### GitHub Actions 自动构建（每次修改出包）
+
+仓库已配置 [Android CI](.github/workflows/android-ci.yml)，**每次修改都会自动构建安装包**：
+
+- **任意分支 push / 任意 PR**：自动构建 Debug + Release APK 与 SDK AAR，
+  到仓库 `Actions` → 对应运行 → `Artifacts` 下载安装包（保留 30 天）；
+- CI 产物自带版本号 `1.0.<运行号>+<commit>`（versionCode 单调递增），可直接覆盖安装旧包；
+- **发布正式安装包**：推送 `v` 开头的 tag，自动创建 GitHub Release 并附带 APK：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+> 💡 想省去本地 Android 环境，直接从 Actions 产物下载 APK 安装即可；
+> 本地构建则需先执行上面的 `git submodule update` 获取 MNN 头文件。
 
 ### 作为 SDK 集成
 
