@@ -1,12 +1,15 @@
 # 每次修改都通过 GitHub Actions 构建 Android 安装包（APK）。
 #
-# 默认产物：**只有 arm64-v8a 的 debug APK**（最快出包，够装真机测）。
-# Release APK 与 SDK AAR 只在「推送 v* 标签」或手动触发并勾选 build_release 时构建。
+# 产物：**debug 与 release 各自独立并行构建，各自一个 Artifact**
+#   - VirtualFaceCapture-<sha>-arm64-debug   （arm64-v8a debug APK）
+#   - VirtualFaceCapture-<sha>-arm64-release （arm64-v8a release APK + SDK AAR）
+# 两个变体分开跑：互不阻塞（一个失败另一个照样出包），日志/产物分开，也省得
+# 一个 job 里前后编两遍。代价是每个 job 都要独立装一遍 SDK，runner 分钟数翻倍。
 #
 # 触发条件：
-#   - 任意分支的 push / 任意 PR：构建 arm64 debug APK，上传为 Artifact
-#   - 推送 v* 标签（如 v1.0.0）：额外构建签名 Release APK + AAR，并创建 GitHub Release
-#   - workflow_dispatch：手动触发（可勾选 build_release）
+#   - 任意分支的 push / 任意 PR：并行构建 debug + release
+#   - 推送 v* 标签（如 v1.0.0）：在上面基础上创建 GitHub Release 并附上所有产物
+#   - workflow_dispatch：手动触发
 #
 # 产物下载：仓库 → Actions → 对应运行 → Artifacts
 # Release 发布：git tag v1.0.0 && git push origin v1.0.0
@@ -19,11 +22,6 @@ on:
   pull_request:
     branches: ['**']
   workflow_dispatch:
-    inputs:
-      build_release:
-        description: '同时构建 Release APK 与 SDK AAR（默认只出 arm64 debug 包）'
-        type: boolean
-        default: false
 
 # 同一分支连续推送时，取消旧的构建，始终为最新一次修改出包
 concurrency:
@@ -35,9 +33,26 @@ permissions:
 
 jobs:
   build:
-    name: Build APK
+    name: Build ${{ matrix.variant }} APK (${{ matrix.abi }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      # 一个变体失败不影响另一个，两个都跑完再判总结果
+      fail-fast: false
+      matrix:
+        include:
+          - variant: debug
+            abi: arm64-v8a
+            artifact: arm64-debug
+            gradle: ':app:assembleDebug'
+            apk: app/build/outputs/apk/debug/app-debug.apk
+            aar: ''
+          - variant: release
+            abi: arm64-v8a
+            artifact: arm64-release
+            gradle: ':app:assembleRelease :facecapture-sdk:assembleRelease'
+            apk: app/build/outputs/apk/release/app-release.apk
+            aar: facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -78,11 +93,13 @@ jobs:
             "cmake;3.22.1" \
             "cmake;3.18.1"
 
+      # 用 Cache 复用 ~/.gradle，两个变体的依赖下载不白跑
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
       # Release 签名：把 keystore 以 base64 存进仓库 Secret（RELEASE_KEYSTORE_BASE64），
       # 这里解码成临时文件再交给 Gradle（RELEASE_STORE_FILE）。
+      # debug 变体也会用这把 key（见 app/build.gradle），所以两个 job 都要准备。
       # 没配 Secret 时回退 debug key —— 能出包，但每次 runner 的 debug key 都是新生成的，
       # 签名不同 → 覆盖安装会失败。见 README「签名 / Release 打包」。
       - name: Prepare release keystore
@@ -91,18 +108,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "::warning::未配置 RELEASE_KEYSTORE_BASE64，Release APK 将用 debug key 签名：每次构建签名都不同，覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE"
+            echo "::warning::未配置 RELEASE_KEYSTORE_BASE64，将用 AGP 自动生成的 debug key 签名：每次构建签名都不同，覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE"
             exit 0
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "RELEASE_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "Keystore decoded: $(wc -c < "$RUNNER_TEMP/release.jks") bytes"
 
-      # 默认只出 arm64-v8a debug 包（abiFilters 已在各模块锁定 arm64-v8a）。
-      # Release APK 与 SDK AAR 只在推 tag 或手动勾选 build_release 时才构建。
       # versionCode = run_number（单调递增，可直接覆盖安装旧包）
       # versionName = 1.0.<run_number>+<commit>（区分每次修改的产物）
-      - name: Build APKs
+      # 只构建本 matrix 条目负责的变体（abiFilters 已在各模块锁定 arm64-v8a）
+      - name: Build ${{ matrix.variant }} APK
         env:
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -110,41 +126,24 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          VERSION_ARGS=(
-            "-PversionCodeOverride=${{ github.run_number }}"
-            "-PversionNameOverride=1.0.${{ github.run_number }}+${GITHUB_SHA:0:7}"
-          )
-
-          ./gradlew :app:assembleDebug "${VERSION_ARGS[@]}" --stacktrace
-
-          if [[ "${GITHUB_REF}" == refs/tags/v* || "${{ inputs.build_release }}" == "true" ]]; then
-            echo "::notice::构建 Release APK 与 SDK AAR"
-            ./gradlew :app:assembleRelease :facecapture-sdk:assembleRelease \
-              "${VERSION_ARGS[@]}" --stacktrace
-          else
-            echo "::notice::只构建 arm64-v8a debug 包（跳过 Release APK / SDK AAR）"
-          fi
+          ./gradlew ${{ matrix.gradle }} \
+            -PversionCodeOverride="${{ github.run_number }}" \
+            -PversionNameOverride="1.0.${{ github.run_number }}+${GITHUB_SHA:0:7}" \
+            --stacktrace
 
       - name: Collect artifacts
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:7}"
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk \
-             "dist/VirtualFaceCapture-${short_sha}-arm64-debug.apk"
-          # Release / AAR 只在需要时才会存在
-          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
-            cp app/build/outputs/apk/release/app-release.apk \
-               "dist/VirtualFaceCapture-${short_sha}-arm64-release.apk"
-          fi
-          if [ -f facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar ]; then
-            cp facecapture-sdk/build/outputs/aar/facecapture-sdk-release.aar \
-               "dist/facecapture-sdk-${short_sha}.aar"
+          cp "${{ matrix.apk }}" "dist/VirtualFaceCapture-${short_sha}-${{ matrix.artifact }}.apk"
+          if [ -n "${{ matrix.aar }}" ]; then
+            cp "${{ matrix.aar }}" "dist/facecapture-sdk-${short_sha}.aar"
           fi
           ls -lh dist
 
       # 把签名证书指纹打到构建日志 / Summary：能直接看出这次用的是正式 key 还是 debug key，
-      # 以及多次构建之间签名有没有变。只校验本次实际产出的 APK。
+      # 以及多次构建之间签名有没有变。
       - name: Verify APK signature
         run: |
           set -euo pipefail
@@ -155,12 +154,12 @@ jobs:
             "$APKSIGNER" verify --print-certs "$apk" | tee -a "${RUNNER_TEMP}/certs.txt"
           done
           {
-            echo "### APK 签名"
+            echo "### ${{ matrix.variant }} APK 签名"
             echo '```'
             grep -E "^(==|Signer #1 certificate (DN|SHA-256))" "${RUNNER_TEMP}/certs.txt" || true
             echo '```'
             if [ -n "${RELEASE_STORE_FILE:-}" ]; then
-              echo "签名证书已在 CI 固定，Release 包可覆盖安装旧包。"
+              echo "签名证书已在 CI 固定，可覆盖安装旧包。"
             else
               echo "⚠️ 当前使用 AGP 自动生成的 debug key 签名，**每次构建签名都不同**：装新包前请先卸载旧包（adb uninstall）。"
               echo "参考 README「签名 / Release 打包」配置正式签名。"
@@ -170,7 +169,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: VirtualFaceCapture-${{ github.sha }}
+          name: VirtualFaceCapture-${{ github.sha }}-${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
@@ -184,11 +183,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # debug / release 是两个独立 Artifact，这里一起拉下来合并到 dist/
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          name: VirtualFaceCapture-${{ github.sha }}
+          pattern: VirtualFaceCapture-${{ github.sha }}-*
           path: dist
+          merge-multiple: true
 
       - name: Create release with APKs
         uses: softprops/action-gh-release@v2

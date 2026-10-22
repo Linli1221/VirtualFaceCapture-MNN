@@ -127,11 +127,11 @@ git submodule update --init --depth 1 ThirdParty/MNN   # 仅需 MNN 头文件
 
 仓库已配置 [Android CI](.github/workflows/android-ci.yml)，**每次修改都会自动构建安装包**：
 
-- **任意分支 push / 任意 PR**：自动构建 **arm64-v8a 的 Debug APK**
-  （`VirtualFaceCapture-<sha>-arm64-debug.apk`），到仓库 `Actions` → 对应运行 →
-  `Artifacts` 下载（保留 30 天）；
-- Release APK 与 SDK AAR **默认不构建**（省 CI 时间）：推 `v` 开头的 tag，或手动
-  `Run workflow` 时勾选 `build_release`，才会额外产出；
+- **任意分支 push / 任意 PR**：**debug 与 release 两个变体独立并行构建**，各出一个
+  Artifact（保留 30 天），到仓库 `Actions` → 对应运行 → `Artifacts` 下载：
+  - `VirtualFaceCapture-<sha>-arm64-debug` —— arm64-v8a debug APK
+  - `VirtualFaceCapture-<sha>-arm64-release` —— arm64-v8a release APK + SDK AAR
+- 两者互不阻塞：一个变体挂了另一个照样出包；
 - CI 产物自带版本号 `1.0.<运行号>+<commit>`（versionCode 单调递增）；
 - ⚠️ **能否覆盖安装取决于签名**：默认回退 debug key（每次构建都不同，必须先卸载旧包）；
   配好下面的「正式签名」后签名固定，才能直接覆盖升级；
