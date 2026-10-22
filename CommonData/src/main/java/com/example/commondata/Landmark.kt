@@ -310,6 +310,82 @@ data class ARKitBlendShapes(
     }
     
     /**
+     * 转换为 MediaPipe 顺序的 BlendShape 数组（长度 52）。
+     *
+     * 这是手机端 → PC 端追踪协议（docs/tracking-protocol.md §5.1）的唯一序列化入口：
+     * 数组下标与 C++ BlendShapeIndex / MediaPipe 输出顺序 / 本类 BS_* 常量完全一致，
+     * 索引 0 是 neutral（恒为 0），1..51 依次为协议表格里的字段。
+     *
+     * 注意：与 [toMap] 不同，这里**不包含** tongueOut —— ARKit-52 的标准拓扑里没有舌头，
+     * tongueOut 只是本工程内部保留字段（MediaPipe 也不输出）。协议数组因此恒为 52 项。
+     *
+     * @return FloatArray(52)，未在上表中的字段不会出现。
+     */
+    fun toMediaPipeArray(): FloatArray {
+        val values = FloatArray(BS_COUNT)
+        // 0 号位 neutral 恒为 0（协议 §5.1）
+        values[BS_NEUTRAL] = 0f
+        // 眉毛
+        values[BS_BROW_DOWN_LEFT] = browDownLeft
+        values[BS_BROW_DOWN_RIGHT] = browDownRight
+        values[BS_BROW_INNER_UP] = browInnerUp
+        values[BS_BROW_OUTER_UP_LEFT] = browOuterUpLeft
+        values[BS_BROW_OUTER_UP_RIGHT] = browOuterUpRight
+        // 脸颊
+        values[BS_CHEEK_PUFF] = cheekPuff
+        values[BS_CHEEK_SQUINT_LEFT] = cheekSquintLeft
+        values[BS_CHEEK_SQUINT_RIGHT] = cheekSquintRight
+        // 眼睛
+        values[BS_EYE_BLINK_LEFT] = eyeBlinkLeft
+        values[BS_EYE_BLINK_RIGHT] = eyeBlinkRight
+        values[BS_EYE_LOOK_DOWN_LEFT] = eyeLookDownLeft
+        values[BS_EYE_LOOK_DOWN_RIGHT] = eyeLookDownRight
+        values[BS_EYE_LOOK_IN_LEFT] = eyeLookInLeft
+        values[BS_EYE_LOOK_IN_RIGHT] = eyeLookInRight
+        values[BS_EYE_LOOK_OUT_LEFT] = eyeLookOutLeft
+        values[BS_EYE_LOOK_OUT_RIGHT] = eyeLookOutRight
+        values[BS_EYE_LOOK_UP_LEFT] = eyeLookUpLeft
+        values[BS_EYE_LOOK_UP_RIGHT] = eyeLookUpRight
+        values[BS_EYE_SQUINT_LEFT] = eyeSquintLeft
+        values[BS_EYE_SQUINT_RIGHT] = eyeSquintRight
+        values[BS_EYE_WIDE_LEFT] = eyeWideLeft
+        values[BS_EYE_WIDE_RIGHT] = eyeWideRight
+        // 下颌
+        values[BS_JAW_FORWARD] = jawForward
+        values[BS_JAW_LEFT] = jawLeft
+        values[BS_JAW_OPEN] = jawOpen
+        values[BS_JAW_RIGHT] = jawRight
+        // 嘴部
+        values[BS_MOUTH_CLOSE] = mouthClose
+        values[BS_MOUTH_DIMPLE_LEFT] = mouthDimpleLeft
+        values[BS_MOUTH_DIMPLE_RIGHT] = mouthDimpleRight
+        values[BS_MOUTH_FROWN_LEFT] = mouthFrownLeft
+        values[BS_MOUTH_FROWN_RIGHT] = mouthFrownRight
+        values[BS_MOUTH_FUNNEL] = mouthFunnel
+        values[BS_MOUTH_LEFT] = mouthLeft
+        values[BS_MOUTH_LOWER_DOWN_LEFT] = mouthLowerDownLeft
+        values[BS_MOUTH_LOWER_DOWN_RIGHT] = mouthLowerDownRight
+        values[BS_MOUTH_PRESS_LEFT] = mouthPressLeft
+        values[BS_MOUTH_PRESS_RIGHT] = mouthPressRight
+        values[BS_MOUTH_PUCKER] = mouthPucker
+        values[BS_MOUTH_RIGHT] = mouthRight
+        values[BS_MOUTH_ROLL_LOWER] = mouthRollLower
+        values[BS_MOUTH_ROLL_UPPER] = mouthRollUpper
+        values[BS_MOUTH_SHRUG_LOWER] = mouthShrugLower
+        values[BS_MOUTH_SHRUG_UPPER] = mouthShrugUpper
+        values[BS_MOUTH_SMILE_LEFT] = mouthSmileLeft
+        values[BS_MOUTH_SMILE_RIGHT] = mouthSmileRight
+        values[BS_MOUTH_STRETCH_LEFT] = mouthStretchLeft
+        values[BS_MOUTH_STRETCH_RIGHT] = mouthStretchRight
+        values[BS_MOUTH_UPPER_UP_LEFT] = mouthUpperUpLeft
+        values[BS_MOUTH_UPPER_UP_RIGHT] = mouthUpperUpRight
+        // 鼻子
+        values[BS_NOSE_SNEER_LEFT] = noseSneerLeft
+        values[BS_NOSE_SNEER_RIGHT] = noseSneerRight
+        return values
+    }
+
+    /**
      * 转换为 Map 格式 (方便序列化)
      */
     fun toMap(): Map<String, Float> {

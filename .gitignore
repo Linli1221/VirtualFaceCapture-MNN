@@ -14,6 +14,14 @@ keystore.properties
 *.keystore
 *.p12
 
+# 本地构建/验证脚手架（Lead 用的 gradle、SDK 临时目录）
+/.build-tmp/
+
+# Windows 客户端依赖与打包产物
+windows-client/node_modules/
+windows-client/dist/
+tools/verify/node_modules/
+
 /MNNSource/
 /MNNDemo/
 /OpenSeeFaceSource/

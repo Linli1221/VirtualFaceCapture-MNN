@@ -1,5 +1,7 @@
 # VirtualFaceCapture-MNN
-> ✨ Android 端虚拟角色面捕驱动系统，推理框架基于 [alibaba-MNN](https://github.com/alibaba/MNN).
+
+> ✨ **安卓面捕 → Windows 渲染**：手机上只跑面部捕捉，追踪数据经局域网 WebSocket 送到电脑，
+> 由 Windows 客户端驱动 Live2D 虚拟形象。推理框架基于 [alibaba-MNN](https://github.com/alibaba/MNN)。
 
 > 🌐 English README: [README.en.md](./README.en.md)
 
@@ -7,18 +9,35 @@
 ___
 
 ## 🧠 简介
+
 基于 **MNN** 推理引擎、在移动端复刻 **MediaPipe Face Landmarker** 面部捕捉方案，
-配合 **仿 OpenSeeFace** 风格的后处理流水线，用来实时驱动 **Live2D** 皮套
-（测来测去，也就 Google 的模型还比较好用 -.-）。
+配合 **仿 OpenSeeFace** 风格的后处理流水线，实时输出 **ARKit-52 BlendShape + 头部姿态**。
 
-整套面捕管线已经从 MediaPipe 源码里彻底剥离出来：不依赖 MediaPipe 的图计算
-（CalculatorGraph）、不依赖 JavaCV / OpenCV-Android、不依赖任何 MediaPipe Tasks
-Java 层，全部由 **MNN + MNN-CV + 本地 C++ 后处理** 实现，姿态估计等部分逻辑用 **ARM NEON**
-做了 SIMD 优化以提升加载与计算速度，整体帧率能在骁龙888手机运行逼近**60**帧 🎉。
+这一版把系统拆成了两半：
 
-> 📈 帧率相关的完整优化清单、日志判读方法与上机调优步骤见 **[PERFORMANCE.md](PERFORMANCE.md)**
-> （含本轮改动：检测 10Hz 节流、派发单消费者化、MNN 后端 Vulkan⇄CPU 运行时切换、
-> 预览 RGB 帧门控、Compose 合批、后处理零分配化等）。
+```
+   手机（Android）                              电脑（Windows）
+┌────────────────────────┐   Wi-Fi / 局域网   ┌────────────────────────┐
+│ 相机 → MNN 推理         │   每帧 ~0.5 KB     │ WebSocket 客户端        │
+│ 478 关键点 → 后处理      │   WebSocket JSON  │ 自适应归一化 → 参数映射   │
+│ ARKit-52 + 头姿（无渲染）│  ────────────────► │ Cubism Web 渲染 Live2D  │
+└────────────────────────┘      60 fps        └────────────────────────┘
+```
+
+为什么要拆开来：
+
+| | 手机端只做面捕 | 电脑端渲染 |
+|---|---|---|
+| **发热 / 耗电** | 省掉整条 GL 渲染 + 编码链路，推理帧率更稳 | — |
+| **画质** | — | 桌面独显渲染，想开多大开多大 |
+| **叠加** | — | 透明窗口直接叠在游戏 / 桌面上，或给 OBS 当浏览器源 |
+| **迭代** | 改形象、改映射只动电脑，不用重装 App | 模型放目录里就自动发现 |
+
+手机上仍然保留完整的调试能力：相机预览 + 关键点叠加、帧率 / 帧耗时、头姿指示、
+ARKit 数值、眨眼曲线与眼睛灵敏度、MNN 后端（Vulkan / CPU）运行时切换。
+
+> 📈 手机端帧率优化清单、日志判读方法与上机调优步骤见 **[PERFORMANCE.md](PERFORMANCE.md)**
+> （注意：该文档里与「手机端 Live2D 渲染」相关的章节属于历史记录，渲染已迁至 Windows 客户端）。
 
 ---
 
@@ -33,21 +52,22 @@ Java 层，全部由 **MNN + MNN-CV + 本地 C++ 后处理** 实现，姿态估�
 
 ## 🧠 方案概览
 
-简单一句话概括为：
+一句话概括：
 
 > **把 MediaPipe Face Landmarker 的 Detection + Landmark 两个模型搬到 MNN 上跑，
 > 自己实现整套图前/图后处理，再接一层仿 OpenSeeFace 的滤波与表情解算，
-> 最终输出 ARKit-52 BlendShape + 头部姿态去驱动 Live2D。**
+> 输出 ARKit-52 BlendShape + 头部姿态；手机只负责产出这份数据，Live2D 在电脑上画。**
 
 与原版 MediaPipe Android 方案的差异：
 
-| 维度 | 官方 MediaPipe Tasks | 本工程 (MNN 版)                                                |
-|------|----------------------|------------------------------------------------------------|
-| 推理引擎 | TFLite + GPU Delegate | **MNN** (CPU / GPU / NNAPI 后端可选)                           |
-| 图调度 | MediaPipe CalculatorGraph | **本地 C++ 流水线**，零图计算依赖                                      |
-| 图像处理 | JavaCV / OpenCV / GL | **MNN-CV** + **NEON kernel**                               |
-| 模型数量 | Detection + Landmark + Blendshape | 仅 **Detection + Landmark** 两个模型，BlendShape 走单独解算           |
-| 后处理 | MediaPipe 内置 | **仿 OpenSeeFace** 平滑 / 标定 / 头姿恢复                           |
+| 维度 | 官方 MediaPipe Tasks | 本工程 (MNN 版) |
+|------|----------------------|-----------------|
+| 推理引擎 | TFLite + GPU Delegate | **MNN**（CPU / GPU / NNAPI 后端可选） |
+| 图调度 | MediaPipe CalculatorGraph | **本地 C++ 流水线**，零图计算依赖 |
+| 图像处理 | JavaCV / OpenCV / GL | **MNN-CV** + **NEON kernel** |
+| 模型数量 | Detection + Landmark + Blendshape | 仅 **Detection + Landmark** 两个模型，BlendShape 走单独解算 |
+| 后处理 | MediaPipe 内置 | **仿 OpenSeeFace** 平滑 / 标定 / 头姿恢复 |
+| 渲染位置 | 端上（MediaPipe 侧） | **Windows 客户端**（Cubism Web），手机端零渲染 |
 | 体积 | 依赖 mediapipe_tasks_vision aar | 仅 `libMNN.so` + `libmediapipefacelandmark.so` + 2 个 `.mnn` 模型 |
 
 ---
@@ -70,20 +90,21 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
               │  FaceLandmark (MNN)      │   face_landmark_detector_mp.mnn
               │   - 输出 478 点 3D 关键点 │
               └──────────────┬───────────┘
-                             │
                              ▼
               ┌──────────────────────────────────────────────┐
               │  仿 OpenSeeFace 后处理 (C++ / Kotlin)         │
               │   • PnP / SVD 头部姿态恢复 (pitch/yaw/roll)   │
               │   • 眨眼曲线 + 嘴形 + 眉毛                    │
-              │   • One-Euro / 滚动均值平滑                  │
-              │   • 首帧自动标定 (calibration)               │
-              │   • ARKit-52 BlendShape 解算                 │
+              │   • One-Euro / 滚动均值平滑                   │
+              │   • 首帧自动标定 (calibration)                │
+              │   • ARKit-52 BlendShape 解算                  │
               └──────────────┬───────────────────────────────┘
                              ▼
-              ┌──────────────────────────┐
-              │  Live2D Cubism Renderer  │   ARKit → Live2D 参数映射
-              └──────────────────────────┘
+              ┌──────────────────────────┐        ┌───────────────────────────┐
+              │  TrackingServer (手机)    │ ─────► │ Windows Client (电脑)      │
+              │  WS /ws, JSON, ~60 fps   │  Wi-Fi │ 自适应归一化 → Live2D 参数  │
+              └──────────────────────────┘        │ Cubism Web + PIXI 渲染     │
+                                                  └───────────────────────────┘
 ```
 
 所有矩阵运算 / 仿射变换 / SVD / Jacobi 旋转 / 点云变换都走本地的
@@ -92,36 +113,198 @@ Camera ───► │ YUV_420_888 (Camera2/CameraX) │
 
 ---
 
-## 📦 模块划分
+## 📦 目录与模块
 
-工程是一个标准的多 module Gradle 项目：
+工程是一个多 module Gradle 项目 + 一个独立的 Windows 客户端：
 
-| Module | 作用                                                     |
-|--------|--------------------------------------------------------|
-| `:app` | Demo 应用：相机、UI、Live2D 渲染、参数映射                           |
-| `:Live2D` | Cubism SDK 包装层 (CMake + JNI)                           |
-| `:MediapipeFaceLandmark` | **核心推理模块**：MNN + `.mnn` 模型 + 原生 C++ 流水线 + NEON 优化      |
-| `:OpenSeeFaceProcess` | 仿 OpenSeeFace 的后处理：平滑、头姿、BlendShape 解算                 |
-| `:CommonData` | 共享数据类型 (`Point3D` / `HeadPose` / `ARKitBlendShapes` …) |
-| `:facecapture-sdk` | 对外发布的 AAR 门面，封装上面 3 个模块                                |
-| `ThirdParty/MNN/` | 仅提供头文件                                                 |
+| 路径 | 是什么 |
+|------|--------|
+| `app/` | **Android 采集端**：相机、面捕管线、调试 HUD、追踪数据 WebSocket 服务 |
+| `windows-client/` | **Windows 渲染端**：Electron + Cubism Web，连手机 WS 渲染 Live2D |
+| `docs/tracking-protocol.md` | **两端之间唯一的契约**：VFC Tracking Protocol v1 |
+| `:MediapipeFaceLandmark` | **核心推理模块**：MNN + `.mnn` 模型 + 原生 C++ 流水线 + NEON 优化 |
+| `:OpenSeeFaceProcess` | 仿 OpenSeeFace 的后处理：平滑、头姿、BlendShape 解算 |
+| `:CommonData` | 共享数据类型（`Point3D` / `HeadPose` / `ARKitBlendShapes` …） |
+| `:facecapture-sdk` | 对外发布的 AAR 门面，封装上面 3 个模块 |
+| `Live2D/` | **已停止构建**。旧版手机端 Cubism SDK 封装（CMake + JNI），仅作历史参考保留 |
+| `ThirdParty/MNN/` | 仅提供头文件 |
+| `tools/verify/` | 端到端验证脚本（mock 手机端 + 无头 Chrome 截图 + 映射单测） |
 
 ---
 
 ## 🚀 快速开始
 
-### 构建运行
+### 1. 手机端（Android）
 
 ```bash
-git clone https://github.com/<your-name>/VirtualFaceCapture-MNN.git
+git clone https://github.com/Linli1221/VirtualFaceCapture-MNN.git
 cd VirtualFaceCapture-MNN
+./check_setup.sh                                     # 可选：环境自检（只查文件是否存在）
 git submodule update --init --depth 1 ThirdParty/MNN   # 仅需 MNN 头文件
 ./gradlew :app:assembleDebug
 # 或直接在 Android Studio 中打开并运行 app
 ```
 
-首次启动需授予相机权限，之后保持人脸在画面内，点击 Start ，即可看到 Live2D 角色随着
-表情 / 头部姿态实时联动。
+装到手机（arm64 设备）、授予相机权限，然后：
+
+1. 点 **开始面捕**，正脸看镜头确认画面正常；
+2. 点 **重置基线**（戴眼镜 / 换光线 / 换人时都建议点一次）；
+3. 点 **网络输出** → 启动，记下对话框里的地址，形如 `ws://192.168.1.23:8765/ws`。
+
+> 手机与电脑必须在同一个局域网（同一台路由器下）；手机需要保持 App 在前台
+> （App 会自动保持屏幕常亮，切后台会停相机，这是 Android 相机模型决定的）。
+
+### 2. Windows 端
+
+需要 **Node.js ≥ 20**（只用于跑本地服务与 Electron 壳，不用编译任何原生模块）。
+
+```bash
+cd windows-client
+npm install          # 国内网络建议先配好 registry / electron_mirror（见下）
+npm start            # 启动 Electron 客户端
+```
+
+首次启动后在地址栏填手机的地址 `ws://<手机IP>:8765/ws`，回车连接。
+连上后：状态点变绿、显示手机型号、输入帧率与端到端 RTT，形象开始跟着动。
+
+**国内网络装不上 Electron** 的话：
+
+```bash
+# windows-client/.npmrc 里已经写好，正常 npm install 即可
+registry=https://registry.npmmirror.com
+electron_mirror=https://npmmirror.com/mirrors/electron/
+```
+
+**不想装 Electron**（只想要一个浏览器窗口 / 给 OBS 用）：
+
+```bash
+npm run web      # 起服务并用 Edge 的 --app 模式打开一个独立窗口
+npm run serve    # 只起本地静态服务，自己用浏览器开 http://127.0.0.1:17890/
+npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765/ws）验证渲染
+```
+
+在完全没装依赖的机器上，`node server.js` 也能单独跑起来（服务本身零依赖，
+`renderer/vendor/` 里已经带了 pixi / pixi-live2d-display / Cubism Core 的浏览器构建）。
+
+### 3. 模型从哪来
+
+放进 `windows-client/models/<名字>/<任意>.model3.json` 即可，**目录会被自动发现**，
+下拉框里按目录名显示。仓库自带 4 个：`ATRI` / `sensei` / `Yuuka` / `zzzz`。
+
+---
+
+## 🎮 操作指南
+
+### 手机端控制面板
+
+| 控件 | 作用 |
+|------|------|
+| **开始 / 停止面捕** | 启停相机 + 推理管线 |
+| **重置基线** | 把当前帧记为「中性脸」（头姿 / 表情零点），等价于 OpenSeeFace 的首帧标定；电脑端也能发 `command: recalibrate` 远程触发 |
+| **网络输出** | 打开对话框：启动 / 停止追踪服务、复制 `ws://` 地址、查看客户端数与输出帧率、打开 `/status` 状态页 |
+| **Camera: 前置 / 后置 / 外接** | 枚举并切换摄像头，切换后自动重做基线；选择会记住 |
+| **Backend: Vulkan / CPU** | 运行时切换 MNN 推理后端（会重建 session，画面中断一帧左右） |
+| **眨眼曲线 / 眨眼速度** | 是否把眨眼整形为更自然的 230 ms 曲线，以及曲线速度 |
+| **眼睛灵敏度** | 眼部 EAR 阈值灵敏度（0.5x ～ 2.0x），下方实时显示生效的 `closed / open` 阈值 |
+| **显示调试 / 关键点** | 顶栏调试 HUD（fps、帧耗时、pitch/yaw/roll + 条形图、ARKit 数值）与相机画面上的关键点 / 检测框叠加 |
+
+### Windows 客户端
+
+| 控件 | 作用 |
+|------|------|
+| **地址栏 + 连接** | 填手机地址并连接；地址会记住，下次启动自动连 |
+| **模型下拉 + 重载** | 切换 Live2D 模型（自动发现 `models/` 下的目录），重载用于改完参数后重新读 |
+| **透明** | 窗口背景透明（需要重建窗口，勾选后会闪一下） |
+| **无边框** | 去掉标题栏，配合透明就是「只有角色」的悬浮窗口 |
+| **置顶** | 窗口永远在最前，适合叠在游戏 / 桌面上 |
+| **鼠标穿透** | 点击穿过窗口点到下面的程序；**穿透后用 `Ctrl + Alt + T` 取消**（全局热键） |
+| **重新校准** | 让手机重做中性脸基线，并把电脑端的自适应量程归零 |
+| **隐藏 UI / 调试** | `H` 隐藏全部面板（只剩角色），`D` 展开实时参数网格 |
+
+断线会自动重连（0.5 s → 1 s → 2 s → 5 s 封顶），状态栏会显示当前阶段；
+断开时形象回到默认姿态，不会定格在最后一帧的鬼脸上。
+
+---
+
+## 🌐 追踪协议（VFC Tracking Protocol v1）
+
+两端之间只认 **[`docs/tracking-protocol.md`](docs/tracking-protocol.md)** 这一份契约：
+JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），手机端零图像编码。
+
+| 端点 / 消息 | 方向 | 说明 |
+|---|---|---|
+| `GET /` | PC → 手机 | 内嵌信息页，确认服务在线 |
+| `GET /status` | PC → 手机 | JSON 状态：`running / tracking / clients / fps / device / protocol / version / seq` |
+| `WS /ws` | 双向 | 追踪数据长连接（端口固定 8765） |
+| `hello` | 手机 → PC | 连接建立时一次：协议名 / 版本 / 设备 / 帧率 / 抽帧系数 |
+| `track` | 手机 → PC | 每帧：`seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating` |
+| `calib` | 手机 → PC | 进入 / 离开首帧标定窗口 |
+| `ping` / `pong` | 双向 | 保活与 RTT 测量（客户端 5 s 一次，手机 30 s 主动 ping） |
+| `command` / `ack` | PC → 手机 | 目前只有 `recalibrate`（等价于手机上的「重置基线」） |
+| `bye` | 手机 → PC | 主动告知停止推流的原因 |
+
+关键约定：`bs` 是 **MediaPipe 顺序的 52 项**（索引 0 恒为 neutral），`pose` 是**相对基线**的
+`[pitch, yaw, roll]`（度，`pitch>0` 低头、`yaw>0` 向左转头），客户端按 `seq` 丢旧帧，
+慢客户端不会拖慢手机推理（每个客户端只有「最新一帧」槽位）。
+
+---
+
+## 🎛 ARKit-52 → Live2D 参数映射
+
+映射算法在 **[`docs/tracking-protocol.md` §8](docs/tracking-protocol.md)** 里给了完整的参考实现，
+Windows 客户端 `renderer/mapping.js` 与它逐行等价，和旧版手机端渲染器手感一致：
+
+- 眼睛 / 嘴巴 / 眼球：`ParamEyeLOpen = 1 - eyeBlinkLeft`、`ParamMouthOpenY = jawOpen`、
+  `ParamMouthForm = (smileL + smileR)/2 - (frownL + frownR)/2`，眼球由 `eyeLook*` 合成；
+- 头部姿态：先过 **自适应归一化器**（负向 / 正向量程各自动态跟随，前 100 帧与默认量程线性混合），
+  再乘系数写入 `ParamAngleX/Y/Z` 与 `ParamBodyAngleX`；
+- 渲染层要求：关掉 Cubism 自带的自动眨眼与鼠标跟随，保留 physics 与 idle motion，
+  在 `InternalModel` 的 `beforeModelUpdate` 事件里**绝对赋值**我们算出来的参数。
+
+`mapping.js` 是纯函数模块（无 DOM / 无 PIXI），可以直接在 Node 里跑数值单测：
+
+```bash
+cd windows-client
+node -e "import('./renderer/mapping.js').then(m => console.log(m.mapTrack({bs:new Array(52).fill(0), pose:[10,-20,5]})))"
+```
+
+---
+
+## 🖥 OBS / 直播叠加
+
+三条路，按需选：
+
+| 方式 | 怎么用 | 适合 |
+|------|--------|------|
+| **窗口捕获**（推荐） | Electron 客户端勾上「透明 + 无边框」，OBS 加「窗口捕获」 | 最简单的叠加，延迟最低 |
+| **显示器捕获 / 虚拟摄像头** | 客户端全屏 + OBS 显示器捕获 / 系统虚拟摄像头 | 想要固定分辨率与构图 |
+| **OBS 浏览器源** | OBS 加「浏览器」，URL 填 `http://127.0.0.1:17890/?ws=ws://<手机IP>:8765/ws`，宽高自定（如 720×720），勾「不可见时关闭源」 | 不需要开 Electron，OBS 直接吃透明网页 |
+
+页面支持的查询参数：
+
+| 参数 | 取值 | 默认 | 说明 |
+|------|------|------|------|
+| `ws` | `ws://ip:8765/ws` | `ws://127.0.0.1:8765/ws` | 手机地址（不填则用上次记住的） |
+| `model` | 目录名，如 `ATRI` | 上次记住的 / 第一个 | 指定初始模型 |
+| `transparent` | `0` / `1` | `0` | 透明底（Electron 会自己带这个参数） |
+
+> 💡 浏览器源默认 30 fps 采样；客户端窗口模式没有这个限制，追求手感优先用窗口捕获。
+
+---
+
+## 🏗 构建与发布
+
+### 本地构建
+
+```bash
+./gradlew :app:assembleDebug          # 调试包
+./gradlew :app:assembleRelease        # 发布包（未配签名时回退 debug key）
+./gradlew :app:testDebugUnitTest      # 追踪协议的 JVM 单元测试
+```
+
+> 首次构建需要 `git submodule update --init --depth 1 ThirdParty/MNN` 拿到 MNN 头文件；
+> 本机 SDK 里的 build-tools 与 AGP 期望版本不一致时，加 `-Pandroid.builder.sdkDownload=false`
+> 让 Gradle 用已安装的版本。
 
 ### GitHub Actions 自动构建（每次修改出包）
 
@@ -142,8 +325,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-> 💡 想省去本地 Android 环境，直接从 Actions 产物下载 APK 安装即可；
-> 本地构建则需先执行上面的 `git submodule update` 获取 MNN 头文件。
+> CI 只构建 Android 端；Windows 客户端是纯 JS，不需要编译，克隆下来 `npm install` 即可用。
 
 ### 签名 / Release 打包
 
@@ -220,9 +402,11 @@ apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk
 
 顺带一提：**测帧率一定用 release 包**，debug 包带调试信息、跑得明显更慢。
 
-### 作为 SDK 集成
+---
 
-如果只想要面捕能力（不要 Live2D 渲染），请参考
+## 🧩 作为 SDK 集成
+
+如果只想要面捕能力（自己接渲染、或送到别的地方），请参考
 [`facecapture-sdk/README.md`](facecapture-sdk/README.md)，门面 API 形如：
 
 ```kotlin
@@ -231,146 +415,14 @@ engine.initialize(context)
 engine.setResultListener { result ->
     val landmarks   = result.landmarks         // 478 个 3D 关键点
     val blendShapes = result.blendShapes       // ARKit 52 BlendShape
-    val pose        = result.relativeHeadPose  // pitch / yaw / roll
+    val pose        = result.relativeHeadPose  // pitch / yaw / roll（相对基线）
 }
 // 把 CameraX 的 ImageProxy 喂进来
 engine.pushFrame(image, rotationDegrees)
 ```
 
----
-
-## 🎮 操作指南
-
-进入 Demo 后，屏幕底部会弹出一个可滚动的 **控制面板 (ControlPanel)**，
-顶部显示当前加载的 Live2D 模型名。所有按钮 / 滑块的作用如下：
-
-### 按钮区
-
-| 按钮 | 状态切换 | 作用 |
-|------|----------|------|
-| **Start / Stop** | 红 ↔ 主色 | 启停整条面捕管线（摄像头采集 + 推理 + 驱动），关闭时模型会停在最后一帧的姿态 |
-| **Show Debug / Hide Debug** | — | 显隐顶部的调试 HUD：FPS、推理耗时、头部 pitch/yaw/roll、EAR、BlendShape 数值等 |
-| **Show Camera / Show Live2D** | 第三色 ↔ 第二色 | 切换主画面：Live2D 渲染视图 ↔ 相机预览 + 关键点叠加，方便排查跟踪问题 |
-| **Select Model** | — | 弹出对话框选择 `assets/` 下的 Live2D 模型（默认提供 sensi / ATRI 等） |
-| **Reset Baseline** | — | **基线重置**：把当前帧的头姿 / 表情记为「中性脸」，类似 OpenSeeFace 的首帧标定。佩戴眼镜、换光线、换人时建议重新点一下 |
-| **Blink Curve: ON / OFF** | 绿 ↔ 第二色 | 是否启用**自动眨眼曲线整形**。开启后会把检测到的眨眼事件整形为更自然的 230 ms 曲线（避免抖动 / 半眨），关闭则直接透传原始 EAR |
-| **Camera: 前置 / 后置 / 外接** | — | 打开**多摄像头选择**对话框：列出设备全部摄像头（前置 / 后置 / 逻辑多摄 / USB 外接），选中后立即切换；选择会被记住，下次启动自动恢复 |
-| **Web Output** | — | 打开**浏览器输出**对话框：启动 / 停止输出服务、复制局域网地址、调整输出高度 / 帧率 / 质量、查看连接状态，详见下文「浏览器输出 / OBS」 |
-| **Backend: Vulkan / CPU** | 紫 ↔ 青绿 | **运行时切换 MNN 推理后端**（会重建推理 session，画面中断一帧左右）。Vulkan 和 CPU 谁更快**因机型而异**（GPU 驱动质量、与 Live2D 的 GPU 争用、每帧 GPU→CPU 回读开销都不同），帧率不够稳时可以点一下实测对比，详见 [PERFORMANCE.md](PERFORMANCE.md) |
-
-### 滑块区
-
-| 滑块 | 取值范围 | 说明 |
-|------|----------|------|
-| **Blink Speed** *(仅在 Blink Curve 开启时显示)* | 0.5x ～ 3.0x | 控制整形后的眨眼速度，数值越大眨眼越慢越柔和；面板会同时显示对应的毫秒数（如 `1.0x (230ms)`）。`< 0.8x` 为「Fast blink」，`> 1.5x` 为「Slow & smooth」 |
-| **Eye Sensitivity** | 0.5x ～ 2.0x | 眼部 EAR 阈值的灵敏度系数。下方实时显示当前生效的 `closed / open` 阈值；`< 0.8x` 需要更大幅度的眨眼才会触发（适合大眼妆 / 戴眼镜），`> 1.3x` 则对细微动作更敏感（适合表情戏多的录播） |
-
-> 💡 TIPS：第一次跑、或者换了模型 / 换了人脸之后，建议先正脸看镜头点一次
-> **Reset Baseline**，然后根据自己的眨眼习惯把 **Eye Sensitivity** 调到刚好能稳定触发即可。
-
-### 多摄像头支持
-
-Demo 现在支持在**多个摄像头之间切换**（不是同时采集多路）：
-
-- 自动枚举 `CameraManager` 暴露的全部摄像头：前置、后置、逻辑多摄以及外接 USB 摄像头；
-- 默认仍优先选择前置摄像头；没有前置时自动回退到后置 / 外接，单摄设备行为保持不变；
-- 点击控制面板的 **Camera: …** 按钮可随时切换；如果正在追踪，会**原地重启采集管线**，追踪开关状态与 Live2D 画面不中断；
-- 每台摄像头都会重新读取 **sensor orientation / 垂直 FOV**，据此计算帧旋转与头姿标定；切换后自动重新标定中性脸，避免前后摄 FOV 不同导致头姿偏移；
-- 预览镜像跟随镜头朝向：前置镜像（照镜子），后置 / 外接保持真实画面；
-- 选择结果按 camera id 保存在本地，下次启动自动恢复；如果该摄像头已不存在（比如拔掉 USB 摄像头），会安全回退到默认前置。
-
-> ⚠️ 同一时刻只使用一路摄像头。同时打开多路摄像头需要设备支持并发流
-> （`LOGICAL_MULTI_CAMERA` / concurrent stream），不在本功能的范围内。
-
----
-
-## 📺 浏览器输出 / OBS
-
-Demo App 内置了 **浏览器输出 (Web Output)**：把手机端 Live2D 的渲染结果实时编码，通过
-**局域网 HTTP / WebSocket** 推给浏览器，OBS 加一个「浏览器源 (Browser Source)」就能把皮套
-叠加到直播 / 录屏画面上。网页背景**默认透明**，OBS 直接采集即可拿到 alpha 通道，不需要抠像。
-
-> 💡 适合「游戏画面 / 桌面 + 皮套」这类叠加场景：透明通道随 WebSocket 推送的 WebP 帧一起传，
-> 电脑上不用装任何额外的推流或虚拟摄像头软件。
-
-### 打开方式
-
-底部控制面板新增 **Web Output** 按钮，点开是一个对话框，包含：
-
-| 项目 | 说明 |
-|------|------|
-| **Start / Stop** | 启动 / 停止浏览器输出服务，**默认关闭** |
-| **访问地址** | 局域网访问地址，形如 `http://192.168.1.23:8765/`，可复制 |
-| **输出高度** | 360 / 480 / 640 / 720 / 1080，默认 640 |
-| **自动降分辨率** | 默认开启：编码一帧的耗时吃不进目标帧率（超过预算的 85%）就自动降一档输出高度，负载下来再升回去；关掉则严格按设定高度输出 |
-| **输出帧率** | 15 ～ 60 FPS，默认 30 |
-| **编码质量** | 40 ～ 95，默认 75，越高越清晰、码率也越大 |
-| **运行状态** | 当前是否运行、客户端数，以及 `输出 fps · 抓帧 fps · 编码 ms/帧`：**抓帧高而编码低 = 编码跟不上**（此时该降高度 / 降质量，或让它自动降），两个都低则是手机端渲染/编码整体吃力 |
-| **OBS 提示** | 对话框内附带的 OBS 使用提示 |
-
-服务固定监听 `0.0.0.0:8765`，端口不可改；手机 IP 变了，访问地址也会跟着变。
-
-**OBS 里帧率偏低怎么查**（按顺序排除）：
-
-1. 对话框里的 `输出 fps` 是否接近设定值？接近 → 手机侧没问题，问题在 OBS / 网络；
-   明显更低 → 看同一行的 `编码 ms/帧`，它超过 `1000 / 帧率` 就是编码跟不上（开自动降分辨率、降高度或降质量）。
-2. 浏览器源属性里 **FPS** 一栏是不是被设成了 10 / 20（默认 30，也可能是"自定义帧率"）；OBS 本身有性能问题时可先设 30 不要设 60。
-3. 地址后面加 `?hud=1` 打开页面状态条，看它显示的 fps 和"已连接"是否稳定；反复显示"重连中"就是 Wi-Fi 丢包。
-4. 页面参数建议 `dpr=1`（OBS 下不需要 2 倍渲染），并把浏览器源的分辨率设成和输出高度接近的值。
-
-### 页面地址与参数
-
-主页面 `http://<手机IP>:8765/` 由 WebSocket 持续推送 **WebP（带 alpha）** 帧，支持以下查询参数：
-
-| 参数 | 取值 | 默认 | 说明 |
-|------|------|------|------|
-| `bg` | `transparent` / `black` / `white` / `green` | `transparent` | 背景色，`green` 配合 OBS 色度键使用 |
-| `fit` | `contain` / `cover` / `stretch` | `contain` | 缩放方式，`contain` 居中显示且不裁切 |
-| `mirror` | `0` / `1` | `0` | `1` 时水平镜像，得到「照镜子」的观感 |
-| `hud` | `0` / `1` | `0` | `1` 时左上角显示状态条（连接状态 / fps / 分辨率 / 模型名） |
-| `dpr` | `1` / `2` / `auto` | `auto` | 页面渲染倍率，OBS 下建议固定为 `1` |
-
-参数直接拼在地址后面，多个用 `&` 连接：
-
-```
-http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
-```
-
-备用地址：
-
-| 地址 | 说明 |
-|------|------|
-| `http://<手机IP>:8765/stream.mjpg` | 备用 MJPEG 流，**无透明通道**，适合简单场景或其它支持 MJPEG 的软件 |
-| `http://<手机IP>:8765/status` | 返回 JSON 状态，便于排障 |
-
-页面快捷键：`h` 切换状态条、`m` 切换镜像、`r` 重连。
-
-### OBS 浏览器源配置
-
-1. 手机和电脑连到**同一个 Wi-Fi / 局域网**；
-2. 在 App 里打开 **Web Output**，记下对话框里显示的访问地址（如 `http://192.168.1.23:8765/`）；
-3. OBS → **来源** → `+` → **浏览器**，URL 填上一步的地址，宽度 / 高度按需设置（如 `720 × 720`），
-   勾选「不可见时关闭源」和「场景激活时刷新浏览器」；
-4. 页面默认就透明，直接把这个源叠在游戏画面上即可；想要纯色背景就在地址后面加 `?bg=black` /
-   `?bg=white` 等，或者用 `?bg=green` 再给源加一个「色度键」滤镜抠像。
-
-| 选项 | 作用 |
-|------|------|
-| 不可见时关闭源 | 当源不可见时一并关掉页面，省电并释放手机端连接 |
-| 场景激活时刷新浏览器 | OBS 刷新该源时重新加载页面，改过的 URL 参数会立即生效 |
-
-> 💡 不同 OBS 版本的中文翻译可能略有差异，按对应的
-> **Shutdown source when not visible** / **Refresh browser when scene becomes active** 勾选即可。
-
-> 💡 建议把浏览器源的「自定义帧率」设成与对话框里的输出帧率一致（例如都是 30），
-> 否则 OBS 侧只会重复采样或丢帧，画面看起来反而更卡。
-
-### 注意事项
-
-- **仅限局域网**：服务没有鉴权，不要在公网环境或不可信的 Wi-Fi 下开启。
-- **需要 App 在前台**：切后台 / 锁屏会停止渲染，画面停在最后一帧（App 已自动保持屏幕常亮）。
-- **性能开销**：输出高度、帧率、质量越高，手机编码压力和带宽越大；默认 `30fps / 640 / 75` 一般够用。
-- **透明通道只有 WebSocket 主页面才有**，`/stream.mjpg` 的 MJPEG 是纯 RGB，没有 alpha。
+想直接复用两端的约定，照抄 `docs/tracking-protocol.md` 就行 —— 它就是给
+「手机产出数据、别处渲染」这种用法准备的。
 
 ---
 
@@ -386,14 +438,16 @@ http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
 - **仿 OpenSeeFace 后处理**：参考 Python 版的 `tracker.py` / `similaritytransform.py`
   重写为 C++/Kotlin，包括 One-Euro 平滑、首帧标定、眨眼曲线整形等。
 - **ARKit-52 BlendShape 自解算**：不依赖 MediaPipe 的第三个 BlendShape 模型，
-  直接基于 478 关键点几何关系解算，省一次推理（其实主要问题是 blend shape 模型直出的
-  产物很难救，但推理代码还是留在工程里了，有需要的自取）。
+  直接基于 478 关键点几何关系解算，省一次推理。
 - **可发布的 AAR**：`:facecapture-sdk` 模块已经配置好 `maven-publish`，
   可一键打包成独立的面捕 SDK。
 - **多摄像头**：运行时枚举并切换前置 / 后置 / 外接摄像头，按设备重算旋转、
   垂直 FOV 与预览镜像，切换后自动重新标定中性脸。
-- **浏览器输出**：渲染结果可直接作为 OBS 浏览器源（透明背景 / MJPEG 备用），
-  手机即「推流端」，电脑侧无需额外的推流或虚拟摄像头软件。
+- **推流不拖累推理**：每个 WS 客户端只有「最新一帧」覆盖槽，慢网络只会丢帧，
+  不会把手机的推理线程堵住。
+- **两端可独立验证**：手机端有协议的 JVM 单元测试；电脑端有
+  `tools/verify/`（假手机端 + 无头 Chrome 截图 + 映射数值单测），
+  改协议 / 改映射都能在 CI 之外本地跑一遍。
 
 ---
 
@@ -401,8 +455,13 @@ http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
 
 ```
 VirtualFaceCapture-MNN/
-├── app/                         # Demo + Live2D 联动
-├── Live2D/                      # Cubism SDK 封装
+├── app/                         # 安卓采集端（相机 + 面捕 + 追踪数据服务）
+│   └── src/main/java/.../tracking/   # TrackingServer / TrackingProtocol / TrackingOutputManager
+├── windows-client/              # Windows 渲染端（Electron + Cubism Web）
+│   ├── electron/                #   桌面壳（透明 / 无边框 / 置顶 / 鼠标穿透）
+│   ├── renderer/                #   页面、映射 (mapping.js)、Cubism 渲染 (live2d.js)
+│   ├── server.js                #   本地静态服务（零依赖，127.0.0.1:17890）
+│   └── models/                  #   Live2D 模型（自动发现）
 ├── MediapipeFaceLandmark/       # MNN 推理 + NEON 优化的核心
 │   ├── src/main/assets/         #   .mnn 模型 (detector / landmark)
 │   ├── src/main/cpp/            #   C++ 流水线、YUV、几何
@@ -413,15 +472,22 @@ VirtualFaceCapture-MNN/
 ├── OpenSeeFaceProcess/          # 仿 OpenSeeFace 后处理
 ├── CommonData/                  # 共享数据类
 ├── facecapture-sdk/             # 对外发布的 AAR 门面
-└── ThirdParty/MNN/              # 仅提供 MNN 头文件 
+├── docs/tracking-protocol.md    # 两端通信协议（唯一契约）
+├── tools/verify/                # 端到端验证脚本
+├── Live2D/                      # 旧版手机端渲染（已停止构建，仅参考）
+└── ThirdParty/MNN/              # 仅提供 MNN 头文件
 ```
-
 
 ---
 
 ## 💡 遗留问题
 
-由于模型参数表现自带差异，人脸形状也是各有不同，以及点位的映射很难做到理想意义上的 0-1 值，所以实际上在 OpenSeeFaceProcess 后处理里面很多阈值设定偏向工程 trick（多次发动了俺寻思之力），目前暂时想不到一个在任何情况下都很完美的办法，如果有其他好的后处理方案欢迎直接提 PR (￣▽￣)"
+- 由于模型参数表现自带差异，人脸形状也是各有不同，以及点位的映射很难做到理想意义上的
+  0-1 值，所以实际上在 OpenSeeFaceProcess 后处理里面很多阈值设定偏向工程 trick
+  （多次发动了俺寻思之力），目前暂时想不到一个在任何情况下都很完美的办法，
+  如果有其他好的后处理方案欢迎直接提 PR (￣▽￣)"
+- 自适应归一化器是「按人头学」的：换人 / 大幅换姿势后建议点一次 **重置基线**。
+- 局域网内没有鉴权，**只在可信网络里开**。
 
 ---
 
@@ -432,3 +498,4 @@ VirtualFaceCapture-MNN/
 - [google/mediapipe](https://github.com/google/mediapipe)
 - [emilianavt/OpenSeeFace](https://github.com/emilianavt/OpenSeeFace)
 - [alibaba/MNN](https://github.com/alibaba/MNN)
+- [pixi.js](https://github.com/pixijs/pixijs) / [pixi-live2d-display](https://github.com/guansss/pixi-live2d-display) / [Live2D Cubism SDK](https://www.live2d.com/en/sdk/)

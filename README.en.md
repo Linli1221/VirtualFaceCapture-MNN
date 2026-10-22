@@ -1,30 +1,48 @@
 # VirtualFaceCapture-MNN
-> ✨ An Android virtual-avatar face-capture system, powered by the [alibaba-MNN](https://github.com/alibaba/MNN) inference engine.
 
-> 🌐 中文版 README: [README.md](./README.md)
+> ✨ **Android face capture → Windows rendering.** The phone only runs face capture; tracking
+> frames are streamed over the local network via WebSocket, and a Windows client drives the
+> Live2D avatar. Inference is built on [alibaba-MNN](https://github.com/alibaba/MNN).
+
+> 🌐 中文说明: [README.md](./README.md)
 
 [![Android CI](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml/badge.svg)](https://github.com/Linli1221/VirtualFaceCapture-MNN/actions/workflows/android-ci.yml)
-
 ___
 
-## 🧠 Overview
-A mobile-side reimplementation of **MediaPipe Face Landmarker** on top of the
-**MNN** inference engine, paired with an **OpenSeeFace-style** post-processing
-pipeline to drive **Live2D** avatars in real time.
-(After trying many alternatives it turns out Google's models are still the only
-ones that hold up well on mobile -.-)
+## 🧠 What this is
 
-The whole capture pipeline has been completely **stripped out of the MediaPipe
-source tree**: no `CalculatorGraph`, no JavaCV / OpenCV-Android, no MediaPipe
-Tasks Java layer. Everything runs on **MNN + MNN-CV + native C++ post-processing**,
-with hot paths (pose estimation, point-cloud transforms, …) accelerated by
-**ARM NEON** SIMD intrinsics. End-to-end the system pushes close to **60 FPS**
-on a Snapdragon 888 device. 🎉
+A mobile port of **MediaPipe Face Landmarker** running on the **MNN** inference engine,
+followed by an **OpenSeeFace-inspired** post-processing pipeline that outputs
+**ARKit-52 blendshapes + head pose** at ~60 fps.
 
-> 📈 For the full frame-rate optimization breakdown, log reading guide and
-> on-device tuning steps see **[PERFORMANCE.md](PERFORMANCE.md)** (10 Hz detection
-> throttling, single-consumer dispatch, runtime Vulkan⇄CPU MNN backend switch,
-> preview RGB gating, batched Compose updates, zero-allocation post-processing, …).
+This version splits the system in two:
+
+```
+   Phone (Android)                              PC (Windows)
+┌────────────────────────┐   Wi-Fi / LAN     ┌────────────────────────┐
+│ Camera → MNN inference  │   ~0.5 KB/frame  │ WebSocket client        │
+│ 478 landmarks → post    │   WebSocket JSON │ adaptive normalizer     │
+│ ARKit-52 + pose (no GL) │  ───────────────►│ → Live2D params         │
+└────────────────────────┘      60 fps       │ Cubism Web + PIXI       │
+                                             └────────────────────────┘
+```
+
+Why split it:
+
+| | Phone = capture only | PC = render |
+|---|---|---|
+| **Heat / battery** | drops the whole GL render + encode path, steadier inference | — |
+| **Quality** | — | rendered on the desktop GPU, any window size |
+| **Overlay** | — | transparent always-on-top window over games, or an OBS browser source |
+| **Iteration** | change avatar / mapping without reinstalling the app | drop a model folder in, it is auto-discovered |
+
+The phone keeps the full debugging toolbox: camera preview with landmark overlay, fps and
+frame cost, head-pose indicator, raw ARKit values, blink curve and eye sensitivity, and a
+runtime MNN backend switch (Vulkan / CPU).
+
+> 📈 The phone-side performance notes, log reading and on-device tuning guide live in
+> **[PERFORMANCE.md](PERFORMANCE.md)** (sections about on-device Live2D rendering are
+> historical — rendering moved to the Windows client).
 
 ---
 
@@ -37,25 +55,26 @@ on a Snapdragon 888 device. 🎉
 
 ---
 
-## 🧠 Architecture at a Glance
+## 🧠 Approach
 
 In one sentence:
 
-> **Port MediaPipe Face Landmarker's Detection + Landmark models onto MNN,
-> rebuild the pre/post image-processing in native code, then bolt on an
-> OpenSeeFace-style smoothing & expression solver to emit ARKit-52 BlendShapes
-> + head pose for driving Live2D.**
+> **Run MediaPipe's Face Detection + Face Landmark models on MNN, implement the whole
+> pre/post-processing yourself, add an OpenSeeFace-style smoothing and expression solver,
+> and output ARKit-52 blendshapes + head pose. The phone only produces that data;
+> Live2D is drawn on the PC.**
 
-Differences vs. the official MediaPipe Android stack:
+Differences from the stock MediaPipe Android pipeline:
 
-| Aspect | Official MediaPipe Tasks | This project (MNN port) |
-|--------|--------------------------|--------------------------|
-| Inference engine | TFLite + GPU Delegate | **MNN** (CPU / GPU / NNAPI backends) |
-| Graph scheduling | MediaPipe `CalculatorGraph` | **Native C++ pipeline**, zero graph deps |
-| Image processing | JavaCV / OpenCV / GL | **MNN-CV** + **NEON kernels** |
-| Model count | Detection + Landmark + Blendshape | **Detection + Landmark only**, BlendShape solved geometrically |
-| Post-processing | Built into MediaPipe | **OpenSeeFace-style** smoothing / calibration / head-pose recovery |
-| Footprint | `mediapipe_tasks_vision.aar` | Just `libMNN.so` + `libmediapipefacelandmark.so` + 2 `.mnn` files |
+| Aspect | Official MediaPipe Tasks | This project (MNN) |
+|--------|--------------------------|--------------------|
+| Inference | TFLite + GPU delegate | **MNN** (CPU / GPU / NNAPI backends) |
+| Scheduling | MediaPipe CalculatorGraph | **local C++ pipeline**, zero graph runtime |
+| Image ops | JavaCV / OpenCV / GL | **MNN-CV** + **NEON kernels** |
+| Models | Detection + Landmark + Blendshape | **Detection + Landmark** only, blendshapes solved in-house |
+| Post-processing | built into MediaPipe | OpenSeeFace-style smoothing / calibration / pose recovery |
+| Rendering | on device | **Windows client** (Cubism Web), no rendering on the phone |
+| Size | needs mediapipe_tasks_vision aar | only `libMNN.so` + `libmediapipefacelandmark.so` + 2 `.mnn` models |
 
 ---
 
@@ -65,317 +84,323 @@ Differences vs. the official MediaPipe Android stack:
             ┌───────────────────────────────┐
 Camera ───► │ YUV_420_888 (Camera2/CameraX) │
             └──────────────┬────────────────┘
-                           │  NEON YUV→RGB / rotation / resize
+                           │  NEON YUV→RGB / rotate / scale
                            ▼
               ┌──────────────────────────┐
               │  FaceDetector  (MNN)     │   face_detector_mp.mnn
-              │   - BlazeFace style      │   (int8-quantized variant included)
+              │   BlazeFace-style        │   (+ int8 variant)
               └──────────────┬───────────┘
                              │ ROI affine crop (MNN-CV)
                              ▼
               ┌──────────────────────────┐
               │  FaceLandmark (MNN)      │   face_landmark_detector_mp.mnn
-              │   - 478 3D landmarks     │
+              │   478 3D landmarks       │
               └──────────────┬───────────┘
-                             │
                              ▼
-              ┌──────────────────────────────────────────────┐
-              │  OpenSeeFace-style post-processing (C++/Kt)  │
-              │   • PnP / SVD head-pose recovery (p/y/r)     │
-              │   • Blink curve + mouth + brows              │
-              │   • One-Euro / rolling-mean smoothing        │
-              │   • Auto baseline calibration (1 s window)   │
-              │   • ARKit-52 BlendShape solver               │
-              └──────────────┬───────────────────────────────┘
+              ┌───────────────────────────────────────────────┐
+              │  OpenSeeFace-style post-processing (C++/Kotlin)│
+              │   • PnP / SVD head pose (pitch/yaw/roll)      │
+              │   • blink curve + mouth + brows               │
+              │   • One-Euro / rolling mean smoothing         │
+              │   • first-frame calibration                   │
+              │   • ARKit-52 blendshape solve                 │
+              └──────────────┬────────────────────────────────┘
                              ▼
-              ┌──────────────────────────┐
-              │  Live2D Cubism Renderer  │   ARKit → Live2D mapping
-              └──────────────────────────┘
+              ┌──────────────────────────┐        ┌───────────────────────────┐
+              │  TrackingServer (phone)   │ ─────► │ Windows client (PC)       │
+              │  WS /ws, JSON, ~60 fps    │  Wi-Fi │ normalizer → Live2D params│
+              └──────────────────────────┘        │ Cubism Web + PIXI         │
+                                                  └───────────────────────────┘
 ```
 
-Linear algebra (matrix multiplies, affine transforms, SVD, Jacobi rotations,
-3×N point-cloud transforms…) all goes through local `mini_linalg` +
-`neon_intrinsics` headers, vectorized for the typical 3×N landmark shapes —
-load time and first-frame latency drop noticeably vs. the scalar baseline.
+All matrix math / affine transforms / SVD / Jacobi rotations / point-cloud transforms use
+the local `mini_linalg` + `neon_intrinsics` (vectorized for the typical 3×N landmark shape).
 
 ---
 
-## 📦 Modules
+## 📦 Layout
 
-Standard multi-module Gradle project:
+A multi-module Gradle project plus a standalone Windows client:
 
-| Module | Purpose |
-|--------|---------|
-| `:app` | Demo app: camera, UI, Live2D rendering, parameter mapping |
-| `:Live2D` | Cubism SDK wrapper (CMake + JNI) |
-| `:MediapipeFaceLandmark` | **Core inference**: MNN + `.mnn` models + native C++ pipeline + NEON |
-| `:OpenSeeFaceProcess` | OpenSeeFace-style post-processing: smoothing, head pose, BlendShape solver |
-| `:CommonData` | Shared types (`Point3D` / `HeadPose` / `ARKitBlendShapes` …) |
-| `:facecapture-sdk` | Public AAR facade wrapping the three modules above |
-| `ThirdParty/MNN/` | MNN headers only |
+| Path | What it is |
+|------|-----------|
+| `app/` | **Android capture app**: camera, face pipeline, debug HUD, WebSocket tracking server |
+| `windows-client/` | **Windows renderer**: Electron + Cubism Web, connects to the phone and draws Live2D |
+| `docs/tracking-protocol.md` | **The single contract** between both sides: VFC Tracking Protocol v1 |
+| `:MediapipeFaceLandmark` | **core inference**: MNN + `.mnn` models + native C++ pipeline + NEON |
+| `:OpenSeeFaceProcess` | OpenSeeFace-style post-processing: smoothing, pose, blendshape solve |
+| `:CommonData` | shared data types (`Point3D` / `HeadPose` / `ARKitBlendShapes` …) |
+| `:facecapture-sdk` | publishable AAR facade over the modules above |
+| `Live2D/` | **no longer built.** Legacy on-device Cubism SDK wrapper (CMake + JNI), kept for reference |
+| `ThirdParty/MNN/` | headers only |
+| `tools/verify/` | end-to-end verification (mock phone + headless Chrome screenshots + mapping unit tests) |
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick start
 
-### Build & run
+### 1. Phone (Android)
 
 ```bash
-git clone https://github.com/<your-name>/VirtualFaceCapture-MNN.git
+git clone https://github.com/Linli1221/VirtualFaceCapture-MNN.git
 cd VirtualFaceCapture-MNN
-git submodule update --init --depth 1 ThirdParty/MNN   # only the MNN headers are needed
+./check_setup.sh                                     # optional: sanity-check the layout
+git submodule update --init --depth 1 ThirdParty/MNN   # headers only
 ./gradlew :app:assembleDebug
-# Or just open the project in Android Studio and hit Run.
+# or just open the project in Android Studio and run "app"
 ```
 
-Grant the camera permission on first launch, keep your face in frame, tap
-**Start**, and the Live2D avatar will mirror your expression & head pose
-in real time.
+Install on an arm64 device, grant camera permission, then:
 
-### GitHub Actions (every change gets a build)
+1. tap **Start** and check the preview;
+2. tap **Reset baseline** (recommended whenever lighting, glasses or the person changes);
+3. tap **Network output** → start, and note the address, e.g. `ws://192.168.1.23:8765/ws`.
 
-[Android CI](.github/workflows/android-ci.yml) builds the installable APK for
-**every modification**:
+> Phone and PC must be on the same LAN. Keep the app in the foreground — Android's camera
+> model stops capture when you leave the activity (the app keeps the screen awake while running).
 
-- **Every push (any branch) / every PR** builds the Debug + Release APKs plus the
-  SDK AAR; download them from `Actions` → the run → `Artifacts` (kept 30 days);
-- CI artifacts carry the version `1.0.<run number>+<commit>` (monotonic
-  versionCode), so they install straight over older builds;
-- **To publish a release**: push a `v*` tag and a GitHub Release with the APKs is
-  created automatically:
+### 2. Windows
+
+Requires **Node.js ≥ 20** (only for the local server and the Electron shell — no native build).
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+cd windows-client
+npm install
+npm start            # Electron client
 ```
 
-> 💡 No local Android toolchain needed — just grab the APK from the Actions
-> artifacts. For local builds, run the `git submodule update` above first to get
-> the MNN headers.
+Then type the phone address `ws://<phone-ip>:8765/ws` into the address bar and hit Enter.
+The status dot turns green, phone model / input fps / RTT appear, and the avatar starts moving.
 
-### Use as an SDK
+**Without Electron** (plain browser window, e.g. for OBS):
 
-If you only need the capture pipeline (no Live2D rendering), see
-[`facecapture-sdk/README.md`](facecapture-sdk/README.md). The facade API
-looks like:
-
-```kotlin
-val engine = FaceCaptureEngine.create()
-engine.initialize(context)
-engine.setResultListener { result ->
-    // --- Raw perception layer (MediaPipe FaceLandmarker on MNN) ---
-    val landmarks = result.landmarks         // 478 normalized 3D points
-    val imgW      = result.imageWidth
-    val imgH      = result.imageHeight
-    val bbox      = result.detectionBox
-    val presence  = result.presenceScore     // model confidence in [0, 1]
-
-    // --- Post-processed layer (OpenSeeFace-style stack) ---
-    val blendShapes = result.blendShapes     // 52 ARKit BlendShapes, smoothed
-    val rawPose     = result.rawHeadPose     // raw pitch / yaw / roll
-    val relPose     = result.relativeHeadPose // baseline-subtracted
-}
-// Push frames from CameraX:
-engine.pushFrame(image, rotationDegrees)
+```bash
+npm run web      # starts the server and opens an Edge --app window
+npm run serve    # static server only → http://127.0.0.1:17890/
+npm run mock     # fake phone on ws://127.0.0.1:8765/ws, no device needed
 ```
 
-Both layers (raw landmarks **and** post-processed BlendShape / head pose) come
-from the same frame atomically — integrators can pick whichever they need.
+`node server.js` works even without `node_modules`: the server has zero dependencies and
+`renderer/vendor/` ships browser builds of pixi / pixi-live2d-display / Cubism Core.
+
+### 3. Where do models come from?
+
+Drop them into `windows-client/models/<name>/<anything>.model3.json` — folders are
+auto-discovered and shown by folder name. Four are bundled: `ATRI`, `sensei`, `Yuuka`, `zzzz`.
 
 ---
 
 ## 🎮 Controls
 
-When the demo launches, a scrollable **ControlPanel** appears at the bottom of
-the screen with the current Live2D model name on top. All buttons and sliders:
+### Phone panel
 
-### Buttons
+| Control | What it does |
+|---------|--------------|
+| **Start / Stop** | camera + inference pipeline |
+| **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). Also remotely triggerable from the PC via `command: recalibrate` |
+| **Network output** | start/stop the tracking server, copy the `ws://` address, see client count and output fps, open the `/status` page |
+| **Camera: front / back / external** | enumerate and switch cameras; re-calibrates after switching, remembers the choice |
+| **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |
+| **Blink curve / speed** | shape blinks into a natural 230 ms curve, adjustable speed |
+| **Eye sensitivity** | eye EAR threshold sensitivity (0.5x–2.0x) with live closed/open thresholds |
+| **Debug / landmarks** | fps, frame cost, pitch/yaw/roll with bars, raw ARKit values, landmark + bbox overlay |
 
-| Button | Toggled state | Effect |
-|--------|---------------|--------|
-| **Start / Stop** | Red ↔ primary | Start / stop the whole capture pipeline (camera + inference + driving). When stopped, the avatar freezes at the last pose. |
-| **Show Debug / Hide Debug** | — | Show or hide the on-screen debug HUD: FPS, inference timings, head pitch/yaw/roll, EAR, raw BlendShape values, etc. |
-| **Show Camera / Show Live2D** | tertiary ↔ secondary | Switch the main view between the Live2D render and the camera preview (with landmarks overlay) — handy for diagnosing tracking issues. |
-| **Select Model** | — | Open a dialog to pick a Live2D model from `assets/` (sensi / ATRI / … bundled). |
-| **Reset Baseline** | — | Recalibrate: treat the current frame as the "neutral face" for head pose and expressions. Recommended whenever you put on glasses, change lighting, or hand the phone to a different person. |
-| **Blink Curve: ON / OFF** | Green ↔ secondary | Toggle the **natural-blink curve shaper**. When on, raw blink events are reshaped into a smoother ~230 ms curve (no jitter / half-blinks). When off, the raw EAR is passed through. |
-| **Camera: Front / Back / External** | — | Open the **camera picker**: lists every camera exposed by the device (front / back / logical multi-cam / USB external) and switches capture instantly. The choice is remembered across launches. |
-| **Web Output** | — | Open the **Web Output** dialog: start / stop the server, copy the LAN URL, tune output height / FPS / quality and watch the connection status. See "Web Output / OBS" below. |
-| **Backend: Vulkan / CPU** | purple ↔ teal | **Switch the MNN inference backend at runtime** (rebuilds the inference sessions; the picture pauses for about one frame). Which one is faster is **device-dependent** (GPU driver quality, contention with the Live2D renderer, per-frame GPU→CPU read-back cost), so tap it to A/B test when the frame rate is not stable. Details in [PERFORMANCE.md](PERFORMANCE.md). |
+### Windows client
 
-### Sliders
+| Control | What it does |
+|---------|--------------|
+| **Address + Connect** | connect to the phone; the URL is remembered |
+| **Model select + Reload** | switch Live2D model (auto-discovered), reload after editing files |
+| **Transparent** | transparent window background (recreates the window) |
+| **Borderless** | no title bar — combine with transparent for a "character only" overlay |
+| **Always on top** | keep the avatar above other windows |
+| **Click-through** | mouse passes through the window; **press `Ctrl + Alt + T` to undo** (global hotkey) |
+| **Recalibrate** | ask the phone to redo the neutral baseline and reset the adaptive ranges |
+| **Hide UI / Debug** | `H` hides every panel (avatar only), `D` toggles the live parameter grid |
 
-| Slider | Range | Notes |
-|--------|-------|-------|
-| **Blink Speed** *(only visible when Blink Curve is ON)* | 0.5x – 3.0x | Controls the duration of the reshaped blink. Larger = slower, smoother blink. The panel also shows the resulting duration in ms (e.g. `1.0x (230ms)`). `< 0.8x` is labeled "Fast blink", `> 1.5x` "Slow & smooth". |
-| **Eye Sensitivity** | 0.5x – 2.0x | Sensitivity multiplier for the EAR thresholds. The panel shows the live `closed / open` thresholds below. `< 0.8x` → larger eye motion required to trigger (great for heavy makeup / glasses); `> 1.3x` → catches subtler motion (great for expressive recording). |
-
-> 💡 TIP: On a fresh run, or after switching model / user, look straight at the
-> camera once and tap **Reset Baseline**, then nudge **Eye Sensitivity** until
-> blinks register reliably for your eye shape.
-
-### Multi-camera support
-
-The demo can **switch between cameras** (one active camera at a time, not
-simultaneous multi-camera capture):
-
-- Enumerates every camera reported by `CameraManager`: front, back, logical
-  multi-cameras and external USB cameras;
-- Front-first by default; falls back to back / external when no front camera
-  exists, so single-camera devices keep the old behavior;
-- Tap **Camera: …** in the control panel to switch at any time. While tracking,
-  the capture pipeline restarts in place — the Start/Stop state and the Live2D
-  avatar stay up;
-- Sensor orientation and vertical FOV are re-read per camera and used for frame
-  rotation and head-pose calibration; switching triggers a fresh neutral-face
-  calibration so front/back FOV differences do not skew the head pose;
-- Preview mirroring follows the lens facing: front is mirrored (selfie view),
-  back / external stay true to the scene;
-- The selected camera id is persisted and restored on the next launch. If it is
-  no longer present (e.g. USB camera unplugged), the app safely falls back to
-  the default camera.
-
-> ⚠️ Only one camera stream is active at a time. Simultaneous multi-camera
-> capture requires device-level concurrent streaming support
-> (`LOGICAL_MULTI_CAMERA` / concurrent streams) and is out of scope here.
+Disconnects reconnect automatically (0.5 s → 1 s → 2 s → 5 s, capped) and the avatar returns to
+its default pose instead of freezing on the last frame.
 
 ---
 
-## 📺 Web Output / OBS
+## 🌐 Tracking protocol (VFC Tracking Protocol v1)
 
-The demo app ships a **Web Output** feature: the Live2D frame rendered on the
-phone is encoded on the fly and pushed to a browser over **HTTP / WebSocket on
-your LAN**, so you can add it to OBS as a **Browser Source** and overlay the
-avatar on your stream or recording. The page background is **transparent by
-default**, so OBS captures the alpha channel as-is — no keying required.
+The only contract between the two sides is **[`docs/tracking-protocol.md`](docs/tracking-protocol.md)**:
+JSON text frames, hand-written serialization, ~0.5 KB per frame (≈240 kbps at 60 fps),
+no image encoding on the phone.
 
-> 💡 Great for the "game footage / desktop + avatar" overlay: the alpha channel
-> travels with the WebP frames pushed over WebSocket, so the PC needs no extra
-> streaming tool or virtual camera.
+| Endpoint / message | Direction | Purpose |
+|---|---|---|
+| `GET /` | PC → phone | embedded info page |
+| `GET /status` | PC → phone | JSON: `running / tracking / clients / fps / device / protocol / version / seq` |
+| `WS /ws` | both | tracking stream (fixed port 8765) |
+| `hello` | phone → PC | once per connection: protocol / version / device / fps / decimation |
+| `track` | phone → PC | per frame: `seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating` |
+| `calib` | phone → PC | entered / left the calibration window |
+| `ping` / `pong` | both | keep-alive and RTT (client every 5 s, phone every 30 s) |
+| `command` / `ack` | PC → phone | currently only `recalibrate` |
+| `bye` | phone → PC | why streaming stopped |
 
-### How to open it
-
-The bottom control panel has a new **Web Output** button that opens a dialog:
-
-| Item | Description |
-|------|-------------|
-| **Start / Stop** | Start / stop the Web Output server, **off by default** |
-| **Address** | LAN URL such as `http://192.168.1.23:8765/`, copyable |
-| **Output Height** | 360 / 480 / 640 / 720 / 1080, default 640 |
-| **Auto downscale** | On by default: when one frame takes too long to encode for the target FPS (over 85 % of the frame budget) the output height drops one step and recovers later; turn it off to always use the configured height |
-| **Output FPS** | 15 – 60 FPS, default 30 |
-| **Quality** | 40 – 95, default 75; higher = sharper, but bigger bitrate |
-| **Status** | Running state, client count, and `output fps · capture fps · encode ms/frame`: **high capture fps with low output fps means encoding is the bottleneck** (lower the height / quality, or let auto-downscale do it); low on both means the phone is struggling overall |
-| **OBS hint** | Short OBS usage tips shown inside the dialog |
-
-The server always listens on `0.0.0.0:8765` (port is fixed); when the phone's
-IP changes, the URL changes with it.
-
-**OBS frame rate looks low?** Check in this order:
-
-1. Is the dialog's `output fps` close to the configured value? If yes the phone is
-   fine and the problem is OBS / the network; if not, look at `encode ms/frame` on
-   the same line — when it exceeds `1000 / FPS` the encoder is the bottleneck
-   (enable auto-downscale, lower the height or the quality).
-2. Check the Browser Source's **FPS** property: it may sit at 10 / 20 (default 30),
-   and 30 is a safer choice than 60 when OBS itself is loaded.
-3. Add `?hud=1` to the URL and watch the page status bar: fps, and whether it keeps
-   showing "reconnecting" (that means Wi-Fi packet loss).
-4. Prefer `dpr=1` (no need for 2x rendering in OBS) and set the source resolution
-   close to the configured output height.
-
-### Page URL & parameters
-
-The main page `http://<phone-IP>:8765/` streams **WebP frames with alpha** over
-WebSocket, and accepts these query parameters:
-
-| Parameter | Values | Default | Meaning |
-|-----------|--------|---------|---------|
-| `bg` | `transparent` / `black` / `white` / `green` | `transparent` | Background fill; `green` is meant for OBS chroma key |
-| `fit` | `contain` / `cover` / `stretch` | `contain` | Scaling mode; `contain` centers without cropping |
-| `mirror` | `0` / `1` | `0` | `1` flips horizontally for a mirror-like view |
-| `hud` | `0` / `1` | `0` | `1` shows a status bar (connection / fps / resolution / model) in the top-left corner |
-| `dpr` | `1` / `2` / `auto` | `auto` | Page render scale; use `1` under OBS |
-
-Chain them on the URL with `&`:
-
-```
-http://192.168.1.23:8765/?bg=transparent&fit=contain&mirror=0&hud=0&dpr=1
-```
-
-Fallback endpoints:
-
-| Endpoint | Description |
-|----------|-------------|
-| `http://<phone-IP>:8765/stream.mjpg` | Fallback MJPEG stream, **no alpha channel**; fine for simple cases or other MJPEG-capable software |
-| `http://<phone-IP>:8765/status` | Returns JSON status, handy for troubleshooting |
-
-Page hotkeys: `h` toggles the status bar, `m` toggles mirroring, `r` reconnects.
-
-### OBS Browser Source setup
-
-1. Connect the phone and the PC to the **same Wi-Fi / LAN**;
-2. Open **Web Output** in the app and note the address shown in the dialog
-   (e.g. `http://192.168.1.23:8765/`);
-3. In OBS: **Sources** → `+` → **Browser**, paste that URL, set width / height as
-   needed (e.g. `720 × 720`), and tick **Shutdown source when not visible** and
-   **Refresh browser when scene becomes active**;
-4. The page is already transparent — just put the source over your game footage.
-   For a solid backdrop append `?bg=black` / `?bg=white`, or use `?bg=green`
-   together with a **Chroma Key** filter on the source.
-
-| Option | Effect |
-|--------|--------|
-| Shutdown source when not visible | Closes the page when the source is hidden — saves power and frees the phone-side connection |
-| Refresh browser when scene becomes active | Reloads the page whenever OBS refreshes the source, so URL parameter changes take effect |
-
-> 💡 Set the Browser Source's **custom frame rate** to the output FPS from the
-> dialog (e.g. 30). Otherwise OBS merely re-samples or drops frames and the
-> result can look *worse* than the phone-side output.
-
-### Notes & caveats
-
-- **LAN only**: the server has no authentication — never expose it on a public
-  network or untrusted Wi-Fi.
-- **The app must stay in the foreground**: backgrounding the app or locking the
-  screen stops rendering and the page freezes on the last frame (the app keeps
-  the screen awake automatically).
-- **Cost scales with settings**: higher height / FPS / quality means more
-  encoding pressure on the phone and more bandwidth. The defaults
-  (`30fps / 640 / 75`) are usually plenty.
-- **Only the WebSocket page carries alpha**; the MJPEG endpoint
-  (`/stream.mjpg`) is plain RGB with no transparency.
+Key rules: `bs` is **MediaPipe order, 52 values** (index 0 is always neutral); `pose` is
+**relative to the baseline** `[pitch, yaw, roll]` in degrees (`pitch>0` = look down,
+`yaw>0` = turn left); the client drops stale frames by `seq`, and a slow client can never
+stall the phone (each connection only keeps the newest frame).
 
 ---
 
-## 🛠 Highlights
+## 🎛 ARKit-52 → Live2D mapping
 
-- **Zero MediaPipe runtime dependency** — every `CalculatorGraph`,
-  `PacketCallback`, `AndroidPacketCreator` etc. is gone; the model pipeline is
-  scheduled by plain C++, with Kotlin running a multi-threaded parallel
-  pipeline on top.
-- **MNN-CV instead of OpenCV** — YUV decoding, resize, affine warp,
-  normalization all live in MNN-CV. Saves several MB of `opencv-android`.
-- **NEON SIMD** — `neon_intrinsics.h` implements dot products, matrix
-  multiplies, 3×N outer products, Jacobi rotations, 4×4 affine transforms
-  and friends; used by the SVD head-pose solver and the per-frame batch
-  transform of 478 landmarks. Noticeable speed-up vs. scalar code.
-- **OpenSeeFace-style post-processing** — rewrote bits of the Python
-  `tracker.py` / `similaritytransform.py` in C++/Kotlin: One-Euro smoothing,
-  first-frame calibration, blink curve shaping.
-- **Geometric ARKit-52 solver** — does *not* require MediaPipe's third
-  (BlendShape) model; solves the 52 BlendShapes from the 478 landmark
-  geometry directly, saving one inference per frame. (Honestly the main
-  reason is that the BlendShape model's raw output was hard to rescue;
-  the inference code is still in the tree if you want to play with it :( .)
-- **Publishable AAR** — `:facecapture-sdk` is already wired with
-  `maven-publish` for one-shot release.
-- **Multi-camera** — enumerate and switch front / back / external cameras at
-  runtime, with per-device rotation, vertical FOV and preview mirroring, and a
-  fresh baseline calibration after each switch.
-- **Web Output** — the rendered frame can be used directly as an OBS Browser
-  Source (transparent background, MJPEG fallback): the phone is the "streamer",
-  the PC installs nothing and needs no virtual camera.
+The reference algorithm lives in **[`docs/tracking-protocol.md` §8](docs/tracking-protocol.md)**.
+`windows-client/renderer/mapping.js` is line-by-line equivalent and matches the old on-device
+renderer:
+
+- eyes / mouth / eyeballs: `ParamEyeLOpen = 1 - eyeBlinkLeft`, `ParamMouthOpenY = jawOpen`,
+  `ParamMouthForm = (smileL + smileR)/2 - (frownL + frownR)/2`, eyeballs combined from `eyeLook*`;
+- head pose: through an **adaptive normalizer** (negative / positive ranges follow the observed
+  motion, blended with defaults over the first 100 frames) and then scaled into
+  `ParamAngleX/Y/Z` plus `ParamBodyAngleX`;
+- renderer requirements: disable Cubism's built-in eye blink and mouse focus, keep physics and
+  idle motions, and **absolutely assign** our parameters in the `beforeModelUpdate` hook.
+
+`mapping.js` is a pure module (no DOM, no PIXI) and can be unit-tested in Node:
+
+```bash
+cd windows-client
+node -e "import('./renderer/mapping.js').then(m => console.log(m.mapTrack({bs:new Array(52).fill(0), pose:[10,-20,5]})))"
+```
+
+---
+
+## 🖥 OBS / streaming overlay
+
+| Option | How | Best for |
+|--------|-----|----------|
+| **Window capture** (recommended) | enable Transparent + Borderless in the Electron client, add a Window Capture source | simplest overlay, lowest latency |
+| **Display capture / virtual cam** | fullscreen client + display capture | fixed resolution and framing |
+| **OBS browser source** | add a Browser source with `http://127.0.0.1:17890/?ws=ws://<phone-ip>:8765/ws`, size e.g. 720×720, enable "Shutdown source when not visible" | no Electron needed, transparent page |
+
+Query parameters:
+
+| Param | Values | Default | Meaning |
+|-------|--------|---------|---------|
+| `ws` | `ws://ip:8765/ws` | `ws://127.0.0.1:8765/ws` | phone address (remembered if omitted) |
+| `model` | folder name, e.g. `ATRI` | last used / first | initial model |
+| `transparent` | `0` / `1` | `0` | transparent background (Electron passes it itself) |
+
+> 💡 Browser sources sample at 30 fps; window capture has no such limit — prefer it for feel.
+
+---
+
+## 🏗 Building & releases
+
+### Local
+
+```bash
+./gradlew :app:assembleDebug          # debug APK
+./gradlew :app:assembleRelease        # release APK (falls back to the debug key)
+./gradlew :app:testDebugUnitTest      # JVM unit tests for the tracking protocol
+```
+
+> First build needs `git submodule update --init --depth 1 ThirdParty/MNN` for the MNN headers.
+> If your local SDK's build-tools don't match what AGP expects, add
+> `-Pandroid.builder.sdkDownload=false` so Gradle uses what is already installed.
+
+### GitHub Actions
+
+[Android CI](.github/workflows/android-ci.yml) builds on every push / PR: debug and release
+variants run in parallel and each publishes an artifact (kept 30 days):
+
+- `VirtualFaceCapture-<sha>-arm64-debug` — arm64-v8a debug APK
+- `VirtualFaceCapture-<sha>-arm64-release` — arm64-v8a release APK + SDK AAR
+
+Artifacts carry `1.0.<run>+<commit>` so versionCode keeps increasing. Pushing a `v*` tag also
+creates a signed GitHub Release.
+
+> CI only builds the Android side. The Windows client is plain JavaScript — clone it and
+> `npm install`.
+
+### Signing
+
+By default a release build falls back to the **debug key**, which is regenerated on every CI
+runner, so installing a new build fails with
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Fix it by pinning a keystore:
+
+1. create one:
+
+```bash
+keytool -genkeypair -v \
+  -keystore virtualfacecapture-release.jks \
+  -alias virtualfacecapture \
+  -keyalg RSA -keysize 2048 -validity 10000 \
+  -storepass <password> -keypass <same> \
+  -dname "CN=VirtualFaceCapture, OU=Release, O=YourOrg, C=CN"
+```
+
+> 🔐 Back this file up. If it is lost you can never update the installed app again.
+> It is already in `.gitignore` — never commit it.
+
+2. add four repository secrets: `RELEASE_KEYSTORE_BASE64` (single-line base64 of the .jks),
+   `RELEASE_STORE_PASSWORD`, `RELEASE_KEY_ALIAS`, `RELEASE_KEY_PASSWORD`;
+
+3. or, for local builds, put `keystore.properties` in the repo root (also gitignored):
+
+```properties
+storeFile=/absolute/path/to/virtualfacecapture-release.jks
+storePassword=...
+keyAlias=virtualfacecapture
+keyPassword=...
+```
+
+Environment variables `RELEASE_STORE_FILE` / `RELEASE_STORE_PASSWORD` /
+`RELEASE_KEY_ALIAS` / `RELEASE_KEY_PASSWORD` take precedence.
+
+Verify with `apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk`.
+And yes — **always benchmark fps on a release build**; debug builds are noticeably slower.
+
+---
+
+## 🧩 Using it as an SDK
+
+If you only want face capture (to drive your own renderer, or anything else), see
+[`facecapture-sdk/README.md`](facecapture-sdk/README.md):
+
+```kotlin
+val engine = FaceCaptureEngine.create()
+engine.initialize(context)
+engine.setResultListener { result ->
+    val landmarks   = result.landmarks         // 478 3D landmarks
+    val blendShapes = result.blendShapes       // ARKit-52 blendshapes
+    val pose        = result.relativeHeadPose  // pitch / yaw / roll, relative to baseline
+}
+engine.pushFrame(image, rotationDegrees)       // feed CameraX ImageProxy
+```
+
+To reuse the wire format, just copy `docs/tracking-protocol.md` — it was written exactly for
+"produce data on the phone, render somewhere else".
+
+---
+
+## 🛠 Engineering notes
+
+- **No MediaPipe runtime**: `CalculatorGraph`, `PacketCallback`, `AndroidPacketCreator` etc.
+  are gone; the C++ side schedules the models sequentially, Kotlin runs the parallel pipeline.
+- **MNN-CV instead of OpenCV**: YUV decode, resize, warp affine and normalization all go
+  through MNN-CV, saving the multi-MB OpenCV-Android dependency.
+- **NEON SIMD**: `neon_intrinsics.h` implements dot products, matrix multiply, 3×N outer
+  products, Jacobi rotations and 4×4 affine transforms used for SVD pose recovery and the
+  batched 478-point transform.
+- **OpenSeeFace-style post-processing**: a C++/Kotlin rewrite of `tracker.py` /
+  `similaritytransform.py`, including One-Euro smoothing, first-frame calibration and blink
+  curve shaping.
+- **ARKit-52 solved in-house**: no third blendshape model — the shapes come from landmark
+  geometry, saving an entire inference pass.
+- **Publishable AAR**: `:facecapture-sdk` is wired for `maven-publish`.
+- **Multi-camera**: enumerate and switch front / back / external cameras at runtime,
+  recomputing rotation, vertical FOV and preview mirroring, re-calibrating after a switch.
+- **Streaming never blocks inference**: each WS client has a single "latest frame" slot, so
+  slow networks drop frames instead of stalling the inference thread.
+- **Both ends are verifiable offline**: the phone has JVM unit tests for the protocol; the PC
+  has `tools/verify/` (mock phone + headless Chrome screenshots + numeric mapping tests).
 
 ---
 
@@ -383,36 +408,43 @@ Page hotkeys: `h` toggles the status bar, `m` toggles mirroring, `r` reconnects.
 
 ```
 VirtualFaceCapture-MNN/
-├── app/                         # Demo + Live2D integration
-├── Live2D/                      # Cubism SDK wrapper
-├── MediapipeFaceLandmark/       # MNN inference + NEON-optimized core
+├── app/                         # Android capture app (camera + pipeline + tracking server)
+│   └── src/main/java/.../tracking/   # TrackingServer / TrackingProtocol / TrackingOutputManager
+├── windows-client/              # Windows renderer (Electron + Cubism Web)
+│   ├── electron/                #   desktop shell (transparent / borderless / always-on-top / click-through)
+│   ├── renderer/                #   page, mapping.js, live2d.js
+│   ├── server.js                #   zero-dependency static server (127.0.0.1:17890)
+│   └── models/                  #   Live2D models (auto-discovered)
+├── MediapipeFaceLandmark/       # MNN inference + NEON core
 │   ├── src/main/assets/         #   .mnn models (detector / landmark)
 │   ├── src/main/cpp/            #   C++ pipeline, YUV, geometry
-│   │   └── include/face_geomentry/
-│   │       ├── mini_linalg.h        # linear algebra
-│   │       └── neon_intrinsics.h    # ARM NEON SIMD
 │   └── src/main/jniLibs/        #   prebuilt libMNN.so
 ├── OpenSeeFaceProcess/          # OpenSeeFace-style post-processing
-├── CommonData/                  # Shared data types
-├── facecapture-sdk/             # Public AAR facade
-└── ThirdParty/MNN/              # MNN headers only
+├── CommonData/                  # shared data classes
+├── facecapture-sdk/             # publishable AAR facade
+├── docs/tracking-protocol.md    # the wire contract
+├── tools/verify/                # end-to-end verification scripts
+├── Live2D/                      # legacy on-device renderer (not built anymore)
+└── ThirdParty/MNN/              # headers only
 ```
 
 ---
 
-## 💡 Known Limitations
+## 💡 Known limitations
 
-Because every face is shaped differently and the per-point mapping is hard to
-nail down to clean 0–1 values, many thresholds in `OpenSeeFaceProcess` end up
-as engineering trick — there is no single magic constant that fits every case.
-If you have a better post-processing idea, PRs are very welcome (￣▽￣)"
+- Blendshape mapping can never be perfect — a lot of the thresholds in `OpenSeeFaceProcess`
+  are pragmatic engineering tricks. Better post-processing ideas are very welcome.
+- The adaptive normalizer learns per person; press **Reset baseline** after changing person or
+  posture.
+- No authentication on the LAN — only enable it on trusted networks.
 
 ---
 
 ## 🙏 Credits
 
-- Live2D model **sensi**: <https://www.bilibili.com/video/BV1tk4y1n7Ls/>
-- Live2D model **ATRI**: <https://www.bilibili.com/video/BV1Rs4y187rJ>
+- Live2D model "sensi": <https://www.bilibili.com/video/BV1tk4y1n7Ls/>
+- Live2D model "ATRI": <https://www.bilibili.com/video/BV1Rs4y187rJ>
 - [google/mediapipe](https://github.com/google/mediapipe)
 - [emilianavt/OpenSeeFace](https://github.com/emilianavt/OpenSeeFace)
 - [alibaba/MNN](https://github.com/alibaba/MNN)
+- [pixi.js](https://github.com/pixijs/pixijs) / [pixi-live2d-display](https://github.com/guansss/pixi-live2d-display) / [Live2D Cubism SDK](https://www.live2d.com/en/sdk/)

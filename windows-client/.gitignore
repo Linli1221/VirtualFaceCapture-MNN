@@ -1,0 +1,13 @@
+# 依赖与构建产物（根 .gitignore 也覆盖了这两项，这里保证子目录单独打包/复制时不带进去）
+node_modules/
+dist/
+
+# 自测产物：截图、Electron smoke 结果、临时日志
+shots/
+electron/smoke-result.json
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.DS_Store
+Thumbs.db

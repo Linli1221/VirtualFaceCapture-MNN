@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VFC · Live2D 虚拟形象</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="stage" aria-hidden="true"></div>
+    <canvas id="live2d"></canvas>
+
+    <div id="ui" class="ui">
+      <header class="panel-head" id="panel-head">
+        <span class="dot" id="conn-dot" data-state="idle"></span>
+        <span class="brand">VFC</span>
+        <span class="status" id="status-text">正在启动…</span>
+        <span class="spacer"></span>
+        <button class="ghost" id="btn-collapse" title="折叠 / 展开面板">–</button>
+      </header>
+
+      <div class="panel-body" id="panel-body">
+        <div class="field-row">
+          <label for="ws-url">手机地址</label>
+          <input id="ws-url" type="text" spellcheck="false" autocomplete="off" placeholder="ws://192.168.1.23:8765/ws" />
+          <button id="btn-connect" class="primary">连接</button>
+        </div>
+
+        <div class="meta-grid">
+          <div class="span-2"><span>设备</span><b id="meta-device">-</b></div>
+          <div><span>输入</span><b id="meta-in-fps">0</b> fps</div>
+          <div><span>渲染</span><b id="meta-render-fps">0</b> fps</div>
+          <div><span>延迟</span><b id="meta-rtt">-</b></div>
+          <div><span>帧号</span><b id="meta-seq">-</b></div>
+          <div><span>丢旧帧</span><b id="meta-dropped">0</b></div>
+        </div>
+
+        <div class="field-row">
+          <label for="model-select">模型</label>
+          <select id="model-select"></select>
+          <button id="btn-reload" title="重新加载当前模型">重载</button>
+        </div>
+
+        <div class="toggles">
+          <label class="toggle"><input type="checkbox" id="tg-transparent" />透明</label>
+          <label class="toggle"><input type="checkbox" id="tg-borderless" />无边框</label>
+          <label class="toggle"><input type="checkbox" id="tg-ontop" />置顶</label>
+          <label class="toggle"><input type="checkbox" id="tg-through" />鼠标穿透</label>
+        </div>
+        <div class="hint" id="native-hint" hidden>窗口开关需要 Electron（npm start）才生效；浏览器里请用 ?transparent=1 测试透明底。</div>
+
+        <div class="actions">
+          <button id="btn-recalib" title="让手机重做中性脸基线校准">重新校准</button>
+          <button id="btn-hide" title="隐藏面板（快捷键 H）">隐藏面板</button>
+          <button id="btn-quit" hidden>退出</button>
+        </div>
+
+        <details id="debug-box" class="debug">
+          <summary>调试参数</summary>
+          <div class="debug-grid" id="debug-grid"></div>
+        </details>
+      </div>
+
+      <div class="error" id="error-box" hidden></div>
+    </div>
+
+    <div class="hint-floating" id="hidden-hint" hidden>按 H 显示面板</div>
+
+    <!-- 顺序固定：Cubism Core → pixi.js → pixi-live2d-display → 业务模块 -->
+    <script src="./vendor/live2dcubismcore.min.js"></script>
+    <script src="./vendor/pixi.min.js"></script>
+    <script src="./vendor/pixi-live2d-display.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

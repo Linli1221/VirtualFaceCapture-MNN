@@ -1,0 +1,28 @@
+{
+  "name": "vfc-windows-client",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VirtualFaceCapture Windows 客户端：连接手机 WebSocket，用 Cubism Web 渲染 Live2D 形象",
+  "type": "module",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "node tools/start-electron.js",
+    "web": "node tools/web-launch.js",
+    "serve": "node server.js",
+    "mock": "node tools/mock-tracker.js",
+    "shot": "node tools/shot.js",
+    "vendor": "node tools/vendor-assets.js",
+    "postinstall": "node tools/vendor-assets.js",
+    "selftest": "node tools/selftest.js"
+  },
+  "dependencies": {
+    "pixi-live2d-display": "0.4.0",
+    "pixi.js": "7.4.3"
+  },
+  "optionalDependencies": {
+    "electron": "^45.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

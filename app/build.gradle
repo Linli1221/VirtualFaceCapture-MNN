@@ -97,8 +97,6 @@ dependencies {
     // Face-capture SDK (aggregates :MediapipeFaceLandmark + :OpenSeeFaceProcess + :CommonData
     // via `api`, so transitive types like ARKitBlendShapes / Point3D are visible here)
     implementation project(':facecapture-sdk')
-    // Live2D rendering only - demo-app concern, not part of the AAR
-    implementation project(':Live2D')
     implementation libs.kotlinx.coroutines.android
     implementation libs.androidx.core.ktx
     implementation libs.androidx.lifecycle.runtime.ktx
@@ -109,6 +107,8 @@ dependencies {
     implementation libs.androidx.compose.ui.tooling.preview
     implementation libs.androidx.compose.material3
     testImplementation libs.junit
+    // 本地 JVM 单元测试里用真实 org.json 校验协议报文（android.jar 里的是抛 Stub 的桩）
+    testImplementation 'org.json:json:20240303'
     androidTestImplementation libs.androidx.junit
     androidTestImplementation libs.androidx.espresso.core
     androidTestImplementation platform(libs.androidx.compose.bom)

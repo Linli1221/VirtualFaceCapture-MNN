@@ -1,5 +1,14 @@
 # 帧率优化说明（目标：稳定 60 FPS）
 
+> ⚠️ **架构变更提示（请先读）**：本文写作时 Live2D 是在**手机端**用 Cubism SDK 渲染的，
+> 现在已经拆成「手机只做面捕 + 电脑渲染」（见 [README.md](README.md) 与
+> [docs/tracking-protocol.md](docs/tracking-protocol.md)）。
+> 因此文中与 **手机端 GL 渲染 / 抓帧 / 浏览器输出（OBS）** 相关的章节（例如
+> 「与 Live2D 抢 GPU」「离屏 FBO 贴回」「Web Output 抓帧」等）属于**历史记录**，
+> 这些路径已从 app 中删除；而**推理侧的全部优化（检测节流、派发单消费者化、
+> Vulkan⇄CPU 切换、YUV 直通、后处理零分配、NEON）仍然有效**，这两类内容在本文中混排，
+> 读的时候按此区分即可。
+
 本文记录「优化帧率、稳定 60 帧」这一轮改动的**全部内容、原理、验证方法与已知风险**。
 
 > ✅ **编译状态**：已通过 GitHub Actions 的 **Android CI**（run #6，commit `7e1898d`）：

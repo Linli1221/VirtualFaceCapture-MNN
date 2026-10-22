@@ -1,0 +1,391 @@
+/* VFC Windows 客户端 · 渲染页样式 */
+
+:root {
+  --bg: #0b0e15;
+  --panel: rgba(18, 22, 33, 0.82);
+  --panel-border: rgba(255, 255, 255, 0.09);
+  --text: #e9edf6;
+  --muted: #8d97ab;
+  --accent: #5ac8fa;
+  --ok: #3ddc97;
+  --warn: #ffb020;
+  --err: #ff5d6c;
+  --radius: 12px;
+  --font: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  user-select: none;
+}
+
+/* 深色舞台背景（截图/展示友好）；透明模式下去掉，只留 alpha */
+#stage {
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 75% 65% at 50% 38%, #1d2740 0%, #121726 48%, #070a11 100%),
+    var(--bg);
+}
+
+canvas#live2d {
+  position: fixed;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* 透明模式：html / body / 舞台背景都必须透明，否则 Electron 透明窗口会露一块深色矩形。
+   （html 单独覆盖是必须的——body 的透明不会影响 html 的 canvas 背景） */
+html.is-transparent,
+html:has(> body.is-transparent) {
+  background: transparent;
+}
+
+body.is-transparent {
+  background: transparent;
+}
+
+body.is-transparent #stage {
+  background: transparent;
+}
+
+/* ---------- 控制面板 ---------- */
+
+.ui {
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  width: 328px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(14px) saturate(140%);
+  overflow: hidden;
+  z-index: 10;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px 9px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  font-variant-numeric: tabular-nums;
+}
+
+body.is-borderless .panel-head {
+  -webkit-app-region: drag;
+}
+
+body.is-borderless .panel-head button {
+  -webkit-app-region: no-drag;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #6b7385;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.04);
+  flex: 0 0 auto;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.dot[data-state="connected"] {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(61, 220, 151, 0.16), 0 0 10px rgba(61, 220, 151, 0.65);
+}
+
+.dot[data-state="connecting"],
+.dot[data-state="reconnecting"] {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(255, 176, 32, 0.16);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.dot[data-state="error"] {
+  background: var(--err);
+  box-shadow: 0 0 0 3px rgba(255, 93, 108, 0.16);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.status {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 178px;
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+.panel-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.ui.collapsed .panel-body {
+  display: none;
+}
+
+.field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field-row label {
+  flex: 0 0 auto;
+  color: var(--muted);
+  width: 56px;
+  white-space: nowrap;
+}
+
+input[type="text"],
+select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  font-family: var(--font);
+  font-size: 12px;
+  outline: none;
+}
+
+input[type="text"]:focus,
+select:focus {
+  border-color: rgba(90, 200, 250, 0.65);
+  box-shadow: 0 0 0 3px rgba(90, 200, 250, 0.14);
+}
+
+button {
+  height: 28px;
+  padding: 0 11px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  font-family: var(--font);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+
+button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+button.primary {
+  color: #06222e;
+  background: var(--accent);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #7ad7ff;
+}
+
+button.ghost {
+  width: 26px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  padding: 8px 9px;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.meta-grid > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.meta-grid .span-2 {
+  grid-column: span 2;
+}
+
+.meta-grid span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.meta-grid b {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.toggle input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.toggle.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.actions button {
+  flex: 1 1 0;
+}
+
+.debug {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 6px;
+}
+
+.debug summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  list-style: none;
+}
+
+.debug summary::-webkit-details-marker {
+  display: none;
+}
+
+.debug summary::before {
+  content: "▸ ";
+  color: var(--accent);
+}
+
+.debug[open] summary::before {
+  content: "▾ ";
+}
+
+.debug-grid {
+  margin-top: 7px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 10px;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  max-height: 210px;
+  overflow: auto;
+}
+
+.debug-grid .k {
+  color: #7f8aa0;
+}
+
+.debug-grid .v {
+  color: #d7e0f0;
+  text-align: right;
+}
+
+.error {
+  margin: 0 12px 12px;
+  padding: 9px 10px;
+  color: #ffd9dd;
+  background: rgba(255, 93, 108, 0.14);
+  border: 1px solid rgba(255, 93, 108, 0.4);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+body.ui-hidden .ui {
+  display: none;
+}
+
+body.ui-hidden .hint-floating {
+  display: block;
+}
+
+.hint-floating {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  padding: 4px 9px;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  font-size: 11px;
+  z-index: 10;
+}

@@ -21,7 +21,7 @@ dependencyResolutionManagement {
 
 rootProject.name = "VirtualFaceCapture"
 include ':app'
-include ':Live2D'
+// :Live2D 目录仍保留在磁盘上（历史参考），但 app 已改为「纯面捕采集端」，不再参与构建。
 include ':MediapipeFaceLandmark'
 include ':OpenSeeFaceProcess'
 include ':CommonData'

@@ -35,17 +35,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.HeadPoseData
-import com.example.virtualfacecapture.ui.theme.Live2DFacePipelineTheme
-import com.example.commondata.ARKitBlendShapes
 import com.example.mediapipefacelandmark.MnnBackend
-import com.example.virtualfacecapture.web.WebOutputManager
+import com.example.virtualfacecapture.tracking.TrackingOutputManager
+import com.example.virtualfacecapture.ui.theme.VirtualFaceCaptureTheme
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 private const val CAMERA_PREFS_NAME = "face_capture_prefs"
 private const val KEY_PREFERRED_CAMERA_ID = "preferred_camera_id"
@@ -72,9 +71,6 @@ private const val DEBUG_SNAPSHOT_INTERVAL_MS = 100L
  * 面捕回调和 UI 不在同一个线程（PipelineFaceTracker 在 Dispatchers.Default 上触发），
  * 这里用普通字段累积「最新值」（加锁保证跨线程可见性），最多每 [intervalNanos]
  * 毫秒才向 Compose state 写一次；[enabled] 为 false（调试面板收起）时一次都不写。
- *
- * sink 在回调线程上执行：Compose 的 SnapshotMutableState 本身允许跨线程写，
- * 与改动前直接写 state 的行为一致。
  */
 private class DebugSnapshotBatcher(
     private val intervalNanos: Long,
@@ -126,17 +122,18 @@ private class DebugSnapshotBatcher(
     }
 }
 
+/**
+ * 面捕采集端主界面。
+ *
+ * 这个 app 现在只做两件事：相机面捕 + 把每帧追踪数据通过局域网 WebSocket 推给 PC。
+ * 手机端**不再渲染 Live2D**、**不再编码视频帧**，界面就是「相机画面 + 调试 HUD + 控制面板」。
+ */
 class MainActivity : ComponentActivity() {
-    
-    // Use PipelineFaceTracker for parallel processing (higher throughput)
+
     private lateinit var faceTracker: PipelineFaceTracker
-    private lateinit var modelManager: Live2DModelManager
-    // Live2D 适配器：把面捕输出转成 JniBridgeJava 调用，是面捕↔Live2D 的唯一桥梁
-    private val live2DAvatarAdapter = Live2DAvatarAdapter()
-    // 浏览器输出（OBS 浏览器源）：把 Live2D 渲染结果推到局域网给浏览器
-    private lateinit var webOutput: WebOutputManager
+    private lateinit var trackingOutput: TrackingOutputManager
     private var isTracking = mutableStateOf(false)
-    
+
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
@@ -147,93 +144,88 @@ class MainActivity : ComponentActivity() {
             Log.e("MainActivity", "✗ Camera permission denied")
         }
     }
-//
-//    override fun onPostResume() {
-//        super.onPostResume()
-//        NeonOptimizationTest.runTests()
-//    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        Log.i("MainActivity", "onCreate: Initializing Live2D Face Pipeline...")
-        
-        // Initialize model manager
-        modelManager = Live2DModelManager(this)
-        modelManager.initialize { models ->
-            Log.i("MainActivity", "Model manager initialized with ${models.size} models")
-            models.forEach { model ->
-                Log.i("MainActivity", "  - ${model.name}")
-            }
-        }
-        
-        // Initialize face tracker (using pipeline for parallel processing)
+
+        Log.i("MainActivity", "onCreate: Initializing face capture (tracking-only build)...")
+
+        // 面捕管线（MNN 推理 + MediaPipe 拓扑 + OpenSeeFace 后处理）
         faceTracker = PipelineFaceTracker(this)
 
         // 恢复上次选择的摄像头（如果该 id 在本次开机后不存在，相机会自动回退到默认前置）
         val cameraPrefs = getSharedPreferences(CAMERA_PREFS_NAME, Context.MODE_PRIVATE)
         faceTracker.setPreferredCamera(cameraPrefs.getString(KEY_PREFERRED_CAMERA_ID, null))
 
-        // 浏览器输出（OBS）：默认关闭，用户可在控制面板里开启
-        webOutput = WebOutputManager(this)
-
-        // 把面捕输出接到 Live2D 适配器。这是 app 模块里唯一的"面捕→Live2D"桥接点，
-        // PipelineFaceTracker 本身不再依赖 JniBridgeJava，可独立打入 facecapture-sdk AAR。
-        faceTracker.onFaceCaptureFrame = { blendShapes, headPose ->
-            live2DAvatarAdapter.onFrame(blendShapes, headPose)
+        // 网络输出（追踪数据）：默认关闭，用户可在控制面板里开启。
+        // PC 端发 command:recalibrate 时回到主线程触发与 UI 相同的「重置基线」逻辑。
+        trackingOutput = TrackingOutputManager(this) {
+            runOnUiThread { faceTracker.resetAdaptiveBaseline() }
         }
 
-        // Request camera permission
+        // 每处理完一帧就把追踪数据喂给网络输出；服务未开启时 submitFrame 只做一次判空即返回。
+        faceTracker.onFaceCaptureResult = { frame ->
+            trackingOutput.submitFrame(
+                blendShapes = frame.blendShapes,
+                headPose = frame.relativeHeadPose,
+                presenceScore = frame.presenceScore,
+                fps = frame.fps,
+                calibrating = frame.isCalibrating,
+            )
+        }
+
         if (checkCameraPermission()) {
             initializeFaceTracker()
         } else {
             requestCameraPermission()
         }
-        
+
         setContent {
-            Live2DFacePipelineTheme {
-                FaceCapturePipelineScreen(
+            VirtualFaceCaptureTheme {
+                FaceCaptureScreen(
                     faceTracker = faceTracker,
-                    modelManager = modelManager,
-                    avatarAdapter = live2DAvatarAdapter,
+                    trackingOutput = trackingOutput,
                     isTracking = isTracking,
-                    webOutput = webOutput
                 )
             }
         }
     }
-    
+
     override fun onResume() {
         super.onResume()
-        if (isTracking.value && faceTracker.isTracking()) {
+        // 从后台回来：之前是「面捕中」就重新开相机（onPause 里释放过）
+        if (isTracking.value && !faceTracker.isTracking()) {
             faceTracker.start()
         }
+        trackingOutput.setTrackingActive(isTracking.value && faceTracker.isTracking())
     }
-    
+
     override fun onPause() {
         super.onPause()
         if (faceTracker.isTracking()) {
             faceTracker.stop()
         }
+        // 相机已释放，/status 的 tracking 要如实变成 false（PC 端据此判断「手机在不在面捕」）
+        trackingOutput.setTrackingActive(false)
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
-        webOutput.dispose()
+        trackingOutput.dispose()
         faceTracker.release()
     }
-    
+
     private fun checkCameraPermission(): Boolean {
         return ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
     }
-    
+
     private fun requestCameraPermission() {
         requestPermissionLauncher.launch(Manifest.permission.CAMERA)
     }
-    
+
     private fun initializeFaceTracker() {
         if (!faceTracker.initialize()) {
             Log.e("MainActivity", "Failed to initialize face tracker")
@@ -242,36 +234,35 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun FaceCapturePipelineScreen(
+fun FaceCaptureScreen(
     faceTracker: PipelineFaceTracker,
-    modelManager: Live2DModelManager,
-    avatarAdapter: Live2DAvatarAdapter,
+    trackingOutput: TrackingOutputManager,
     isTracking: MutableState<Boolean>,
-    webOutput: WebOutputManager
 ) {
     // 调试面板数据：fps / BlendShape / 姿态合并为一个快照，且限制在 ≤10Hz（见 DebugSnapshotBatcher）
     val debugSnapshotState = remember { mutableStateOf(DebugSnapshot()) }
     var showDebug by remember { mutableStateOf(true) }
-    var showCameraPreview by remember { mutableStateOf(false) }
-    var showModelSelector by remember { mutableStateOf(false) }
-    var showWebOutputDialog by remember { mutableStateOf(false) }
+    var showTrackingDialog by remember { mutableStateOf(false) }
     var showCameraSelectorDialog by remember { mutableStateOf(false) }
+    var showControlPanel by rememberSaveable { mutableStateOf(true) }
+
+    // 相机预览叠加层开关（关键点 / 检测框）
+    var drawLandmarks by rememberSaveable { mutableStateOf(true) }
+    var drawDetectionBox by rememberSaveable { mutableStateOf(true) }
+
     var availableCameras by remember { mutableStateOf<List<CameraDeviceInfo>>(emptyList()) }
     var currentCamera by remember { mutableStateOf<CameraDeviceInfo?>(null) }
-    val context = LocalContext.current
+    var isCalibrating by remember { mutableStateOf(false) }
     var blinkCurveEnabled by remember { mutableStateOf(faceTracker.blinkCurveProcessor.isEnabled) }
     var blinkSpeedScale by remember { mutableStateOf(faceTracker.blinkCurveProcessor.blinkSpeedScale) }
-    var availableModels by remember { mutableStateOf<List<Live2DModelManager.ModelInfo>>(emptyList()) }
-    var currentModel by remember { mutableStateOf<Live2DModelManager.ModelInfo?>(null) }
-    var isCalibrating by remember { mutableStateOf(false) }  // 校准状态
-    var showControlPanel by rememberSaveable { mutableStateOf(true) }  // 侧边控制面板显示状态
     // MNN 推理后端（Vulkan ⇄ CPU）：让用户在真机上实测哪一个能稳住 60 帧
     var mnnBackend by remember { mutableStateOf(faceTracker.getMnnBackend()) }
     var backendSwitching by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
 
-    // 面捕回调在后台线程触发，用 rememberUpdatedState 让回调 lambda 始终读到最新的开关值
-    val showCameraPreviewState = rememberUpdatedState(showCameraPreview)
+    var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     // 合批器：回调线程只更新普通字段，最多 10Hz 写一次 Compose state
     val debugBatcher = remember {
@@ -285,10 +276,7 @@ fun FaceCapturePipelineScreen(
     SideEffect {
         debugBatcher.enabled = showDebug
     }
-    
-    // Camera preview view reference
-    var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
-    
+
     // Set up callbacks
     LaunchedEffect(Unit) {
         faceTracker.onFpsUpdate = { newFps ->
@@ -304,19 +292,13 @@ fun FaceCapturePipelineScreen(
         }
 
         faceTracker.onVisualizationUpdate = { data ->
-            // 只有相机预览真的在显示时才需要可视化数据（关掉预览后可能还会来一两帧，
-            // 用最新开关值挡掉，免得往已经 detached 的 View 上白画）
-            if (showCameraPreviewState.value) {
-                cameraPreviewView?.updateVisualizationData(data)
-            }
+            cameraPreviewView?.updateVisualizationData(data)
         }
 
         faceTracker.onCameraFrameUpdate = { frameData, width, height ->
-            // 预览帧的生成已在相机线程上被 faceTracker.setCameraPreviewFramesEnabled() 门控，
-            // 关闭预览时不会有回调，这里不再重复判断（见 LaunchedEffect(showCameraPreview)）。
             cameraPreviewView?.updateCameraFrame(frameData, width, height)
         }
-        
+
         faceTracker.onCalibrationStatusUpdate = { calibrating ->
             isCalibrating = calibrating
         }
@@ -326,10 +308,6 @@ fun FaceCapturePipelineScreen(
             // 前置预览习惯性镜像，后置 / 外接相机保持真实方向
             cameraPreviewView?.mirrorHorizontal = camera?.isFrontFacing ?: true
         }
-        
-        // Load available models
-        availableModels = modelManager.getAvailableModels()
-        currentModel = modelManager.getCurrentModel()
 
         // 摄像头列表 + 初始选中项（用于在 Start 之前就显示正确的标签/镜像）
         availableCameras = faceTracker.getAvailableCameras()
@@ -339,109 +317,72 @@ fun FaceCapturePipelineScreen(
             ?: availableCameras.firstOrNull()
     }
 
-    // 把当前模型名同步给浏览器输出的状态栏（/status 与网页 HUD 用）
-    LaunchedEffect(currentModel) {
-        webOutput.modelName.value = currentModel?.name ?: ""
-    }
-    
-    // 相机预览帧门控 + 清理。
-    // 关闭预览时通知 SDK：相机线程不要再做整帧 YUV→RGB（每帧几百 KB 的内存写 + 几十万次
-    // 像素运算，而推理管线走 YUV 直通，根本用不到这份 RGB）；同时清掉预览 View 里的位图。
-    LaunchedEffect(showCameraPreview) {
-        faceTracker.setCameraPreviewFramesEnabled(showCameraPreview)
-        if (!showCameraPreview) {
-            cameraPreviewView?.clear()
+    // 相机预览帧门控：本 app 只有相机预览一个画面，进前台常开、离开时关掉，
+    // 避免相机线程白做整帧 YUV→RGB（每帧几十万次像素运算，推理管线走 YUV 直通用不到）。
+    DisposableEffect(Unit) {
+        faceTracker.setCameraPreviewFramesEnabled(true)
+        onDispose {
+            faceTracker.setCameraPreviewFramesEnabled(false)
         }
     }
 
-    // 摄像头切换后同步预览镜像方向（前置镜像、后置/外接不镜像）
-    LaunchedEffect(currentCamera) {
-        cameraPreviewView?.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+    // 叠加层开关同步给预览 View
+    LaunchedEffect(drawLandmarks, drawDetectionBox) {
+        cameraPreviewView?.apply {
+            this.drawLandmarks = drawLandmarks
+            this.drawKeyPoints = drawLandmarks
+            this.drawDetectionBox = drawDetectionBox
+        }
+    }
+
+    // 面捕管线状态同步给追踪服务（/status 的 tracking 字段）
+    val tracking: Boolean = isTracking.value
+    LaunchedEffect(tracking) {
+        trackingOutput.setTrackingActive(tracking)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Main content: Live2D view or Camera Preview
-        if (showCameraPreview) {
-            // Camera preview with landmarks overlay
-            AndroidView(
-                factory = { context ->
-                    CameraPreviewView(context).also {
-                        cameraPreviewView = it
-                        it.drawLandmarks = true
-                        it.drawDetectionBox = true
-                        it.drawKeyPoints = true
-                        it.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-        } else {
-            // Live2D rendering view
-            Live2DView(
-                modifier = Modifier.fillMaxSize(),
-                modelManager = modelManager,
-                onModelLoadComplete = {
-                    Log.i("FaceCapturePipeline", "✓ Live2D model loaded in UI")
-                    currentModel = modelManager.getCurrentModel()
-                },
-                onModelLoadError = {
-                    Log.e("FaceCapturePipeline", "✗ Failed to load Live2D model in UI")
-                },
-                captureSink = webOutput
-            )
-        }
-        
+        // 主画面：相机预览 + 关键点 / 检测框叠加（手机端不再渲染 Live2D）
+        AndroidView(
+            factory = { ctx ->
+                CameraPreviewView(ctx).also {
+                    cameraPreviewView = it
+                    it.drawLandmarks = drawLandmarks
+                    it.drawKeyPoints = drawLandmarks
+                    it.drawDetectionBox = drawDetectionBox
+                    it.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
         // 校准覆盖层 - 在追踪开始时且正在校准期间显示
         CalibrationOverlay(
             isCalibrating = isTracking.value && isCalibrating,
             modifier = Modifier.fillMaxSize(),
             text = "面捕正在校准中..."
         )
-        
+
         // Debug overlay
         if (showDebug) {
             DebugOverlayHost(
                 snapshot = debugSnapshotState,
                 isTracking = isTracking.value,
-                currentModel = currentModel?.name ?: "None",
-                showCameraPreview = showCameraPreview,
+                currentCameraName = currentCamera?.label ?: "自动",
+                trackingEnabled = trackingOutput.isRunning.value,
+                trackingClients = trackingOutput.clientCount.value,
                 faceTracker = faceTracker,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(16.dp),
             )
         }
-        
-        // Model selector dialog
-        if (showModelSelector) {
-            ModelSelectorDialog(
-                models = availableModels,
-                currentModel = currentModel,
-                onModelSelected = { model ->
-                    Log.i("FaceCapturePipeline", "User selected model: ${model.name}")
-                    scope.launch {
-                        modelManager.loadModel(model) { success ->
-                            if (success) {
-                                currentModel = model
-                                Log.i("FaceCapturePipeline", "✓ Model switched to: ${model.name}")
-                            } else {
-                                Log.e("FaceCapturePipeline", "✗ Failed to switch model")
-                            }
-                        }
-                    }
-                    showModelSelector = false
-                },
-                onDismiss = {
-                    showModelSelector = false
-                }
-            )
-        }
-        
-        // 浏览器输出（OBS）设置对话框
-        if (showWebOutputDialog) {
-            WebOutputDialog(
-                manager = webOutput,
-                onDismiss = { showWebOutputDialog = false }
+
+        // 网络输出（追踪数据）对话框
+        if (showTrackingDialog) {
+            TrackingOutputDialog(
+                manager = trackingOutput,
+                onDismiss = { showTrackingDialog = false }
             )
         }
 
@@ -453,7 +394,6 @@ fun FaceCapturePipelineScreen(
                 onCameraSelected = { camera ->
                     showCameraSelectorDialog = false
                     scope.launch {
-                        val wasTracking = isTracking.value
                         val switched = faceTracker.switchCamera(camera.id)
                         if (switched) {
                             currentCamera = camera
@@ -461,15 +401,14 @@ fun FaceCapturePipelineScreen(
                                 .edit()
                                 .putString(KEY_PREFERRED_CAMERA_ID, camera.id)
                                 .apply()
-                            // 相机几何 / FOV 变了，重置 avatar 归一化窗口等待重新校准
-                            avatarAdapter.reset()
+                            // 相机几何 / FOV 变了，重做基线校准，避免姿态与表情残留旧基线
+                            faceTracker.resetAdaptiveBaseline()
                             Log.i(
                                 "FaceCapturePipeline",
-                                "Camera switched to ${camera.label} (${camera.id}), " +
-                                    "wasTracking=$wasTracking"
+                                "Camera switched to " + camera.label + " (" + camera.id + ")"
                             )
                         } else {
-                            Log.e("FaceCapturePipeline", "Failed to switch camera to ${camera.id}")
+                            Log.e("FaceCapturePipeline", "Failed to switch camera to " + camera.id)
                             availableCameras = faceTracker.getAvailableCameras()
                         }
                     }
@@ -526,64 +465,64 @@ fun FaceCapturePipelineScreen(
                 ControlPanel(
                     isTracking = isTracking.value,
                     showDebug = showDebug,
-                    showCameraPreview = showCameraPreview,
-                    currentModelName = currentModel?.name ?: "Loading...",
-                    currentCameraName = currentCamera?.label ?: "Auto",
-                    webOutputEnabled = webOutput.isRunning.value,
-                    onOpenCameraSelector = {
-                        availableCameras = faceTracker.getAvailableCameras()
-                        showCameraSelectorDialog = true
-                    },
-                    onOpenWebOutput = {
-                        showWebOutputDialog = true
-                    },
+                    currentCameraName = currentCamera?.label ?: "自动",
+                    trackingEnabled = trackingOutput.isRunning.value,
+                    trackingClients = trackingOutput.clientCount.value,
+                    blinkCurveEnabled = blinkCurveEnabled,
+                    blinkSpeedScale = blinkSpeedScale,
+                    drawLandmarks = drawLandmarks,
+                    drawDetectionBox = drawDetectionBox,
+                    mnnBackend = mnnBackend,
+                    backendSwitching = backendSwitching,
                     onToggleTracking = {
                         scope.launch {
                             if (isTracking.value) {
                                 Log.i("FaceCapturePipeline", "Stopping face tracking...")
                                 faceTracker.stop()
                                 isTracking.value = false
+                                trackingOutput.setTrackingActive(false)
                             } else {
                                 Log.i("FaceCapturePipeline", "Starting face tracking...")
                                 faceTracker.start()
                                 isTracking.value = true
+                                trackingOutput.setTrackingActive(true)
                             }
                         }
                     },
+                    onResetBaseline = {
+                        Log.i("FaceCapturePipeline", "Resetting adaptive baseline...")
+                        faceTracker.resetAdaptiveBaseline()
+                    },
                     onToggleDebug = {
                         showDebug = !showDebug
-                        Log.d("FaceCapturePipeline", "Debug overlay: ${if (showDebug) "shown" else "hidden"}")
+                        Log.d("FaceCapturePipeline", "Debug overlay: " + if (showDebug) "shown" else "hidden")
                     },
-                    onToggleCameraPreview = {
-                        showCameraPreview = !showCameraPreview
-                        Log.d("FaceCapturePipeline", "Camera preview: ${if (showCameraPreview) "shown" else "hidden"}")
+                    onOpenCameraSelector = {
+                        availableCameras = faceTracker.getAvailableCameras()
+                        showCameraSelectorDialog = true
                     },
-                    onSelectModel = {
-                        showModelSelector = true
+                    onOpenTrackingOutput = {
+                        showTrackingDialog = true
                     },
-                        onResetBaseline = {
-                            Log.i("FaceCapturePipeline", "Resetting adaptive baseline...")
-                            faceTracker.resetAdaptiveBaseline()
-                            // 同步重置 Live2D 适配器的归一化窗口，避免 avatar 和面捕基线错位
-                            avatarAdapter.reset()
-                        },
-                    blinkCurveEnabled = blinkCurveEnabled,
-                    blinkSpeedScale = blinkSpeedScale,
                     onToggleBlinkCurve = {
                         blinkCurveEnabled = !blinkCurveEnabled
                         faceTracker.blinkCurveProcessor.isEnabled = blinkCurveEnabled
                         if (blinkCurveEnabled) {
                             faceTracker.blinkCurveProcessor.reset()
                         }
-                        Log.i("FaceCapturePipeline", "Blink Curve Processor: ${if (blinkCurveEnabled) "ENABLED" else "DISABLED"}")
+                        Log.i("FaceCapturePipeline", "Blink Curve Processor: " + if (blinkCurveEnabled) "ENABLED" else "DISABLED")
                     },
                     onBlinkSpeedChange = { newSpeed ->
                         blinkSpeedScale = newSpeed
                         faceTracker.blinkCurveProcessor.blinkSpeedScale = newSpeed
-                        Log.d("FaceCapturePipeline", "Blink speed scale: $newSpeed")
+                        Log.d("FaceCapturePipeline", "Blink speed scale: " + newSpeed)
                     },
-                    mnnBackend = mnnBackend,
-                    backendSwitching = backendSwitching,
+                    onToggleLandmarks = {
+                        drawLandmarks = !drawLandmarks
+                    },
+                    onToggleDetectionBox = {
+                        drawDetectionBox = !drawDetectionBox
+                    },
                     onToggleMnnBackend = {
                         // 后端切换 = 销毁 → 重建推理 session，耗时可达数百毫秒，
                         // 必须放到 IO 线程，否则会把主线程卡住（掉帧/ANR）。
@@ -594,7 +533,7 @@ fun FaceCapturePipelineScreen(
                                 MnnBackend.VULKAN
                             }
                             backendSwitching = true
-                            Log.i("FaceCapturePipeline", "Switching MNN backend to $target ...")
+                            Log.i("FaceCapturePipeline", "Switching MNN backend to " + target + " ...")
                             scope.launch(Dispatchers.IO) {
                                 val ok = try {
                                     faceTracker.setMnnBackend(target)
@@ -609,7 +548,7 @@ fun FaceCapturePipelineScreen(
                                 backendSwitching = false
                                 Log.i(
                                     "FaceCapturePipeline",
-                                    "MNN backend switch (ok=$ok) -> ${faceTracker.getMnnBackend()}"
+                                    "MNN backend switch (ok=" + ok + ") -> " + faceTracker.getMnnBackend()
                                 )
                             }
                         }
@@ -623,16 +562,17 @@ fun FaceCapturePipelineScreen(
 /**
  * 把 [DebugSnapshot] 的读取关在一个独立的重组作用域里。
  *
- * 如果直接在 [FaceCapturePipelineScreen] 的函数体里读快照，每次数据更新都会让整个
- * 屏幕（包括 Live2D 的 AndroidView、控制面板）重新走一遍组合；放到这里以后只有
+ * 如果直接在 [FaceCaptureScreen] 的函数体里读快照，每次数据更新都会让整个屏幕
+ * （包括相机预览的 AndroidView、控制面板）重新走一遍组合；放到这里以后只有
  * 这一小块会随面捕数据（≤10Hz）重组。
  */
 @Composable
 private fun DebugOverlayHost(
     snapshot: State<DebugSnapshot>,
     isTracking: Boolean,
-    currentModel: String,
-    showCameraPreview: Boolean,
+    currentCameraName: String,
+    trackingEnabled: Boolean,
+    trackingClients: Int,
     faceTracker: PipelineFaceTracker,
     modifier: Modifier = Modifier
 ) {
@@ -640,10 +580,11 @@ private fun DebugOverlayHost(
     DebugOverlay(
         fps = value.fps,
         isTracking = isTracking,
-        currentModel = currentModel,
+        currentCameraName = currentCameraName,
+        trackingEnabled = trackingEnabled,
+        trackingClients = trackingClients,
         blendShapes = value.blendShapes,
         headPose = value.headPose,
-        showCameraPreview = showCameraPreview,
         modifier = modifier,
         faceTracker = faceTracker
     )
@@ -653,10 +594,11 @@ private fun DebugOverlayHost(
 fun DebugOverlay(
     fps: Float,
     isTracking: Boolean,
-    currentModel: String,
+    currentCameraName: String,
+    trackingEnabled: Boolean,
+    trackingClients: Int,
     blendShapes: ARKitBlendShapes?,
     headPose: HeadPoseData,
-    showCameraPreview: Boolean,
     modifier: Modifier = Modifier,
     faceTracker: PipelineFaceTracker
 ) {
@@ -669,12 +611,11 @@ fun DebugOverlay(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            // FPS and Performance Charts Row
+            // FPS / 状态 + 性能曲线
             Row(
                 verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // Left: FPS and status
                 Column(
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
@@ -683,48 +624,46 @@ fun DebugOverlay(
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.White
                     )
-                    
+
+                    // 帧耗时 = 端到端每帧处理时间（含推理 + 后处理），与 FPS 互为倒数
                     Text(
-                        text = if (isTracking) "Tracking: ON" else "Tracking: OFF",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (isTracking) Color.Green else Color.Red
-                    )
-                    
-                    Text(
-                        text = "Model: $currentModel",
+                        text = "帧耗时: %.1f ms".format(if (fps > 0f) 1000f / fps else 0f),
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color.Cyan
-                    )
-                    
-                    Text(
-                        text = if (showCameraPreview) "View: Camera" else "View: Live2D",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.Magenta
+                        color = Color.LightGray
                     )
 
                     Text(
-                        text = "Camera: ${faceTracker.getCurrentCamera()?.label ?: "Auto"}",
+                        text = if (isTracking) "面捕: 运行中" else "面捕: 已停止",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isTracking) Color.Green else Color.Red
+                    )
+
+                    Text(
+                        text = "摄像头: " + currentCameraName,
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Cyan
                     )
+
+                    Text(
+                        text = if (trackingEnabled) "网络输出: ON (" + trackingClients + " 客户端)" else "网络输出: OFF",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (trackingEnabled) Color(0xFF4CAF50) else Color.Gray
+                    )
                 }
-                
-                // Right: CPU/Memory performance charts
+
                 PerformanceChartPanel(
                     modifier = Modifier.padding(start = 8.dp)
                 )
             }
-            
-            // Head Pose section
+
             HorizontalDivider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-            
+
             Text(
-                text = "Head Pose (→Live2D):",
+                text = "头部姿态（相对基线）:",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Yellow
             )
-            
-            // Pitch with visual indicator
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "Pitch: %+6.1f°".format(headPose.pitch),
@@ -738,8 +677,7 @@ fun DebugOverlay(
                     color = Color.Red
                 )
             }
-            
-            // Yaw with visual indicator
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "Yaw:   %+6.1f°".format(headPose.yaw),
@@ -753,8 +691,7 @@ fun DebugOverlay(
                     color = Color.Green
                 )
             }
-            
-            // Roll with visual indicator
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "Roll:  %+6.1f°".format(headPose.roll),
@@ -768,17 +705,16 @@ fun DebugOverlay(
                     color = Color.Blue
                 )
             }
-            
+
             blendShapes?.let { bs ->
                 HorizontalDivider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-                
+
                 Text(
-                    text = "BlendShapes:",
+                    text = "ARKit-52:",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.White
                 )
-                
-                // Show key BlendShapes
+
                 Text(
                     text = "Eye L: %.2f".format(bs.eyeBlinkLeft),
                     style = MaterialTheme.typography.bodySmall,
@@ -800,10 +736,10 @@ fun DebugOverlay(
                     color = Color.White
                 )
             }
-            
+
             // Eye Sensitivity Control Section
             HorizontalDivider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-            
+
             EyeSensitivityControl(faceTracker)
         }
     }
@@ -815,9 +751,8 @@ fun DebugOverlay(
  */
 @Composable
 fun EyeSensitivityControl(faceTracker: PipelineFaceTracker) {
-    // 使用 remember + mutableStateOf 来跟踪滑块值
     var sensitivity by remember { mutableFloatStateOf(SimpleEyeExtractor.eyeSensitivity) }
-    
+
     Column {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -825,7 +760,7 @@ fun EyeSensitivityControl(faceTracker: PipelineFaceTracker) {
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                text = "Eye Sensitivity:",
+                text = "眼睛灵敏度:",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Yellow
             )
@@ -835,7 +770,7 @@ fun EyeSensitivityControl(faceTracker: PipelineFaceTracker) {
                 color = Color.White
             )
         }
-        
+
         Slider(
             value = sensitivity,
             onValueChange = { newValue ->
@@ -851,21 +786,20 @@ fun EyeSensitivityControl(faceTracker: PipelineFaceTracker) {
             ),
             modifier = Modifier.fillMaxWidth()
         )
-        
+
         // 显示当前有效的 EAR 阈值
         val thresholds = faceTracker.faceCapturePipeline.extractor.simpleEyeExtractor.getEffectiveThresholds()
         Text(
-            text = "Thresholds: closed=%.2f, open=%.2f".format(thresholds.first, thresholds.second),
+            text = "EAR 阈值: closed=%.2f, open=%.2f".format(thresholds.first, thresholds.second),
             style = MaterialTheme.typography.labelSmall,
             color = Color.Gray
         )
-        
-        // 灵敏度说明
+
         Text(
             text = when {
-                sensitivity < 0.8f -> "Low: needs larger eye movement"
-                sensitivity > 1.3f -> "High: reacts to subtle movements"
-                else -> "Normal: balanced detection"
+                sensitivity < 0.8f -> "低: 需要较大眼动"
+                sensitivity > 1.3f -> "高: 细微动作也会响应"
+                else -> "正常: 平衡检测"
             },
             style = MaterialTheme.typography.labelSmall,
             color = when {
@@ -890,20 +824,18 @@ fun PoseIndicator(
 ) {
     val normalizedValue = (value / maxValue).coerceIn(-1f, 1f)
     val barWidth = 80.dp
-    
+
     Box(
         modifier = modifier
             .width(barWidth)
             .height(8.dp)
     ) {
-        // Background bar
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Gray.copy(alpha = 0.3f))
         )
-        
-        // Center line
+
         Box(
             modifier = Modifier
                 .width(1.dp)
@@ -911,15 +843,14 @@ fun PoseIndicator(
                 .align(Alignment.Center)
                 .background(Color.White.copy(alpha = 0.5f))
         )
-        
-        // Value indicator
+
         val indicatorWidth = (kotlin.math.abs(normalizedValue) * barWidth.value / 2).dp
         val indicatorOffset = if (normalizedValue >= 0) {
             barWidth / 2
         } else {
             barWidth / 2 - indicatorWidth
         }
-        
+
         Box(
             modifier = Modifier
                 .width(indicatorWidth)
@@ -930,27 +861,34 @@ fun PoseIndicator(
     }
 }
 
+/**
+ * 底部控制面板（中文 UI，Compose Material3）。
+ *
+ * 只保留面捕采集端真正需要的开关：开始/停止、重置基线、摄像头、网络输出、
+ * 眨眼曲线、调试开关、叠加层开关、MNN 推理后端。
+ */
 @Composable
 fun ControlPanel(
     isTracking: Boolean,
     showDebug: Boolean,
-    showCameraPreview: Boolean,
-    currentModelName: String,
     currentCameraName: String,
+    trackingEnabled: Boolean,
+    trackingClients: Int,
     blinkCurveEnabled: Boolean,
     blinkSpeedScale: Float,
-    webOutputEnabled: Boolean,
-    onToggleTracking: () -> Unit,
-    onToggleDebug: () -> Unit,
-    onToggleCameraPreview: () -> Unit,
-    onSelectModel: () -> Unit,
-    onResetBaseline: () -> Unit,
-    onToggleBlinkCurve: () -> Unit,
-    onBlinkSpeedChange: (Float) -> Unit,
-    onOpenCameraSelector: () -> Unit,
-    onOpenWebOutput: () -> Unit,
+    drawLandmarks: Boolean,
+    drawDetectionBox: Boolean,
     mnnBackend: MnnBackend,
     backendSwitching: Boolean,
+    onToggleTracking: () -> Unit,
+    onResetBaseline: () -> Unit,
+    onToggleDebug: () -> Unit,
+    onOpenCameraSelector: () -> Unit,
+    onOpenTrackingOutput: () -> Unit,
+    onToggleBlinkCurve: () -> Unit,
+    onBlinkSpeedChange: (Float) -> Unit,
+    onToggleLandmarks: () -> Unit,
+    onToggleDetectionBox: () -> Unit,
     onToggleMnnBackend: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -970,17 +908,18 @@ fun ControlPanel(
         Column(
             modifier = Modifier
                 .padding(16.dp)
+                .heightIn(max = 380.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Current model display
             Text(
-                text = "Current: $currentModelName",
+                text = "摄像头: " + currentCameraName + " · 网络输出: " +
+                    (if (trackingEnabled) "已开启 (" + trackingClients + " 客户端)" else "已关闭"),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
 
-            // Control buttons - first row
+            // 第一行：开始/停止 + 重置基线
             Row(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -993,46 +932,9 @@ fun ControlPanel(
                             MaterialTheme.colorScheme.primary
                     )
                 ) {
-                    Text(if (isTracking) "Stop" else "Start")
+                    Text(if (isTracking) "停止面捕" else "开始面捕")
                 }
 
-                Button(
-                    onClick = onToggleDebug
-                ) {
-                    Text(if (showDebug) "Hide Debug" else "Show Debug")
-                }
-            }
-
-            // Control buttons - second row
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
-                    onClick = onToggleCameraPreview,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (showCameraPreview)
-                            MaterialTheme.colorScheme.tertiary
-                        else
-                            MaterialTheme.colorScheme.secondary
-                    )
-                ) {
-                    Text(if (showCameraPreview) "Show Live2D" else "Show Camera")
-                }
-
-                Button(
-                    onClick = onSelectModel,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.secondary
-                    )
-                ) {
-                    Text("Select Model")
-                }
-            }
-
-            // Control buttons - third row
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
                 Button(
                     onClick = onResetBaseline,
                     colors = ButtonDefaults.buttonColors(
@@ -1040,24 +942,11 @@ fun ControlPanel(
                         contentColor = MaterialTheme.colorScheme.onErrorContainer
                     )
                 ) {
-                    Text("Reset Baseline")
-                }
-
-                // 眨眼曲线处理器开关
-                Button(
-                    onClick = onToggleBlinkCurve,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (blinkCurveEnabled)
-                            Color(0xFF4CAF50)  // Green when enabled
-                        else
-                            MaterialTheme.colorScheme.secondary
-                    )
-                ) {
-                    Text(if (blinkCurveEnabled) "Blink Curve: ON" else "Blink Curve: OFF")
+                    Text("重置基线")
                 }
             }
 
-            // Control buttons - fourth row：摄像头选择 + 浏览器输出（OBS 浏览器源）
+            // 第二行：摄像头切换 + 网络输出
             Row(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
@@ -1069,31 +958,103 @@ fun ControlPanel(
                     )
                 ) {
                     Text(
-                        text = "Camera: $currentCameraName",
+                        text = "摄像头: " + currentCameraName,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
 
                 Button(
-                    onClick = onOpenWebOutput,
+                    onClick = onOpenTrackingOutput,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (webOutputEnabled)
-                            Color(0xFF2196F3)   // 运行中：蓝色
+                        containerColor = if (trackingEnabled)
+                            Color(0xFF2196F3)
                         else
                             MaterialTheme.colorScheme.secondary
                     )
                 ) {
                     Text(
-                        text = if (webOutputEnabled) "Web Output: ON" else "Web Output",
+                        text = if (trackingEnabled) "网络输出: ON" else "网络输出",
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
-            // Control buttons - fifth row：MNN 推理后端（Vulkan ⇄ CPU）
+            // 第三行：眨眼曲线 + 调试
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = onToggleBlinkCurve,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (blinkCurveEnabled)
+                            Color(0xFF4CAF50)
+                        else
+                            MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = if (blinkCurveEnabled) "眨眼曲线: ON" else "眨眼曲线: OFF",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Button(
+                    onClick = onToggleDebug,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = if (showDebug) "隐藏调试" else "显示调试",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // 第四行：预览叠加层（关键点 / 检测框）
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = onToggleLandmarks,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (drawLandmarks)
+                            Color(0xFF7C4DFF)
+                        else
+                            MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = if (drawLandmarks) "关键点: ON" else "关键点: OFF",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Button(
+                    onClick = onToggleDetectionBox,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (drawDetectionBox)
+                            Color(0xFF00897B)
+                        else
+                            MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text(
+                        text = if (drawDetectionBox) "检测框: ON" else "检测框: OFF",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // 第五行：MNN 推理后端（Vulkan ⇄ CPU）
             // 切换会重建推理 session（管线短暂重启），按钮在切换期间禁用并显示进度文案。
             Button(
                 onClick = onToggleMnnBackend,
@@ -1101,16 +1062,16 @@ fun ControlPanel(
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = when (mnnBackend) {
-                        MnnBackend.VULKAN -> Color(0xFF7C4DFF)   // GPU：紫色
-                        MnnBackend.CPU -> Color(0xFF00897B)      // CPU：青绿
+                        MnnBackend.VULKAN -> Color(0xFF7C4DFF)
+                        MnnBackend.CPU -> Color(0xFF00897B)
                     }
                 )
             ) {
                 Text(
                     text = when {
-                        backendSwitching -> "Backend: switching..."
-                        mnnBackend == MnnBackend.VULKAN -> "Backend: Vulkan (tap for CPU)"
-                        else -> "Backend: CPU (tap for Vulkan)"
+                        backendSwitching -> "推理后端: 切换中..."
+                        mnnBackend == MnnBackend.VULKAN -> "推理后端: Vulkan (点击切 CPU)"
+                        else -> "推理后端: CPU (点击切 Vulkan)"
                     },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -1121,7 +1082,7 @@ fun ControlPanel(
             if (blinkCurveEnabled) {
                 Column {
                     Text(
-                        text = "Blink Speed: %.1fx (%.0fms)".format(
+                        text = "眨眼速度: %.1fx (%.0fms)".format(
                             blinkSpeedScale,
                             230f * blinkSpeedScale
                         ),
@@ -1142,9 +1103,9 @@ fun ControlPanel(
                     )
                     Text(
                         text = when {
-                            blinkSpeedScale < 0.8f -> "Fast blink"
-                            blinkSpeedScale > 1.5f -> "Slow & smooth"
-                            else -> "Normal speed"
+                            blinkSpeedScale < 0.8f -> "快眨"
+                            blinkSpeedScale > 1.5f -> "慢而柔和"
+                            else -> "正常速度"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = when {
@@ -1157,62 +1118,6 @@ fun ControlPanel(
             }
         }
     }
-}
-
-@Composable
-fun ModelSelectorDialog(
-    models: List<Live2DModelManager.ModelInfo>,
-    currentModel: Live2DModelManager.ModelInfo?,
-    onModelSelected: (Live2DModelManager.ModelInfo) -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text("Select Live2D Model")
-        },
-        text = {
-            LazyColumn {
-                items(models) { model ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                Log.i("ModelSelector", "Model clicked: ${model.name}")
-                                onModelSelected(model)
-                            }
-                            .padding(vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = model.name == currentModel?.name,
-                            onClick = {
-                                Log.i("ModelSelector", "RadioButton clicked: ${model.name}")
-                                onModelSelected(model)
-                            }
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(
-                                text = model.name,
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                            Text(
-                                text = model.jsonFileName,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray
-                            )
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(onClick = onDismiss) {
-                Text("Close")
-            }
-        }
-    )
 }
 
 /**
@@ -1230,11 +1135,11 @@ fun CameraSelectorDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Select Camera") },
+        title = { Text("选择摄像头") },
         text = {
             if (cameras.isEmpty()) {
                 Text(
-                    text = "No camera found. Check the camera permission and try again.",
+                    text = "没有找到摄像头，请检查相机权限后重试。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -1259,8 +1164,10 @@ fun CameraSelectorDialog(
                                     style = MaterialTheme.typography.bodyLarge
                                 )
                                 Text(
-                                    text = "ID ${camera.id} · sensor ${camera.sensorOrientation}° · " +
-                                        "FOV %.0f°".format(camera.verticalFovDegrees),
+                                    text = "ID " + camera.id + " · 传感器 " +
+                                        camera.sensorOrientation + "° · FOV %.0f°".format(
+                                        camera.verticalFovDegrees
+                                    ),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = Color.Gray
                                 )
@@ -1272,24 +1179,20 @@ fun CameraSelectorDialog(
         },
         confirmButton = {
             Button(onClick = onDismiss) {
-                Text("Close")
+                Text("关闭")
             }
         }
     )
 }
 
-/** 「浏览器输出」可选高度（px）。 */
-private val WEB_OUTPUT_HEIGHTS = listOf(360, 480, 640, 720, 1080)
-
 /**
- * 浏览器输出（OBS 浏览器源）设置对话框。
+ * 「网络输出」对话框：启停追踪服务，显示 PC 客户端要连的 WebSocket 地址。
  *
- * 打开后在浏览器 / OBS 里访问 `http://<手机IP>:8765/` 即可看到 Live2D 画面，
- * 页面默认透明背景，可直接作为 OBS 的浏览器源叠加到画面上。
+ * 手机端只做面捕，不传图像；PC 端连 ws://手机IP:8765/ws 收 hello / track / calib。
  */
 @Composable
-fun WebOutputDialog(
-    manager: WebOutputManager,
+fun TrackingOutputDialog(
+    manager: TrackingOutputManager,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1297,19 +1200,13 @@ fun WebOutputDialog(
     val clients = manager.clientCount.value
     val outputFps = manager.outputFps.value
     val error = manager.errorMessage.value
-    val captureHeight = manager.captureHeight.value
-    val targetFps = manager.targetFps.value
-    val quality = manager.quality.value
-    val effectiveHeight = manager.effectiveHeight.value
-    val autoScale = manager.autoScale.value
-    val encodeMs = manager.encodeMs.value
-    val captureFps = manager.captureFps.value
-    val urls = remember(running) { manager.lanUrls() }
-    val heightIndex = WEB_OUTPUT_HEIGHTS.indexOf(captureHeight).coerceAtLeast(0)
+    val seq = manager.latestSeq.value
+    val wsUrls = remember(running) { manager.wsUrls() }
+    val httpUrls = remember(running) { manager.httpUrls() }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("浏览器输出 (OBS)") },
+        title = { Text("网络输出（追踪数据）") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -1317,32 +1214,36 @@ fun WebOutputDialog(
             ) {
                 Text(
                     text = if (running) {
-                        "状态：运行中 · 客户端 $clients"
+                        "状态: 运行中 · 客户端 " + clients
                     } else {
-                        "状态：已停止"
+                        "状态: 已停止"
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (running) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 if (running) {
-                    // 抓帧 fps 和编码 fps 分开显示：抓帧高、编码低就是编码跟不上（该降档）
                     Text(
-                        text = "输出 %.0f fps · 抓帧 %.0f fps · 编码 %.1f ms/帧"
-                            .format(outputFps, captureFps, encodeMs),
+                        text = "输出 %.1f fps · 最新帧序号 %d".format(outputFps, seq),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
-                if (urls.isEmpty()) {
+                Text(
+                    text = "PC 客户端 WebSocket 地址（填这个）：",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                if (wsUrls.isEmpty()) {
                     Text(
                         text = "未找到局域网地址，请先连接 Wi-Fi / 热点",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
                 } else {
-                    urls.forEach { url ->
+                    wsUrls.forEach { url ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = url,
@@ -1351,6 +1252,19 @@ fun WebOutputDialog(
                                 modifier = Modifier.weight(1f)
                             )
                             TextButton(onClick = { copyToClipboard(context, url) }) {
+                                Text("复制")
+                            }
+                        }
+                    }
+                    if (httpUrls.isNotEmpty()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "浏览器状态页: " + httpUrls.first(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = { copyToClipboard(context, httpUrls.first()) }) {
                                 Text("复制")
                             }
                         }
@@ -1367,72 +1281,22 @@ fun WebOutputDialog(
                             Color(0xFF2196F3)
                     )
                 ) {
-                    Text(if (running) "停止输出" else "启动输出")
+                    Text(if (running) "停止服务" else "启动服务")
                 }
 
                 error?.let {
                     Text(
-                        text = "启动失败：$it",
+                        text = "启动失败: " + it,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
                 }
 
                 Text(
-                    text = if (running && effectiveHeight != captureHeight) {
-                        "输出高度：$captureHeight px（编码跟不上，已自动降到 ${effectiveHeight}px 保帧率）"
-                    } else {
-                        "输出高度：$captureHeight px"
-                    },
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Slider(
-                    value = heightIndex.toFloat(),
-                    onValueChange = { value ->
-                        val index = value.roundToInt().coerceIn(0, WEB_OUTPUT_HEIGHTS.lastIndex)
-                        manager.captureHeight.value = WEB_OUTPUT_HEIGHTS[index]
-                    },
-                    valueRange = 0f..(WEB_OUTPUT_HEIGHTS.size - 1).toFloat(),
-                    steps = WEB_OUTPUT_HEIGHTS.size - 2
-                )
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "编码跟不上时自动降分辨率",
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Switch(
-                        checked = autoScale,
-                        onCheckedChange = { manager.autoScale.value = it }
-                    )
-                }
-
-                Text(
-                    text = "输出帧率：$targetFps fps",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Slider(
-                    value = targetFps.toFloat(),
-                    onValueChange = { manager.targetFps.value = it.roundToInt() },
-                    valueRange = 15f..60f,
-                    steps = 8
-                )
-
-                Text(
-                    text = "编码质量：$quality",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Slider(
-                    value = quality.toFloat(),
-                    onValueChange = { manager.quality.value = it.roundToInt() },
-                    valueRange = 40f..95f,
-                    steps = 10
-                )
-
-                Text(
-                    text = "提示：手机与电脑需在同一局域网；输出期间请保持 App 在前台。" +
-                        "OBS → 来源 → 浏览器，URL 填上面的地址，页面默认透明背景。",
+                    text = "说明：手机端只做面捕，不传图像，每帧约 0.4~0.7 KB JSON。" +
+                        "Windows 客户端连接上面的 ws:// 地址，按 track.seq 丢弃旧帧；" +
+                        "可发 ping 保活、发 command:recalibrate 让手机重做中性脸基线校准。" +
+                        "手机与电脑需在同一局域网，输出期间请保持 App 在前台。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
