@@ -49,6 +49,13 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // MediaPipe tasks-vision 通过 AssetManager 的**未压缩 fd**读 .task 模型。
+    // noCompress 必须写在 app 模块：library 模块里的同名设置在最终 APK 不生效
+    // （CI 实测 compress_type=8=DEFLATED，运行时会加载失败、界面提示「未找到模型」）。
+    androidResources {
+        noCompress += "task"
+    }
+
     signingConfigs {
         // 只有真的拿到 keystore 才创建 release 配置，否则 AGP 会因缺字段直接报错。
         if (hasReleaseSigning) {
