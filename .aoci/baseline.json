@@ -1,0 +1,3308 @@
+{
+  "version": 1,
+  "created_at": "2026-10-23T19:23:39Z",
+  "updated_at": "2026-10-23T21:31:01Z",
+  "files": {
+    ".gitattributes": {
+      "role": "index",
+      "sha256": "21fa16a2122e2b0360b47502c577428b645437e08e9e87ffba661f84853cb476",
+      "size": 291,
+      "normalized_sha256": "21fa16a2122e2b0360b47502c577428b645437e08e9e87ffba661f84853cb476"
+    },
+    ".github/workflows/android-ci.yml": {
+      "role": "index",
+      "sha256": "07d3bb8f7059277c0c4d247f9c78aae3c3d1bc534255cd25f2b30ec5a2bcd44a",
+      "size": 11856,
+      "normalized_sha256": "3bf73f7530745ae329ccfbbc4f7e9e29e7c0a6795c48a2c5cd98e5e2f9513657"
+    },
+    ".github/workflows/auto-delete-merged-branch.yml": {
+      "role": "index",
+      "sha256": "e00b933387ed3b5288ecc45eea1e9184eb144a5c6f484289b0ad6ea1d79a0225",
+      "size": 5359,
+      "normalized_sha256": "a05a434857dda9877e6de06fd5813ac86f9d63d8ef28c92dee345fd5c789fc8b"
+    },
+    ".github/workflows/windows-client-ci.yml": {
+      "role": "index",
+      "sha256": "98ee6aef135606ced6646ce0fe295f10289cf6adf7a4407171c56e4bf7f03bae",
+      "size": 7541,
+      "normalized_sha256": "98ee6aef135606ced6646ce0fe295f10289cf6adf7a4407171c56e4bf7f03bae"
+    },
+    ".gitignore": {
+      "role": "index",
+      "sha256": "319ab4caed7be29b89dbc6f996383c39693e56cf82b147b896f55037d517cbc5",
+      "size": 782,
+      "normalized_sha256": "cae5114bc25a561e59fafe857b2c4a62ace9d0859deb0112cc86802d4c5ca498"
+    },
+    ".gitmodules": {
+      "role": "index",
+      "sha256": "211f7682fad1059c71af7cf544bc4561c27d0ac3e05b599f1ce384e48a89e088",
+      "size": 97,
+      "normalized_sha256": "d98b58e106c3c7d28fbbabb21473e6e2289732b08fa86f1fc8132e4d528ef24e"
+    },
+    "AGENTS.md": {
+      "role": "index",
+      "sha256": "ddb50101a5be7eb54bde0bdccb2ce15fbac13a0efed1b2851adc248c7a39bcb7",
+      "size": 13258,
+      "normalized_sha256": "ddb50101a5be7eb54bde0bdccb2ce15fbac13a0efed1b2851adc248c7a39bcb7"
+    },
+    "CommonData/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "CommonData/build.gradle": {
+      "role": "index",
+      "sha256": "c2f1b6241c6aa48d9a7961c6ffbe4befea472208099fffcabb2919c20e376282",
+      "size": 1019,
+      "normalized_sha256": "b0bbe09627bba52ac6f5eb0a088c63e4da8372e10d4431b7b8b94c13994e2f86"
+    },
+    "CommonData/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "CommonData/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "48c84bd2ac064ce2665b62a6e7c0e87f3b4fe259708a76e16625c2b43e1bc078",
+      "size": 770,
+      "normalized_sha256": "56fd960cf225f6ca40f982b13a5dbb0d8bc3dfde13ff76422825c6070d0a1890"
+    },
+    "CommonData/src/androidTest/java/com/example/commondata/ExampleInstrumentedTest.kt": {
+      "role": "index",
+      "sha256": "3ba6d0f8751d1e01fb499bc567b1839485589d26048ddf3dcd4415fb4dacb81a",
+      "size": 699,
+      "normalized_sha256": "779ab37be9ef77fb2431c3c59db102d9de8629e4db5cdba13c64710fc3ca7be0"
+    },
+    "CommonData/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "28b1700b6a37f2d3ae037dbada7741cdbbedea29caf51d706cae22dca0b0d2ce",
+      "size": 124,
+      "normalized_sha256": "f0f4b47043b24ea2136dabe1cd4309c3b71d84d779889989dbe6d6e5126bfd56"
+    },
+    "CommonData/src/main/java/com/example/commondata/BlendShapeResult.kt": {
+      "role": "index",
+      "sha256": "be7c4b9b9f302282473f41ad639c225044629f7a4a2ac54c5571254734fedb72",
+      "size": 1476,
+      "normalized_sha256": "6b794fdcf65a101c9ab8e7519576b0fc4ccd9e00e6d0105e3f4acd1ac9590d72"
+    },
+    "CommonData/src/main/java/com/example/commondata/CameraDeviceInfo.kt": {
+      "role": "index",
+      "sha256": "cb66de335bf5c9b14f76c64cd54a51a9402b0fe555a5d64e94a74df2defa2588",
+      "size": 3257,
+      "normalized_sha256": "cb66de335bf5c9b14f76c64cd54a51a9402b0fe555a5d64e94a74df2defa2588"
+    },
+    "CommonData/src/main/java/com/example/commondata/FaceLandmarkIndices.kt": {
+      "role": "index",
+      "sha256": "a0abc83e482a76b8357c26b12504ffcae8d4bac28b022eacf36566881c7d2b73",
+      "size": 15197,
+      "normalized_sha256": "2d2948c9687ffc3cfa8015f3cd3d0092e213d342014c0e068b4667dfca0649a7"
+    },
+    "CommonData/src/main/java/com/example/commondata/FaceVisualizationData.kt": {
+      "role": "index",
+      "sha256": "d5d1e939b3e0ff4647cc5015cb1bc554070fb6f06c7690e60b4fe95cf58f2daa",
+      "size": 1483,
+      "normalized_sha256": "86fd5dc6a0eb5ad1b5f7b16ab394dc6f9892d2f82dda565ac5b64bfd70171021"
+    },
+    "CommonData/src/main/java/com/example/commondata/Landmark.kt": {
+      "role": "index",
+      "sha256": "ebcc6a9833054267821790f4cb3c775d6ae8d57466eab743becdae6e6f76b9b2",
+      "size": 18196,
+      "normalized_sha256": "fea5fd2d785ffce317eb37fdfb2d5000e2592b3f2f9beaa69351e6bf0ac1c1cf"
+    },
+    "CommonData/src/main/java/com/example/commondata/UpperBodyPose.kt": {
+      "role": "index",
+      "sha256": "25c67caa008d3d4cd7c421fd592e1dcc53e93ee338671aff889495f524884470",
+      "size": 11226,
+      "normalized_sha256": "a94b3b584cb6a07e1a4d3b1cf3349f671bb1db6c52361931a17d98e2ec87be31"
+    },
+    "CommonData/src/main/java/com/vfc/log/VfcLog.kt": {
+      "role": "index",
+      "sha256": "a8ef366a4abe7480af310a58452da67e81013f3e56084c37dee88ceb0a9074dc",
+      "size": 16631,
+      "normalized_sha256": "fa56a88160bc982ffc92ab7769aff70b261e2cb7755bcb63bb93c7772ac45dea"
+    },
+    "CommonData/src/test/java/com/example/commondata/ExampleUnitTest.kt": {
+      "role": "index",
+      "sha256": "91830ffddc97e26fc8213babcf5b121642abfd2df4e1e2074ea68fb45523817d",
+      "size": 362,
+      "normalized_sha256": "911f4ac43be8f69605f698420341196ad6c4dc8cab3c1266815e419238868931"
+    },
+    "LICENSE": {
+      "role": "index",
+      "sha256": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+      "size": 11558,
+      "normalized_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "Live2D/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "Live2D/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "9ea684cbf74d5556356acb88dedcc94dc26e2cb30d1457df34262809220c1fa3",
+      "size": 1888,
+      "normalized_sha256": "ac71dc0a11534fe8ef15d839f65903605e2440bb5a40878031c69396affb808a"
+    },
+    "Live2D/build.gradle": {
+      "role": "index",
+      "sha256": "5fb8d570d06acfc95ae4af084cb346bcee5e4d07e738f5771b93a215c054e27e",
+      "size": 1053,
+      "normalized_sha256": "7171d4355dd0c49f5661091d6e468e3d54e99016434ca362c0e4349f2fb4dd20"
+    },
+    "Live2D/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "Live2D/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "48c84bd2ac064ce2665b62a6e7c0e87f3b4fe259708a76e16625c2b43e1bc078",
+      "size": 770,
+      "normalized_sha256": "56fd960cf225f6ca40f982b13a5dbb0d8bc3dfde13ff76422825c6070d0a1890"
+    },
+    "Live2D/src/SDKRoot/Core/CHANGELOG.md": {
+      "role": "index",
+      "sha256": "33ce70bfc5c43982e5293555d5e7db4bce8c8c21922821869dfa262cd0f0e79b",
+      "size": 5744,
+      "normalized_sha256": "5f401aaf8378f8e2b826041ec6970019d3ac657949347ffb18245796d536e0ba"
+    },
+    "Live2D/src/SDKRoot/Core/LICENSE.md": {
+      "role": "index",
+      "sha256": "ab2b9d38b378aa6c3c6fd0e888e5c335ae811d76e4236c913aa4af609c091da8",
+      "size": 527,
+      "normalized_sha256": "b81e37048010ef1d336106151201a0323c3309cae44aecdedf57831fe88fa991"
+    },
+    "Live2D/src/SDKRoot/Core/README.ja.md": {
+      "role": "index",
+      "sha256": "70c8eccb652ee6de9bbcda6a9c30e7d3085b60171f1c8dc40183d638c80dbcfa",
+      "size": 3138,
+      "normalized_sha256": "e195a3ea4fbc858699b845916bc73bc6ad657d9d83f1a43c794e439501170c6b"
+    },
+    "Live2D/src/SDKRoot/Core/README.md": {
+      "role": "index",
+      "sha256": "f834d47d66bce1367fb6456a7ce5f7c633c6a783a01a75c1796e6182588dd215",
+      "size": 2624,
+      "normalized_sha256": "fad1686d2645a19bbc3d6cd116e3f7d607f3dd29d1c21b64a811176ce9f2ff01"
+    },
+    "Live2D/src/SDKRoot/Core/RedistributableFiles.txt": {
+      "role": "index",
+      "sha256": "1506ff6b84f47d713de9cb710a811b2b86c7e6b326690e6b4d0e8b09d0c47622",
+      "size": 3423,
+      "normalized_sha256": "805b0029098cbc27d64bdf93f245c5cd52b7a0e3123b21914107b3bcf4200b5d"
+    },
+    "Live2D/src/SDKRoot/Core/dll/macos/Live2DCubismCore.bundle": {
+      "role": "index",
+      "sha256": "efb1645f95899f1437db5e60a18b30a2b2a6c720c5fd4e845e88171c4987e4a3",
+      "size": 252144
+    },
+    "Live2D/src/SDKRoot/Core/dll/windows/x86/Live2DCubismCore.lib": {
+      "role": "index",
+      "sha256": "98d5cc3d9410d636bca9bfb44f01942ad535cb006c45cc2e1d0660f291d3ed2a",
+      "size": 13074
+    },
+    "Live2D/src/SDKRoot/Core/dll/windows/x86_64/Live2DCubismCore.lib": {
+      "role": "index",
+      "sha256": "1e3eb80b90c18136eb90b28dac9d64193f43fbcfab1d7db898d180b09a74f7b0",
+      "size": 12262
+    },
+    "Live2D/src/SDKRoot/Core/include/Live2DCubismCore.h": {
+      "role": "index",
+      "sha256": "6ecee1b3dbab04c9082a881a917aa5768ed4096c4697c86902ca25124c612cfb",
+      "size": 16569,
+      "normalized_sha256": "d8036dd06101319ee7de29f3b75c9023c142fbf4424b0b77b77cbcd9e144598c"
+    },
+    "Live2D/src/SDKRoot/Core/lib/android/arm64-v8a/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "ce874dd017d6b96adcbd758d15577c080e9772e6ff2c8347c81064094dbc264a",
+      "size": 1213710
+    },
+    "Live2D/src/SDKRoot/Core/lib/android/armeabi-v7a/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "5e1c993b09934e0d06965a2d6cf6da858a59d109b7d6ee9c85c189f40cf96cda",
+      "size": 853768
+    },
+    "Live2D/src/SDKRoot/Core/lib/android/x86/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "ed8ef66914dc235a9b2ab1a0ae82abeaedf9c3f78d4f1391fbff031dae3cab0b",
+      "size": 858524
+    },
+    "Live2D/src/SDKRoot/Core/lib/android/x86_64/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "30408180ef3f7fa8dc2f2a360d286391b649754d927484ee307dd0880da0c61f",
+      "size": 1194360
+    },
+    "Live2D/src/SDKRoot/Core/lib/experimental/catalyst/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "7e52401db1442ae7112380cfe92946f621d3544c413732e6d152cc475b2b731b",
+      "size": 224448
+    },
+    "Live2D/src/SDKRoot/Core/lib/experimental/rpi/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "41be4cf88b769c1d3fbff1ded1c377c22b83e616b90420b105c6f4306406a9b3",
+      "size": 100738
+    },
+    "Live2D/src/SDKRoot/Core/lib/ios/Debug-iphoneos/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "ffc5c99c802bfd5243db80bc12cead1b15105b8968a79d0e065aef13166ae2a8",
+      "size": 206576
+    },
+    "Live2D/src/SDKRoot/Core/lib/ios/Debug-iphonesimulator/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "93a44e2ba12bcd1b3de0e4e1c92621cfb0d7a69bc34c90b6b8b024472e76aa57",
+      "size": 216752
+    },
+    "Live2D/src/SDKRoot/Core/lib/ios/Release-iphoneos/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "0afb9074cdacf56e9aad660e765cf3cb9f22bd52fdc3cc57307a3171537b95cb",
+      "size": 98792
+    },
+    "Live2D/src/SDKRoot/Core/lib/ios/Release-iphonesimulator/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "0bb8f02d33e414f69cc823d7f6be16ffe84bde2d05cc2859b8f3cbb4d2449d12",
+      "size": 126512
+    },
+    "Live2D/src/SDKRoot/Core/lib/linux/x86_64/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "53acf28faa48c5be35116ddabe5a601191215a0382d85477c85ee7c3451e20d1",
+      "size": 149182
+    },
+    "Live2D/src/SDKRoot/Core/lib/macos/arm64/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "8b96c6e3f0c678a15aab81c22a0ba543953bd76573a2ec7844d1dc6db24f45af",
+      "size": 97840
+    },
+    "Live2D/src/SDKRoot/Core/lib/macos/x86_64/libLive2DCubismCore.a": {
+      "role": "index",
+      "sha256": "1583cdff0661f993558e746e22c7db1691a08e2335a818ec4b5ac9a109f33f8f",
+      "size": 126608
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/120/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "1daf66e794f60f41bf1293fea40db85cfd5d6620f7cf234fa696d4a8587f5647",
+      "size": 171856
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/120/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "a5a6ace8239aabddf1a96c6d8335f3378e9a5cd0fee73839d0f7c34e2434caf8",
+      "size": 171920
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/120/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "90b7b53547e2a3583516a646113a7acd8b8451dcdb4806cceb4f4c2df0e61b3d",
+      "size": 171732
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/120/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "1537abe4d947d529472e50c88984386d9c648824ce092439fec891c3fdd68afe",
+      "size": 171798
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/140/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "aea82c811b407dae0ded9f6d8a4435db4e9c6a9de5a0a21f0b2e85d94e9ed5b1",
+      "size": 174216
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/140/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "10328b56e1f4068d14f9179ebf95c98eb0bf48e83c100d89e4282227d7326c81",
+      "size": 174280
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/140/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "3307924a385923423621c2cb96c9596453e4e3119d23a5675be28891cb462802",
+      "size": 174098
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/140/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "517f567edfccd6e73f4ad34cb95c10e10ac412d1ba0fde766a148573bb6b1078",
+      "size": 174164
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/141/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "f8a807654660bb993914c34d34762a8af67e4316b818f5ef3b06d64c2c8375b3",
+      "size": 190310
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/141/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "0355e9ec246c1ead97424b10876121dd1fcafdccbb7a84007e0196a2ef79a29a",
+      "size": 190372
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/141/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "df2db2c38c85411fa92a7fc8ae50e1676a4b0a3631e4180c49d98acb7d1f7d89",
+      "size": 190210
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/141/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "055231ff42c1100e720842d61d112c6974a7ae3364ff8ab70dd5bd28ceb0fe65",
+      "size": 190270
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/142/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "2f170ffab4afc14babfa06eb16bfa6dfbbb82aa9e4620f5cf3f26f5222eeb9ab",
+      "size": 190460
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/142/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "521b1de459931d588a900575b1ed5796756dfd14437316d9f2e7e26c26850772",
+      "size": 190522
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/142/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "385113e280eee0f6deaf957776ba9f2504611c48d96c821ef29340fed4652e9e",
+      "size": 190358
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/142/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "94145e7e6ce18078bbe6c23498ff3946a9a2680639c2a4d122ff309aad8c86db",
+      "size": 190422
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/143/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "0a666c8f3050c6cd5e35b9be02214e61e21453d246cd1c6830a9e46777c1a608",
+      "size": 189914
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/143/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "a9889e2e16a10607e86c2b96da8f3b75fb092314ed9c3c6f208b6792b1910f51",
+      "size": 189976
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/143/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "d7d9dd244129c6efac06d364d545c5ff8cafad552a6552c675cd704ae03ac02c",
+      "size": 189814
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86/143/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "fc220351c0f8d0b504abc158d0b453866b769ee781b6d80222a52100c1c3b43a",
+      "size": 189874
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/120/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "2aa614e4739401fc5345a53cabfc04c7554fd9d91029aec67b5c5977df841810",
+      "size": 283672
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/120/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "329419d528076396e0b6a49722549c4fc23ac4dec97c3d0a1896efafd466e034",
+      "size": 283742
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/120/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "ae06dc2ed69f450210bbc32cc2032c11443816d0b0c2d909146c0c479f85f892",
+      "size": 283562
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/120/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "e4aa7fbb539e3758337fca701201d25ae9b6015a133bf90aaf3570011f618043",
+      "size": 283628
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/140/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "45806515102cfd37480f9cfc3856fd9f8aa07808aface24b7ac39a01ba35212b",
+      "size": 287020
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/140/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "5ae44247521b2a964df58dfdd155e6be2b1c7fc8bf1fb87e93a4ceabd6daf33a",
+      "size": 287086
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/140/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "8348054e5c88fdfd4ec4f4389cee0f09f30f88615baf213f5bf50b13f02954ec",
+      "size": 286912
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/140/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "ccca8fe450c54709127faa4e5edee34f011df1990b7cc6573873f26b65d17593",
+      "size": 286980
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/141/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "cd607a931f9acbf1c250459bc61ccd7efca5d559db280d067cac4fc8ebb415ce",
+      "size": 301308
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/141/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "e1132ae6b2270ccba51e86759677b30f22a0648ee23cf0e4daecf60575225933",
+      "size": 301364
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/141/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "4d8c2cc50269307e18fc5a77f225c34a20b940ce5f52e23b65d06b6b301e757b",
+      "size": 301214
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/141/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "6a93a5d123c2df0dbc7026742401b19aad12e161c15f2f84beda8553f8718e13",
+      "size": 301274
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/142/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "b8306302b77b09ffea2a70db4dc950e5f11e7e517fa89f77a82a859b7d829c2a",
+      "size": 302364
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/142/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "9f6d2454d413749895b2d702c4544200bd3388eb5e3874f122d56b1081716dfb",
+      "size": 302422
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/142/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "c4c1a1ec9a7412d690e3352417aeb46140a7b130e43fcff8a82f7b23b6b727de",
+      "size": 302272
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/142/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "21cefa121cc0035c289983efad1827385adf7d90666cae8c45d6e089dedd60c5",
+      "size": 302330
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/143/Live2DCubismCore_MD.lib": {
+      "role": "index",
+      "sha256": "df31964b7a39dcc5b0faff9e55522ac5894685ee3019cafac9caa5c95dad6803",
+      "size": 301914
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/143/Live2DCubismCore_MDd.lib": {
+      "role": "index",
+      "sha256": "142b2f89685620b6a7b2db639f7f13ae5a55f35b10be875d5f39cb22d2cce7eb",
+      "size": 301972
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/143/Live2DCubismCore_MT.lib": {
+      "role": "index",
+      "sha256": "913ce00f85158dce912f262f705af0e5d72b953975c431807c6106eae64ad44c",
+      "size": 301820
+    },
+    "Live2D/src/SDKRoot/Core/lib/windows/x86_64/143/Live2DCubismCore_MTd.lib": {
+      "role": "index",
+      "sha256": "fd2f397322ce2a868fb50da6ed4982f1352dd849661c727d9fe2d0bb08ffc2f1",
+      "size": 301882
+    },
+    "Live2D/src/SDKRoot/Framework/CHANGELOG.md": {
+      "role": "index",
+      "sha256": "c4912aedc6a3d4e55923fb2efa6d567322564bbc24aff665793220417e8a1681",
+      "size": 13902,
+      "normalized_sha256": "3681d4653fe3a40246d88281e00268418e376408cad267cf18161290133ca6fe"
+    },
+    "Live2D/src/SDKRoot/Framework/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "a3633f929013e9428591e098f2a533180969ea25e2b876cdaf9653c4a3252f56",
+      "size": 662,
+      "normalized_sha256": "79ff4baa2934e8754384de43d6c6a73946a135df31ea32c2c73389b0af1b193c"
+    },
+    "Live2D/src/SDKRoot/Framework/LICENSE.md": {
+      "role": "index",
+      "sha256": "92c147a7e854aa024cf2d5ced296584b6cde192b85da028242d9cea72f682c66",
+      "size": 2300,
+      "normalized_sha256": "b367cb8009a392894796baac33dc43e4918462f457574b4a81ceb7bbf7c86803"
+    },
+    "Live2D/src/SDKRoot/Framework/README.ja.md": {
+      "role": "index",
+      "sha256": "dafd15cebf449afe8298220cfa73e5a5b49c51fd0c896777c823cbb142d2bb93",
+      "size": 4706,
+      "normalized_sha256": "876217b92672ebd1436492dbc622331ae9b0ca77d38460d2b86a99d4d032bb0c"
+    },
+    "Live2D/src/SDKRoot/Framework/README.md": {
+      "role": "index",
+      "sha256": "2e297ede831cb1da5c60ab05a58e9b5407b298e2da547b2ba58c2ce35fe87e09",
+      "size": 3919,
+      "normalized_sha256": "0bce3282753057042a51516ca521466b7a53b7becc8498807c4868ffc503a213"
+    },
+    "Live2D/src/SDKRoot/Framework/TRANSLATION.md": {
+      "role": "index",
+      "sha256": "d150ed098e7bb0ed28b30d7ad530bbe702621a239f7dbdb61c5e0af6ddafdb0e",
+      "size": 3402,
+      "normalized_sha256": "6d7d93b4b1669bff6baa24cf6920ff4181da0cc3f7569b3abea5ebb2191bfe50"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "b4141fa73ed5bba231f02eda6f5def14b0e7f1e8a7355f8388e59341b8d91372",
+      "size": 1026,
+      "normalized_sha256": "6c6d8728ea4555d57ec571e00fcbc82831b39df98cf17a1e9e60b1adca204cd4"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismCdiJson.cpp": {
+      "role": "index",
+      "sha256": "c8e896de0ce405b2ee5957a8bed8e2fb3c9c571cd708c169234ed0bc21642db8",
+      "size": 3104,
+      "normalized_sha256": "0ddd8692440f4e1c3bff490f34a452c60c6dd76e8c58d1c8703af421d998e68f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismCdiJson.hpp": {
+      "role": "index",
+      "sha256": "35042b3d16d15a759e01c24aae85dfa987525c66663e873a1192959d37c4b30d",
+      "size": 3847,
+      "normalized_sha256": "bf83279b136321c0607748207c582818a339c2f746054b1772b5770ad0338904"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismDefaultParameterId.cpp": {
+      "role": "index",
+      "sha256": "6e15be11219e59d9697f6cc705dbc56f05a287b65d1a1f9ec649583ae82374d8",
+      "size": 2776,
+      "normalized_sha256": "128c14843be26c0b4185daf583b59360668d66dd1edfc11d3f08ec5236b9ea23"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismDefaultParameterId.hpp": {
+      "role": "index",
+      "sha256": "0666555c254db2bddaf0e231a7e2dc2ddc089bf20f9d2c8cceb662567945caf5",
+      "size": 2518,
+      "normalized_sha256": "1e72916a696872dc07df287e47d0a78844696f2f287848af21656d7b4bee6973"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismFramework.cpp": {
+      "role": "index",
+      "sha256": "d2e03e7abdb6235a90aef3acdf8d2672a928299fdb80f58f524c77b5a2a859ff",
+      "size": 10558,
+      "normalized_sha256": "dc4312b43f00084feff4bfa7f88a95ece86df2975ba15a9b2e207fcc9c4b7436"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismFramework.hpp": {
+      "role": "index",
+      "sha256": "1c015eeec34a256037a2767a761939a6911db2a5b2dfda56a096c1760453a8f7",
+      "size": 14135,
+      "normalized_sha256": "7ddf6f19a587cae2c24ca48ba7fd30ebef19af0668faa055ef4134679b6709e5"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismFrameworkConfig.hpp": {
+      "role": "index",
+      "sha256": "28f61a8f0d31396d5ee1b13ed720197e2c21e3e8215a03749341c6187221b245",
+      "size": 1588,
+      "normalized_sha256": "a9251edcf712050e8cfe88c7c21c65d4f2c39416193fa2f970074399c9a69db9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismJsonHolder.hpp": {
+      "role": "index",
+      "sha256": "2618963e8c2cadfc0c1796db32f1ab894756df131d58c8733e382e71bfd50401",
+      "size": 1833,
+      "normalized_sha256": "a3b38c8e889ff9373a59bf961088f47ae0be81786d3310280de0d298ae8e83fe"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismModelSettingJson.cpp": {
+      "role": "index",
+      "sha256": "0f8a8aaf6c6b7f6475fd81dbf5c0954a518cb8eaf9bc3548835b785fe55b8f54",
+      "size": 15127,
+      "normalized_sha256": "255885515c4dbddf848a11d80e352dd2452e6b8795d467dc4731d02ba3374981"
+    },
+    "Live2D/src/SDKRoot/Framework/src/CubismModelSettingJson.hpp": {
+      "role": "index",
+      "sha256": "0dc9e3f863603f408b6e521f8aeedd0cd5e02118d2e555ef6f6dc791c559f2ff",
+      "size": 11654,
+      "normalized_sha256": "82e823e801950bae296d1c8a70306157dcd3711f28dd988c9b6093d9413ee352"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "be28bf5334ea2b43ef9bd713c37ab83868076111aaf19f2607a646396c611639",
+      "size": 342,
+      "normalized_sha256": "70e1ac3bb8e762e42b870eb75122aefda78862a3fe8cb4614de831e624f0436f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismBreath.cpp": {
+      "role": "index",
+      "sha256": "d7644871689005df052dbd2bfd461ff77341c6bbef61274f6c2d6e756e6c068a",
+      "size": 1402,
+      "normalized_sha256": "e6517835253014d1347f799e598af498f752e9573ce30fe7676f8bd601082f77"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismBreath.hpp": {
+      "role": "index",
+      "sha256": "015070016effcb8d65a32af71f3d74391b9c54b86d261fad3541d8f8e905daf2",
+      "size": 4282,
+      "normalized_sha256": "f4400dfeb3e7d5ae2e9d830167de549cb3677c1ebec4cdfbdc86ec5c1f9c9fee"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismEyeBlink.cpp": {
+      "role": "index",
+      "sha256": "43730af965fe3d6b3b05c17d5095614001abebcc09478c29b5363e9d85f74266",
+      "size": 4121,
+      "normalized_sha256": "56349ad81de692d8a84bc0945cf5b67762e8ca81559a38b15709c857ccd3001f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismEyeBlink.hpp": {
+      "role": "index",
+      "sha256": "c6cc119e93397254f993bb6a2f1ce3d5ebf9c8c0eb2231271fd03161bb9bc397",
+      "size": 5189,
+      "normalized_sha256": "a98671ba8082ac298679edf055fac9fcaebe05c30b4db7adb8f9d700195b9b0a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismPose.cpp": {
+      "role": "index",
+      "sha256": "9360a69f57e7325870f2774ad1d5dcd8356da9b0243e3d4254590c5de909a6fc",
+      "size": 9481,
+      "normalized_sha256": "d7f89d8d50f627004c46ace5ba5e7734cc10b84833b9f51dab315bb823462bd8"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Effect/CubismPose.hpp": {
+      "role": "index",
+      "sha256": "4ffe25c864bb4cafbef3a32bf09e26729a4be8930faa7b4bd387b88b6c0dd8a3",
+      "size": 4846,
+      "normalized_sha256": "b82b4117c67db3d945bb6f99fcdec10d496e2d9585f509a5d1263e29a87b252f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/ICubismAllocator.hpp": {
+      "role": "index",
+      "sha256": "9c0a764b9b7d97348bf45fc9f4692f3b137970c4bae0c9b4e316be643a596f67",
+      "size": 1637,
+      "normalized_sha256": "4edf6a53ff3a2fedfb5211cab78efae788055a8500378a3460f97587b4c64073"
+    },
+    "Live2D/src/SDKRoot/Framework/src/ICubismModelSetting.hpp": {
+      "role": "index",
+      "sha256": "a9b7e8dffac0ef1e4c966c26c288d67c48705f85ce85c1f9b1aa9621310c3160",
+      "size": 6965,
+      "normalized_sha256": "9b27645bcaa7758ee35ea58a3b0b9e01b60b591df36defc3d6564ad40b8f769e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Id/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "4da6bc438f88f0984ad006ab727aeec278a2deff314497e10b452fd097c3d7b8",
+      "size": 240,
+      "normalized_sha256": "b76e98a0d2bc2221ee9b3e9cbff096dece9c82c2faf03706f4cf2dce18474b09"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Id/CubismId.cpp": {
+      "role": "index",
+      "sha256": "156e025612efaf82d5a6e3bbc493520bf7086b913b050a2a251fff901303881e",
+      "size": 973,
+      "normalized_sha256": "4bdab46c31f45a22b5fce470d6621d08d1a70768f59b7b01352b52042e121618"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Id/CubismId.hpp": {
+      "role": "index",
+      "sha256": "916463fa71931c521140ba5c3f2eb60b40026f34bb585394e7028f057e426a0e",
+      "size": 1411,
+      "normalized_sha256": "945635fb035dbd8552670fe0c0579615c480e27e1c92c5e3774652b0fef087cb"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Id/CubismIdManager.cpp": {
+      "role": "index",
+      "sha256": "15d8fcad86751ecdbcc81c854b3940dd1b7ae0f911e0a57c1b90cbdd94bf44c4",
+      "size": 3333,
+      "normalized_sha256": "44b5918054f20f18a312f012709fe494c55dae6087df00a2f6520259067367f5"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Id/CubismIdManager.hpp": {
+      "role": "index",
+      "sha256": "4bf23ff463085ebc22ed8b4df1c02d0f34f9369bbf996dff42603617b8bb0f47",
+      "size": 3209,
+      "normalized_sha256": "c34827081f97bb1b73086098883e2b74ad30074c7407a3817479106fba1d3c58"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Live2DCubismCore.hpp": {
+      "role": "index",
+      "sha256": "02beb69884cbd4e9256d9e43365f81ac8e762566a61cb5f524eea4511bec1a0c",
+      "size": 539,
+      "normalized_sha256": "329e17fadcfcf287849b69376586f2b9a10d24092c1bda6bf6482dbed358108b"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "f06de1576f97ffd6ce036ac7225a461b056f6a656f8449a721b7661a2a351560",
+      "size": 672,
+      "normalized_sha256": "360b2e3b1d12daa2d59ae0a5d2415753abc3a0b2a5d739c898cc37bb5550ef65"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismMath.cpp": {
+      "role": "index",
+      "sha256": "497eedc4604cfa06c013e5e207983fdc7d93fa6e1fd9e07af1b31f500069a2a4",
+      "size": 5417,
+      "normalized_sha256": "6fba8b980c0e22011877e2fa71937f2f1d6166fb3cb256d6b4bc26a74054444e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismMath.hpp": {
+      "role": "index",
+      "sha256": "556ae6e8cb1179f23ae1191d31e4072f3d065ca2a00d8e4d7c216d6571a9fcd1",
+      "size": 6876,
+      "normalized_sha256": "13e26dfdf003ad1cb4fed340b2d142c8132e53eedcffc1d80b4b91d7fef774d2"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismMatrix44.cpp": {
+      "role": "index",
+      "sha256": "945e72a781da1d4b85b88c05ae65005638d1ab20cbb2a6a77ee07efabd8bbc67",
+      "size": 3491,
+      "normalized_sha256": "6b647c37ead4fe7e8243708da3ad1b8704bce5f9327fae99238dada49c1b866e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismMatrix44.hpp": {
+      "role": "index",
+      "sha256": "9ca9cfdfc63a2c3aefbd2e52683ea5365a4ed2cfc9728b0d18002c8e679e2024",
+      "size": 5963,
+      "normalized_sha256": "62d4b4b0efeafc9f6a1a999e73a40fe8edd25792b825d77549d32516efd1d0fc"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismModelMatrix.cpp": {
+      "role": "index",
+      "sha256": "0b0d32fcaeaa8a40c8a15dd6f27f96c53f5b991b64ed86442a9b8f76cac7e1c8",
+      "size": 3788,
+      "normalized_sha256": "b9eab422042d2922ca4f26accaf857a65ef8bc716249eeb3c4cd6bb32e73e3b8"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismModelMatrix.hpp": {
+      "role": "index",
+      "sha256": "c5a4fbfce09151f53ff8bbaf547be01fc9971e7283d385ebc39219acdd76b282",
+      "size": 3949,
+      "normalized_sha256": "952071f2f0620c78d2cf640b94d9594173a523e27b0821df453147dafcbc37d1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismTargetPoint.cpp": {
+      "role": "index",
+      "sha256": "439b25060b9db7e3808617e1fc8b4cc5c6520aec1fec4d9c917e3393c2369136",
+      "size": 4997,
+      "normalized_sha256": "95faacf1448b24ab06c648b1519d9eb0768739f08a95e46883ee599aa2def95e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismTargetPoint.hpp": {
+      "role": "index",
+      "sha256": "5748a0970c53896b9f7fa4f2f756324efc4261fc175a854157b462cc72c0017e",
+      "size": 2368,
+      "normalized_sha256": "7a1d11801a58c991ea0d849549ade7cd895104bf165754334462142547a693bc"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismVector2.cpp": {
+      "role": "index",
+      "sha256": "117e42b89c9241cd9138aea8d31071a40b4deffe61f66e00d5130883573ebd22",
+      "size": 2643,
+      "normalized_sha256": "0d178155bff124016584ec8249658002e2b8935b2769a2d858d64d51775dd7e6"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismVector2.hpp": {
+      "role": "index",
+      "sha256": "59424bd4e94606b7c2b2e10a30c5ee9976d74f6431c2b536aea9d38bd0634ee6",
+      "size": 6489,
+      "normalized_sha256": "1f00dda0d525d982659f71370b5b10c0405c0f977a90e619d2a08b066b33e54f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismViewMatrix.cpp": {
+      "role": "index",
+      "sha256": "2c5404b273f3ee20f8ae6cde223ebfc117fc7c36eefeadcf0f2e8bc48ffa2019",
+      "size": 4919,
+      "normalized_sha256": "4392774d0d10bc320663ae42ccf4cfb71aafd4df396b64aea94849b3f9b37f23"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Math/CubismViewMatrix.hpp": {
+      "role": "index",
+      "sha256": "169954cb5119cf6ea3499cd066508ab90eb2ff0f3fe521a2b8340c1d66b102b9",
+      "size": 7128,
+      "normalized_sha256": "5ff09e7d71b0e57baa5914066372095d5f8288d376cff2a6f215de57888a2ba1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "54481c1280a65a4a3c2c227dbd47461f20ee853c348580f2df91ad74216f7de1",
+      "size": 576,
+      "normalized_sha256": "f8cb82d6fd2b97e7407fe888c4720152cc6856bb633ea077baf6a4f4e5e4961a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismMoc.cpp": {
+      "role": "index",
+      "sha256": "0f4776e5cf59d0d108c012e468ff03075c6e198609baed153c58589fd1e1dc53",
+      "size": 3098,
+      "normalized_sha256": "ee5324e08f5c43ed706581725e4539ebdfe59a83da7d3030cbfcd1c9af270b40"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismMoc.hpp": {
+      "role": "index",
+      "sha256": "8634a8049a21bc4601fe3ebf0fcf09876e674a0e212fee1c4bd3682f750b215f",
+      "size": 3307,
+      "normalized_sha256": "2c80e2722060ee24afaa839210aeef1b2f290ed174a76d87978395d2a2deeac9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModel.cpp": {
+      "role": "index",
+      "sha256": "6c58996f53852f0ba4b6dbab403308d9a57d7ab4041941511c52e2e57e4da6aa",
+      "size": 31716,
+      "normalized_sha256": "a65a9862db5f4f95353b2af68a95e1468685c3be2e59ad488653d061e9a0ea05"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModel.hpp": {
+      "role": "index",
+      "sha256": "d7658f04d03f7087cc6cf6fde98c949600ea563f3e0361d25118362e447c3f9c",
+      "size": 34630,
+      "normalized_sha256": "948b07461959393a7737c64e48600ce21f73caad2f2e16409d233d1a1ac2feed"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModelUserData.cpp": {
+      "role": "index",
+      "sha256": "b4e58a2b9e632ff819c7b1912603aefbeb2f2ed33acf50539c0d74f3a63fc710",
+      "size": 2217,
+      "normalized_sha256": "17d971b1cc512a8aad4b0bc9eb7106781319c97ada8ae36343ea35f9ab82f0ea"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModelUserData.hpp": {
+      "role": "index",
+      "sha256": "dc82825714c062633ed7bedea5e68a5c3f4acf672024533dbab546cb789be75b",
+      "size": 2837,
+      "normalized_sha256": "b1e0e3a92103d0ab59a0bca98804903f1e449bc3bb9bece499f3318c9e3210f2"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModelUserDataJson.cpp": {
+      "role": "index",
+      "sha256": "385956460efcfa8c9fb29f33b1428dbc8ee7d0fabf8c4607ae2f0dbcd439dad4",
+      "size": 1708,
+      "normalized_sha256": "9bc2cc905ffea6cb2b66b4cf9e7b29344b7c66401a687b5a3511af8d1dec50e2"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismModelUserDataJson.hpp": {
+      "role": "index",
+      "sha256": "f515b1eac5bec2dbb8d43e9f7d1113e2ba0a1857cc72c6eac26f24fd55da1f5e",
+      "size": 2494,
+      "normalized_sha256": "85438084b4344165d8caa4f27fcca507544677f195788170a49dd9da7c576e9d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismUserModel.cpp": {
+      "role": "index",
+      "sha256": "bbf7127cd43f61ba7ac110f00744dd16c8c8df7d5b2b6966453a62a8e4bdb76d",
+      "size": 7023,
+      "normalized_sha256": "8264e69756a180f39e77cf61c851248a1c4a86f4df7802556c3d5dc4d05ac118"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Model/CubismUserModel.hpp": {
+      "role": "index",
+      "sha256": "3b5ed087010777a741f2a80d4d14462961086612c2b8e76b4b345a9e3cb403b7",
+      "size": 10663,
+      "normalized_sha256": "a42f56e821bbd5f552d9219b6db1896375ca45d9000e8803c2aa60af4a936f16"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/ACubismMotion.cpp": {
+      "role": "index",
+      "sha256": "3fa36122b87659e02a9f72376d9e9a1a91d22172b8bc920881b0d6dd2b2ba85a",
+      "size": 5788,
+      "normalized_sha256": "9c97df0e74e18ccf446a41585423f1ffa6b442f6aa5e425c1f4a93ad1a7e28c5"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/ACubismMotion.hpp": {
+      "role": "index",
+      "sha256": "f07495ab27120dfee4565b8a215c235f80b59409ae1889af88f1c59fd8ebb177",
+      "size": 10999,
+      "normalized_sha256": "70546e42d94b336f2c81219876476e50724d20d75f70698adfab25103b416b28"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "e6584dc4e8770f6e9ca4d90aa0853a6e5db098c111912498d2d00846d05598af",
+      "size": 1022,
+      "normalized_sha256": "fc2261f8ede4aa1860798f8010b3174503b1bb0091e3d5b2f33bad2cece2b852"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismExpressionMotion.cpp": {
+      "role": "index",
+      "sha256": "3de3aa5c01682556f7dc7ce093c453b85179d08c4f895c9eda047f2e51e69e7c",
+      "size": 9693,
+      "normalized_sha256": "f515a061435001dc23475671a4cc55ec44341c3907e9f8aa7f5d06fe6cf551ba"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismExpressionMotion.hpp": {
+      "role": "index",
+      "sha256": "af1dc1bde42a88f86f259786eafcf5e57fbdcd175cace3da06a38463c2bf8660",
+      "size": 5277,
+      "normalized_sha256": "e0acdd327eeb4ee83b93241bf7f185c1b00e8460bb55992263818cacafd36ebe"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismExpressionMotionManager.cpp": {
+      "role": "index",
+      "sha256": "59b37ab945069c0f06b77dede37b8e2d62031f436197045eb2911f8ca908ed8b",
+      "size": 7095,
+      "normalized_sha256": "681c746d995bc3bdfaa30fe83ac4a1977e83bdee7984caf297530f85789990b6"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismExpressionMotionManager.hpp": {
+      "role": "index",
+      "sha256": "63ca991f20f1cad8e30b79594aed844c0be6c8211ec842b8451947df2ea472d2",
+      "size": 4152,
+      "normalized_sha256": "4e351fefd9ea59da842bf025f38d2fcddb01aab85324dc5bb1fdd62c8fc138f8"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotion.cpp": {
+      "role": "index",
+      "sha256": "7d04c2c94e27a2327f3f5471851a2674e5f9ed444ffa562d5d40df53eb28175d",
+      "size": 28755,
+      "normalized_sha256": "59ca60654f4cb58f93b4c0c4c80ca6d097e360ddad80fed219530d4bcce3f64d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotion.hpp": {
+      "role": "index",
+      "sha256": "4920749357c73ff5ecc9f1e46477964520ddbacbd566980caad9419406371d62",
+      "size": 9766,
+      "normalized_sha256": "bd7a4729a3836bda151bc6193e08a4006a1e69e384dd266f112789250ac10d03"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionInternal.hpp": {
+      "role": "index",
+      "sha256": "40a6442f1f03abd99f5b0777157f5625e080cbbaca1e41ce8ca0c0b14ae66089",
+      "size": 4626,
+      "normalized_sha256": "57cbdb38a5fccae13dbc6062a282656e9603edea04d8302571113b5b0e332b2a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionJson.cpp": {
+      "role": "index",
+      "sha256": "0310ec8ae1ac7fccaaa39c00b2abc069d32f33ee6e5af2d6bd9ae99d004a8244",
+      "size": 4869,
+      "normalized_sha256": "e6ce4cab6f40e2b985cfd0988cf28deb48f098792c147f2badc309f009ffd836"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionJson.hpp": {
+      "role": "index",
+      "sha256": "f8960c8aefd0816130dc76ae2f3b42d11d28c08720ce9e09f7d6bc08c2cbdd79",
+      "size": 8567,
+      "normalized_sha256": "e6b6a5d168b863e2f9277c0962239f720f3c1bc690785620f5a542989a973779"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionManager.cpp": {
+      "role": "index",
+      "sha256": "03c210eae4a8195e4331bf9eb52a3d493f3e799defe30d3920c30ac8dc61cda6",
+      "size": 1849,
+      "normalized_sha256": "bed950b1a3871467d7a1be9d7e48fc3f04bf6ff717049b9cf9ae700be6887331"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionManager.hpp": {
+      "role": "index",
+      "sha256": "0dbd55cd3a945f9aa65cbe36e58aa892bbe31577f44547b2aa830633b11ffb67",
+      "size": 3482,
+      "normalized_sha256": "2dfa71bdcb3d9bd83fd5faa19b47f5d9d71d62966cc73d4e530e886eba40091e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionQueueEntry.cpp": {
+      "role": "index",
+      "sha256": "89904da138d511223214e7bacb633ff6c19dcde003aeccc89703f3defd8ff568",
+      "size": 3600,
+      "normalized_sha256": "ca7da5a1b47aa30db67d239816e53bd641d400ee196a382987031af8c8216087"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionQueueEntry.hpp": {
+      "role": "index",
+      "sha256": "68cc8a7594be7da7261a6dab4bdcc20e44532ccc424eea394697208a3fc5ab3d",
+      "size": 8054,
+      "normalized_sha256": "b39a52cb666503b02f7a87c3714e5ad1cc2701a49bc1937ac3893f946a3bcd91"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionQueueManager.cpp": {
+      "role": "index",
+      "sha256": "ff895c499be2434648bd09b759fb5d8341ae852c72d868f6c6387b6c78859a36",
+      "size": 8258,
+      "normalized_sha256": "b1c4c4e873deef92017ac7f79ae1b22e33f6bdcd1e0fce96beb574c79b4b4f8c"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Motion/CubismMotionQueueManager.hpp": {
+      "role": "index",
+      "sha256": "fb0d01690b0764781175e713e8c254c495d5106e5fd0c86ec666e4232294b423",
+      "size": 7211,
+      "normalized_sha256": "8e54d275486228b948cb3bd85ad36240d321ca1d029c0e260f15ca3f00cde81e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "4fc75646df9f018bb0ea3f8ce6f5fc33704756413fbb5fdd73296946a3d15dfd",
+      "size": 313,
+      "normalized_sha256": "214d435d604df1999305f49f5fd8f665dbb8981e52a1db5e6dfa2ce21ccc985f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CubismPhysics.cpp": {
+      "role": "index",
+      "sha256": "ed6faef3664ec85be036cb341c0a74cc0b9b16da4ffb2c51c0dc44fcc999cbd3",
+      "size": 39640,
+      "normalized_sha256": "b967e6559f1b1f96b36148bd909e43d515ed6cdf4398fdd0c1250b3cdd1c4623"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CubismPhysics.hpp": {
+      "role": "index",
+      "sha256": "ce130103746a9f4dbfdcf397f9eca2df51c66467dd3d334223b800843382d3af",
+      "size": 4640,
+      "normalized_sha256": "b171ba5612d2c2a9e00ec2c8219237519183d5b643e602f4fd15c83943402b67"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CubismPhysicsInternal.hpp": {
+      "role": "index",
+      "sha256": "adc3b7fe3a46d8840fb87e3a19d3e9afbadb62ed5be77bc6fb4ad5a71570e09f",
+      "size": 8413,
+      "normalized_sha256": "7ac82e50e5d5f7720fe10deb3bf701f691f52d3553b4e90f2304d47f95785b57"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CubismPhysicsJson.cpp": {
+      "role": "index",
+      "sha256": "c59c03ff6609767b7c855540f3b53724f81cb2770272f99b73f2d007a36ae85e",
+      "size": 8761,
+      "normalized_sha256": "c0ecb71841f0241be051243ee0b3018b45841632ed58432f2b3e4a4d200aa78c"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Physics/CubismPhysicsJson.hpp": {
+      "role": "index",
+      "sha256": "579f413e7353c711fe8508ad3150b74e89b414f6020392d89eadab06c40a111b",
+      "size": 11894,
+      "normalized_sha256": "db5c91226ed0b308e9fe46ee6799a16b57ae148acf1253f7ca46c558b5088881"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "9f8bd5edc38d80efcd14f848cbee11d597eb038ac05074db0c5afa9257c11c5c",
+      "size": 762,
+      "normalized_sha256": "c59f3ad27a14faf4cf47c8c3ca6e78d076606154c6b1a30dc432cd242e6ea731"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "d53de90c5d1c38a23eaa4004590ff5d72c2a0bc6e74b9d5cec63d7efb9ab9b1b",
+      "size": 552,
+      "normalized_sha256": "cd5656e2de3a9018469937059de117184f0d2bbe457b1b65096fdbbe8e68c23d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismCommandBuffer_Cocos2dx.cpp": {
+      "role": "index",
+      "sha256": "358d02f210b2ecd75c556ae5eb1c4e03fd8f4cc93f9e6c2cf329510a9c0fbe6b",
+      "size": 7842,
+      "normalized_sha256": "d993f9b43231fd5ea6a075832ae2100f237c2938d9df65d195642a958c2edc37"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismCommandBuffer_Cocos2dx.hpp": {
+      "role": "index",
+      "sha256": "4ca4a11ad4ef219bcff757bfbcab610e32a8b2ae4a60d35e3ed2bb4a19f25a9d",
+      "size": 4116,
+      "normalized_sha256": "cd26f7c4bdc572de6528aa063437e4547af2911ab88dbcdc64e77d02e0f29409"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismOffscreenSurface_Cocos2dx.cpp": {
+      "role": "index",
+      "sha256": "55aaed28a479243c9240f04d3b324db78ee70f5f06527cf34ced4d1ee2dca47f",
+      "size": 4874,
+      "normalized_sha256": "78cd87e4a0ded55dd39ee94eaa187d74c35b5321de70600cd16e382c2bf6c0fe"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismOffscreenSurface_Cocos2dx.hpp": {
+      "role": "index",
+      "sha256": "17a6cbf2fb45b7a83a70e630edba3a0f0b157223eefd1a152470da73824c2e97",
+      "size": 3527,
+      "normalized_sha256": "b82770e80adb5f452739ab7516e789fc07006028228260ddcc08725c9b7ac8a7"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismRenderer_Cocos2dx.cpp": {
+      "role": "index",
+      "sha256": "f507204ddc993ee99cf49b2504415675f0bd99f65ecb8b3cd6bd60a78c44e27e",
+      "size": 30652,
+      "normalized_sha256": "066ad13caeab22a341fdad6b5f1228f355ab9d777a7b0dc9927aed754cff6dd1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismRenderer_Cocos2dx.hpp": {
+      "role": "index",
+      "sha256": "e268750602ebdd0b3c639986c01e43f56f96787962e5c971f026f0af955d5b7e",
+      "size": 13069,
+      "normalized_sha256": "4c0fa55e4463b55b6d38770907c51a3aceb1093ded1702c62ad0370cd5f6be85"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismShader_Cocos2dx.cpp": {
+      "role": "index",
+      "sha256": "4ffa4cfc5977c836912ccf6ab3fb70939799896ae36900f6a366598c1fc39e32",
+      "size": 53031,
+      "normalized_sha256": "96b3e9f44ac07bffa9a050a24a5e67807b9b5c240e6c9ee3aac128703056efd8"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Cocos2d/CubismShader_Cocos2dx.hpp": {
+      "role": "index",
+      "sha256": "a7b4ac35bd4ca13e05e410b9422593eec0c5896968a1a96c8362d9c96832f6aa",
+      "size": 8838,
+      "normalized_sha256": "91124d2c75611ac41d4553eac8fad0dd4c88c768d7ecb707932f01be26f50baf"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/CubismClippingManager.hpp": {
+      "role": "index",
+      "sha256": "b6fd81b422e9333cb6ed6e5b969edcb80ae7d10775a25354b2470508e35580c8",
+      "size": 6970,
+      "normalized_sha256": "29b7f677f3e09fceaed208839187f219b73731c7505fb80e1b474a31d0aee701"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/CubismClippingManager.tpp": {
+      "role": "index",
+      "sha256": "7c280ed1efaa7d4ab139fca6426b175f2b0a362988faca31a520b09fee58727b",
+      "size": 22924,
+      "normalized_sha256": "86df49b8dc29799c174977b68042f2206793e423b15b3b22d1c2446cf87ac8e6"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/CubismRenderer.cpp": {
+      "role": "index",
+      "sha256": "6cf60ff9067dd4b0ff3524421c9c8f4a9ce9a5e300ed61a37c1f4bccd423040d",
+      "size": 5090,
+      "normalized_sha256": "4d452b40f0cad816fa798a03eafbf81c55510708f002c95b186f41a2102a522a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/CubismRenderer.hpp": {
+      "role": "index",
+      "sha256": "d5fe78e2cc7b3e4097fb95419d7f4d78cadf6f860b353cea379a3e2b921c74db",
+      "size": 11056,
+      "normalized_sha256": "8714fa9bb74d791bffc3bcc46dc2ff0e23089322ac99dcd5a99fd16845260506"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "0e52cdeb6049c40c7a641e69a4d5f0423033ac15484f8d14b8957143c58543c6",
+      "size": 641,
+      "normalized_sha256": "e7614946001f7b3325ce917c5eb317c1c53717f3f44520ae84f53b861a4a3de9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismNativeInclude_D3D11.hpp": {
+      "role": "index",
+      "sha256": "eefe8158ae457f684fba03e18e9125813e005eb73d5e421a6e21957e5e652258",
+      "size": 308,
+      "normalized_sha256": "8429cc4028b4dd7e6f0fde30b744b72f773b242dfbadd831d508433d996f56e4"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismOffscreenSurface_D3D11.cpp": {
+      "role": "index",
+      "sha256": "41862eda68100e259e21b53d6af4c9cbabc1a6300ffc5c5f132964027d021465",
+      "size": 7913,
+      "normalized_sha256": "97f42e053df8c203301e433e98fea7236a372607cc4dcd2e957a2b85ff32b1a1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismOffscreenSurface_D3D11.hpp": {
+      "role": "index",
+      "sha256": "db8eba35f094c79bdbd9329d0c1a998a45a839ee657c671cacbeeca348218f44",
+      "size": 3360,
+      "normalized_sha256": "bd6814d473d884d37c715a70640402d1f50ad48019ca730ce3fa2a93358d7b20"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismRenderState_D3D11.cpp": {
+      "role": "index",
+      "sha256": "fa19b30e3131cb3ec8cf83a1398c9315e09700f989a719875dc118023d4bdfb4",
+      "size": 16351,
+      "normalized_sha256": "085e1a1aa5e1caf18909f1c0ccbcfe91157df656d555ee685f738dc1f9ccfa22"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismRenderState_D3D11.hpp": {
+      "role": "index",
+      "sha256": "a4f93ecf79c535ade4268bc5f8e17fb6398976e30c8d0f06974e219922acd638",
+      "size": 7683,
+      "normalized_sha256": "71c86ef66bb5e0c9af01060382731be43f24725733964ec86e2d00c948078116"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismRenderer_D3D11.cpp": {
+      "role": "index",
+      "sha256": "4fe30c82ad511fd9718ecbcf0ee2225967537b25c714af41b45342ba27e4dcf3",
+      "size": 44026,
+      "normalized_sha256": "78e78d6dd84a831bd0d64ec14ac01dfbf6ab384c24aa17d9e999629957f33b7a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismRenderer_D3D11.hpp": {
+      "role": "index",
+      "sha256": "bb1e3f03de21973bf2d6ff275f22deaf934f56a48a5ca29ef719d081df75fe94",
+      "size": 16550,
+      "normalized_sha256": "4b41a80cfb7c1e279dbce556aeb50d7a6544e7f503e0a848aa42d8bb7cc50226"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismShader_D3D11.cpp": {
+      "role": "index",
+      "sha256": "02030737bdb4ee5ab583306dffd4e78fa3ef3c284b1c0b30de0db9155f404a0f",
+      "size": 15246,
+      "normalized_sha256": "935f0969648398fcfa04df560d1e38a62c019febfb4203aca0ed1f5ae3f45598"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismShader_D3D11.hpp": {
+      "role": "index",
+      "sha256": "57c115453a7a4dc3310320a1ab515635f0be8226ff81594d187777cc493d289e",
+      "size": 3936,
+      "normalized_sha256": "45b35bf2d0aa676e4306300125717a07b8e3cf55be2532e1a0a11f74338ce475"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D11/CubismType_D3D11.hpp": {
+      "role": "index",
+      "sha256": "c8c94e0796bb01b05b4cd6486d396115b39d95c73de21974d2a9a716ae41714f",
+      "size": 848,
+      "normalized_sha256": "fb678e4a2d7be9f54f2dfaadd06261362058abe6ec2a51c5ac6e02546b235647"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "8ddab86be542fbe2490ec97d202138b814b269e541f9f83ec51938ad97ec41e4",
+      "size": 631,
+      "normalized_sha256": "bf7219e3ad6b3a809e3a7ecbb6cc145fffe22fb5ec8c81e8ada92cf3fc38785d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismNativeInclude_D3D9.hpp": {
+      "role": "index",
+      "sha256": "7c480ce36bff44ec5a69e6e53a42a7546fa2e541946b4a2e4568c1f345b69fa0",
+      "size": 494,
+      "normalized_sha256": "18a9d817743f86d2524057dc632abb5281b4676482d794898be0324bef1051b5"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismOffscreenSurface_D3D9.cpp": {
+      "role": "index",
+      "sha256": "0a913832f4a08b0fd139f2781bf90f92547eb2b05c78198bf295b779e792fac8",
+      "size": 4895,
+      "normalized_sha256": "20941a1b7d5965209a722c8f8777c06c70c07d02c4498a0159146b449eac0132"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismOffscreenSurface_D3D9.hpp": {
+      "role": "index",
+      "sha256": "9d0cea70d6aa1f80b15b890241482bbd4ed174c0cb547df5f48738bcb6128b1c",
+      "size": 2868,
+      "normalized_sha256": "76a0b434bc487882c70a22acb92cab7ff989e7d1bae0f02dcb160b0a47238652"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismRenderState_D3D9.cpp": {
+      "role": "index",
+      "sha256": "289d730d226b2de30bfe07246f59734d8b84140850078b6156975b25b0694473",
+      "size": 12026,
+      "normalized_sha256": "f7ae64b5c936d5a2fbdde78900b54910d4231019428c5c9ccf9fd2b495c9098d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismRenderState_D3D9.hpp": {
+      "role": "index",
+      "sha256": "9c27c288d6f28ca47eb96ce55f9cb5c68fed10c4634c4a00b4ce4f8884b95cdf",
+      "size": 8598,
+      "normalized_sha256": "0dc6b6df13c27f33d10fe5c62efe32a7d94a183b1b309cf4a593d0db2ee863de"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismRenderer_D3D9.cpp": {
+      "role": "index",
+      "sha256": "604c24e2b42d5c816ef3f64fb73a6c691a99b895becff973dd1efd8c6be42229",
+      "size": 40191,
+      "normalized_sha256": "5c3820d51796071fa9e996ec1c45f6c5c2ad32376377e1726c54720a60b3e2e4"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismRenderer_D3D9.hpp": {
+      "role": "index",
+      "sha256": "eb93a14a2ac3d86070213fa433fee11966c6f2c42bc5f5a8f03d203374969019",
+      "size": 16369,
+      "normalized_sha256": "1ed7207e6710cbb39e55fafb286cfe62dac39e70896ee8a6e6f0b90cdffb9008"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismShader_D3D9.cpp": {
+      "role": "index",
+      "sha256": "9dd78ea5d4bee5cad48d61c83a61c767ebdd9965023a2a3ca85b41a631600f5d",
+      "size": 9768,
+      "normalized_sha256": "7109f320121e111cf88f00fd347b09724b38abf0d3af52823ac6e50366fd008d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismShader_D3D9.hpp": {
+      "role": "index",
+      "sha256": "3ad655bc6f371de1bc22660853f7513c47fe3d21081a58e11b868145b17542a5",
+      "size": 2394,
+      "normalized_sha256": "bb623d036cbf902e7947c7f8c1c3b629abdb0b01f9412768c3e8673323cc911d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/D3D9/CubismType_D3D9.hpp": {
+      "role": "index",
+      "sha256": "c95bee9163f58934d7c3130897b3f63aae9f016228ed8be77c4dc3045fe4b03c",
+      "size": 647,
+      "normalized_sha256": "fc19b278c8be0403776ac2fb9eda8c2a03e4fe06a916aa38279630a6d31b9a3b"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "2b8f36c057d1090d1bfff606d6b6a718b51760679ae6e03a4ec33415cfb0c73d",
+      "size": 870,
+      "normalized_sha256": "2173b0628ac14fe24f2ad63e761d53ca6e27b90ba2769848995dfda5ad1787e3"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismCommandBuffer_Metal.hpp": {
+      "role": "index",
+      "sha256": "df5615320d301de149438956f0e894fb2e6aedf2f71e348c69db95b0b1e9a77f",
+      "size": 3028,
+      "normalized_sha256": "9e9933abae15b3e912878a319494feef821207ab5ef584feb72ceb9ad322b3a6"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismCommandBuffer_Metal.mm": {
+      "role": "index",
+      "sha256": "c2b2cbb4743528c76d81ac17eaabd34b8787b3db1b069072c693c22052c0789b",
+      "size": 4663,
+      "normalized_sha256": "a38f0f8476d57a2466ee8889d1ff25f6bfb4ce1bc78264589f48b8fbd46d5042"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismOffscreenSurface_Metal.hpp": {
+      "role": "index",
+      "sha256": "fec832faed7d6813f8e6aa418035eea5e27c5f2792554eb3f4277b66541a6846",
+      "size": 2564,
+      "normalized_sha256": "36f4f6ea94aa8170236ba0211a68ecf6c583e5acee4c5ec044a6d88dc8d43c2a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismOffscreenSurface_Metal.mm": {
+      "role": "index",
+      "sha256": "da4a931075933ab9917ab78c40fe145534ce71f281c75943c0470e34daed53b4",
+      "size": 4765,
+      "normalized_sha256": "9c4204743aa8665bc8585207bd88199bddcc4e7b03d9d37fdeaac799dbd11817"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismRenderer_Metal.hpp": {
+      "role": "index",
+      "sha256": "9ddd71fcff39606507632226704c5bb4af6f18b0fb921c3a087ae657ac25d186",
+      "size": 11792,
+      "normalized_sha256": "0c6f8eae7e879a8f7cfda4c8715b5bf96e6500b67dc5a289c5630fc077ed69c9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismRenderer_Metal.mm": {
+      "role": "index",
+      "sha256": "d2222777cb1e59f36bc8706d2d43b23ef054bdbb2a253d1401d89bf8ac9da8b0",
+      "size": 27484,
+      "normalized_sha256": "f92a770be8b47be748f1c0f111dbb811e59bddbfeb1ed0417d6ca3979d701ee9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismRenderingInstanceSingleton_Metal.h": {
+      "role": "index",
+      "sha256": "c1a3a8aeb8ae1dfa6bce0c7e60ccb10872a816776e215faeed77dedac39db0af",
+      "size": 673,
+      "normalized_sha256": "51664aca648f1942cfa302faaa269db279ca48cce7fba2a6409934ba48ae0fa7"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismRenderingInstanceSingleton_Metal.m": {
+      "role": "index",
+      "sha256": "cc3b312eb18ba1419fa9a14f0af448a046659123a2be4b5016173390cad9a581",
+      "size": 968,
+      "normalized_sha256": "afb3fdd344703e79b13813d485f3b5699440ed09b05fbf23076a8896d8611b3a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismShader_Metal.hpp": {
+      "role": "index",
+      "sha256": "cff7328d6293f7560332047b34d058d691c2bb803cbb0330e15c589b1b689272",
+      "size": 6363,
+      "normalized_sha256": "dbe36596f7120964511a18d887203bbbf2d0fbc8db94caebb4b9119ef544087e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/CubismShader_Metal.mm": {
+      "role": "index",
+      "sha256": "6f7c72b4ee3dabd1fa2fa2a1cbe1ee06c225689d7a53bb14b873500aac7304be",
+      "size": 25230,
+      "normalized_sha256": "ecf62042b214b35aa3ff188149208b38328af7f9b3d575a915f937c8087f87d3"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/MetalShaderTypes.h": {
+      "role": "index",
+      "sha256": "ed0987c478a73b46946d05885651458f6e6bf5facea3fed415872409ae3d96fd",
+      "size": 791,
+      "normalized_sha256": "ffe7d0a2a869f01d4c672f0df5f6dc4c686e4af992776247fbc0faab0020ab2d"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Metal/MetalShaders.metal": {
+      "role": "index",
+      "sha256": "6923d32c67854a1b1d3306e79c5fd44fa2d409037c070c58dd35d3fcf737f868",
+      "size": 9409,
+      "normalized_sha256": "54bcc3b0f1aa66410f0f46d653b646b5609e61d2776fa3a873c7a0be07a3dea0"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "1d950bfbe5ba798a8b5873c83b0fb13ad2ce0a5ab592ec3a8b541777c8c609a9",
+      "size": 426,
+      "normalized_sha256": "b932b72f008f19fd08a2c47a39b02eff584e525d7870f4677866ec4c5139e3a0"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismOffscreenSurface_OpenGLES2.cpp": {
+      "role": "index",
+      "sha256": "fad2d89e2e38aca560f55295995d7d967d4b386b7eebda5ba6c4e4de3ead7f84",
+      "size": 4216,
+      "normalized_sha256": "e23821e134dc26cf436b730464a10031cab327821c895a492dc70f0573376d34"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismOffscreenSurface_OpenGLES2.hpp": {
+      "role": "index",
+      "sha256": "bb7360af3be067e8eb15ebd7ab8656bc379eb29a80c80ac5d603d109d1a11d64",
+      "size": 3560,
+      "normalized_sha256": "6c98dbf7fd43380e33b1c2a8ec087892d0b14be3054f8227ab978d3a75fbf9b0"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismRenderer_OpenGLES2.cpp": {
+      "role": "index",
+      "sha256": "63a8cb61ec6afa7a036b14dfea24aa34628bb8b7cae449c190a2e06aadde5324",
+      "size": 32451,
+      "normalized_sha256": "c65aee7ae26377aeae17eb1360cba1c206ff5b09bf3e31ac55d50116161fb4ea"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismRenderer_OpenGLES2.hpp": {
+      "role": "index",
+      "sha256": "1d1f6e69b8323a0552b53a41fb0bb5255cae03f595f7b2fafa209d9774e99d1e",
+      "size": 14086,
+      "normalized_sha256": "5b35f9c029028e0efb8f1c1a3557768952a4af8285460bf5dec4ffd376b09e0f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismShader_OpenGLES2.cpp": {
+      "role": "index",
+      "sha256": "9f0d02a86f4f972e96c204acd0508030651d6a12b4a7a773d4502dbf19f9b9d8",
+      "size": 57189,
+      "normalized_sha256": "16769269d0adbbd587a6770802de22bdd865bab296275dc77ad62f08cca608d9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/OpenGL/CubismShader_OpenGLES2.hpp": {
+      "role": "index",
+      "sha256": "2d3f4039d10dc73bdd34cedf7dc7b4673bf016edf94bcc34d91a9006c9029b0c",
+      "size": 9293,
+      "normalized_sha256": "33dcaa866c28a972638f16c5d3d1ad4f728ed95dbc10ce15a08db5bdaa0c88b2"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "705ffc2696d3b0b512426dbfa674e39d5d19b54ef27c72b010a05bb2410866e6",
+      "size": 406,
+      "normalized_sha256": "54020f8d3c6f4f969152c6c5611e679847bef98273f4f6ac38192f8fd83e3a86"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismClass_Vulkan.cpp": {
+      "role": "index",
+      "sha256": "ab6157cda5c038edef83e4294a74723acf5c9bb8b1af18b4965881c4584a18b2",
+      "size": 11301,
+      "normalized_sha256": "226c0f15eb4bb9aec62109a3c2d4e0539502b71bd4d0a6f760a3be69afb140bd"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismClass_Vulkan.hpp": {
+      "role": "index",
+      "sha256": "033745203d3605affdd481d22d3a94a9eb38ddb9f7824bd9b1cffed9868cb688",
+      "size": 7087,
+      "normalized_sha256": "e47136e8b3c79cbdead0ec922046936c246c81116461990e5b96cd5604d85f93"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismOffscreenSurface_Vulkan.cpp": {
+      "role": "index",
+      "sha256": "1e11c799cfa6d432034e4a762144d1cd50f071277190820a51db74ab07739ce6",
+      "size": 6285,
+      "normalized_sha256": "67801d5cd5b782be5a4bd45b9f4b7a0c6a8e879f93f9cd23bb4f524b99cab51a"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismOffscreenSurface_Vulkan.hpp": {
+      "role": "index",
+      "sha256": "ab1637f4fa48bc00fa691007ef60139cdfae03497fdfc987aa73abc9b387fc18",
+      "size": 3325,
+      "normalized_sha256": "e4802415e4996cb6246af14eaf3bc4130f508a9408661211654ed46420365cd3"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismRenderer_Vulkan.cpp": {
+      "role": "index",
+      "sha256": "8a40073bcdc80751612b8b475bf500fbb50ebf4952d2f18354fdce098efe79f2",
+      "size": 65341,
+      "normalized_sha256": "f1be7ef35f96e9307310877f506991f650b18f7243dd59a1844f569113e25972"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/CubismRenderer_Vulkan.hpp": {
+      "role": "index",
+      "sha256": "e41487e47a5326c22d6e5feb5fdf82bcc1425c85eb39a10231d67f4c7466a85d",
+      "size": 25722,
+      "normalized_sha256": "7d6c5db12b02408b55a4abea6de1578b2a0e39c9911b42bfb6492f0c64f30459"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "6384be4af6db7afc2fb58d4ef9f2c4dcc19987346b2d0c9bb3f108a70421a582",
+      "size": 1129,
+      "normalized_sha256": "c0a9f92d64135aec6e67e02ae42e15fccb9b89586b57186ac3adb1df65aecfae"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrc.frag": {
+      "role": "index",
+      "sha256": "0a7e4740b7f6076e04d0db6080ca473ade9d1609adeb1cd9003636fa27d6165a",
+      "size": 507,
+      "normalized_sha256": "be3e92b935427f59e2b6d6b457ab6abc3ab4e3c9b3f227ee3e2fdd925bfde87e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcMask.frag": {
+      "role": "index",
+      "sha256": "1dbe4e0db1c08aa22d24cd5565a6b382177dae0c13f65adf377bcc8614301d85",
+      "size": 799,
+      "normalized_sha256": "50318ec4874bad9544fd4de99899f805e796d6334743ac44ce904a3b144abda9"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcMaskInverted.frag": {
+      "role": "index",
+      "sha256": "7fb52371e1c92bb375f6e50fad6ee33bff752f578f65d9e3c114d618bd50ea3c",
+      "size": 808,
+      "normalized_sha256": "1bc73f96d380e4ca58d5f5ea8218f60eddee7d1c7be1fa1148b1922c4a1595ee"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcMaskInvertedPremultipliedAlpha.frag": {
+      "role": "index",
+      "sha256": "152ed26886ea0fad144f4fe5c1dc4d1ff6980642df390efe5f0ea81f72e9bef5",
+      "size": 765,
+      "normalized_sha256": "dbd34f837c390d9a13feb4fd050e1b581d1bc5682d380d08d5c27b4de6507a7f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcMaskPremultipliedAlpha.frag": {
+      "role": "index",
+      "sha256": "96f0dea7f537a6230e5175f1122548912cd10ccc96bc890c8bdec6cf16dd5b72",
+      "size": 757,
+      "normalized_sha256": "cb9e4215969383763a5c35ae2f3214c9c34d55dff8710702af49d91a8a449141"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcPremultipliedAlpha.frag": {
+      "role": "index",
+      "sha256": "d171d36dd5fa0b67fa5979a5ef2a746bf73adce5e30d5723bd3d1951cfe5f4eb",
+      "size": 466,
+      "normalized_sha256": "8a029f4dc8d69bdae06427438d59c280978fa137fe6a5b8fc6da9d846c009ed1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/FragShaderSrcSetupMask.frag": {
+      "role": "index",
+      "sha256": "bdecd790b107098df6dea81c77647dd27377c584f78d97942ba2e5ba71928444",
+      "size": 538,
+      "normalized_sha256": "6a365a3a03fd462db3a1f187b2a2c145131372cc828d93e216efb099a0c66d97"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/VertShaderSrc.vert": {
+      "role": "index",
+      "sha256": "d44a1a6ff155cb4e495d738c1522c6759017eab1829cbc9b14a6ce3cf2e63418",
+      "size": 397,
+      "normalized_sha256": "cb2d11f10f5a6e3ae48cc1fb6339a55ea7da185fcabcdcd63e3b69727f5bf53f"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/VertShaderSrcMasked.vert": {
+      "role": "index",
+      "sha256": "990da9dd02cb6c6c2f6cb650005fef6770d1877c2176a73b9840ce1b19eb89f1",
+      "size": 525,
+      "normalized_sha256": "1c5add57c48b1fd6c4b8f7a5458e689651642abf5aacf7f28643d6debba8e7f5"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/VertShaderSrcSetupMask.vert": {
+      "role": "index",
+      "sha256": "64ee97648565109383191466b6f8834641ec691bb158f790e4797833da4a7806",
+      "size": 487,
+      "normalized_sha256": "fbd6511ed8dbd742bc3f515f14f4998c5be5b94bce09e69707669f4f08b91902"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Rendering/Vulkan/Shaders/src/common.glsl": {
+      "role": "index",
+      "sha256": "6c0954640acf6e6c62a718d5ab2edc7535eb40da513e74d4b283b1de2e5780b9",
+      "size": 291,
+      "normalized_sha256": "7d12f3d2d94f7662975f935cf8c32431f3732ebaaa22598c816844a8c027a2a0"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "0d29889d14f1d1f1786445701794ea38754fc3b36cf9671822c3eab205762a55",
+      "size": 372,
+      "normalized_sha256": "4e6bb1e056e89ed890f04acee813e586e7739e374fba00fddac310394f073494"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/CubismBasicType.hpp": {
+      "role": "index",
+      "sha256": "7c7e96e203f3a7aa36c78ef05e67054d6249fd2cc116ef8360d58e33d24f8c05",
+      "size": 1533,
+      "normalized_sha256": "30132436ade4bc98b23ecd0299a09b6d26d499c1158d123811dac5d6ef645f0e"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmMap.hpp": {
+      "role": "index",
+      "sha256": "ffe1fbdd0af1f959bb2522975c941a67f03093ad0633a2fc6ec0e07425e165c3",
+      "size": 17067,
+      "normalized_sha256": "d6273dd6f527b8ebe953e411c0158af25bb785c935ec8b80bd1e2c4d4c00c86c"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmRectF.cpp": {
+      "role": "index",
+      "sha256": "7251e052a1c3b88f6173f7fe13b77b84e8b967ee5ec64cffc6b31f594da5f7d4",
+      "size": 883,
+      "normalized_sha256": "2ea11a41a5a60ece5c7e4f09437ef9eb85b81e9209f0877f277f485d737403c1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmRectF.hpp": {
+      "role": "index",
+      "sha256": "0400f2fe5fb989db8b6c60b08b9c692a5116610d9ad561a41620e0f967b313bf",
+      "size": 2183,
+      "normalized_sha256": "7d3c79de68eaad227dbb11a3fe66741b6485f1a960bcf01bb0fa8c973d533de1"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmString.cpp": {
+      "role": "index",
+      "sha256": "7ec57ebeb0e93be2b2852b1c279ba7c8f1cf22929b888287ec759725da6b1c02",
+      "size": 12937,
+      "normalized_sha256": "7eb2d36834437a0a318591d2923c5675092cdca992f0d9c56857387e92ffd63b"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmString.hpp": {
+      "role": "index",
+      "sha256": "96ffaac4a41bacf1357ffb61cb7bec00dcd2195f88e6ea2dfed714aa535e236b",
+      "size": 7230,
+      "normalized_sha256": "07fd380fdb66a234a45666cc05e399c9394ba03d4f476a9831bb8b73da8284d6"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Type/csmVector.hpp": {
+      "role": "index",
+      "sha256": "101962c06370748f92c0fbc589cbfe2eb421fbb99d3c1e5c2ab0a2e31beea9bf",
+      "size": 20993,
+      "normalized_sha256": "b31797750017079a15aa078685f639f0a2db1ee1850dbef9f30978ba428f1b7b"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "5b72baaa1a4dddc16ba8f111cc2f8926ce4fa435ebfd787e82a38a4b256cde90",
+      "size": 336,
+      "normalized_sha256": "1c6179dea9fcce53a587005d838757dc4286cfa0d4c5487e9d759baa8b2cc2f4"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismDebug.cpp": {
+      "role": "index",
+      "sha256": "54fe97f2c979cd2c1a2461479f568fe1f56a252bff7a9f43be95a196687135a6",
+      "size": 1574,
+      "normalized_sha256": "fd98a0f2f04c50fd4ec0949ac05eec74e968062e24b25caf917f73a802302855"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismDebug.hpp": {
+      "role": "index",
+      "sha256": "3dba40937b113651e21c7e48aa38b63b68fc169269ed4a840ff7136df0a8ea2a",
+      "size": 5338,
+      "normalized_sha256": "b5dc3aebc364d61c355acf9f9b00969e907b746e59b9ae9c1c660fa07c494de4"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismJson.cpp": {
+      "role": "index",
+      "sha256": "db5beeedaed6f395a9cdfa11bf19514724b802d683f385e20e61862456f1b16e",
+      "size": 13328,
+      "normalized_sha256": "b137a044eb6a3c62a99c97a208a4b6933f314b7ac80b967b7ddc329cbf757dd8"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismJson.hpp": {
+      "role": "index",
+      "sha256": "786702d4368c4fd2c2556dd159e8b8a98e00f671699e6f344203d9760d6779c6",
+      "size": 24426,
+      "normalized_sha256": "090a0edf30712a3ab5b12ddb114cbeaa4ef7099672817bb5a8b1f72a11206289"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismString.cpp": {
+      "role": "index",
+      "sha256": "5aa69b2d0065f4139cb2cc4f7c70f69a39713c6c4ee1ea2dfb746e29889f8481",
+      "size": 3268,
+      "normalized_sha256": "d540f63dbeaf23b89349797f67e25db46642b0730c2658432bd48c8d1d0f59cd"
+    },
+    "Live2D/src/SDKRoot/Framework/src/Utils/CubismString.hpp": {
+      "role": "index",
+      "sha256": "3b0bf68dccab8a5c3b2da457264fbd083a62ca85e31fc4b4dc582be9f9eb0c7a",
+      "size": 1964,
+      "normalized_sha256": "33281e2b963f979b63de2b793ec6915b279bba6de84e87cc5e946c4bdf75485d"
+    },
+    "Live2D/src/SDKRoot/OpenGL/README.md": {
+      "role": "index",
+      "sha256": "74d0f8ca6c0f647d746fb959ed3421203eecd8cbb7a5d0b6cb0de33e3d940cf5",
+      "size": 5059,
+      "normalized_sha256": "f74382ef85626de3ea0d9aadcdefdbda818528f67d1862598b65170e23850fdc"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/scripts/setup_glew_glfw": {
+      "role": "index",
+      "sha256": "029cf4779cfbaf49313095c9123db4fb140fdd646c346124939eb3a46dc8bae3",
+      "size": 817,
+      "normalized_sha256": "23a82a4d3ccdeb7f4312e6aebb9c711f3ac3c2e13ed7bede6a99927580ab06e5"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/scripts/setup_glew_glfw.bat": {
+      "role": "index",
+      "sha256": "3a60456bc31c52ea8fbe76f2dd5016567299f7549f87cd45f091aa52b9733401",
+      "size": 1193,
+      "normalized_sha256": "944f42411d6d988391b2b17cee4bd14cc97fadf968ec32a50ac73fda00ea8e01"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/scripts/setup_glew_glfw_vs2013.bat": {
+      "role": "index",
+      "sha256": "9100247da9a954f55c2f9a015730b671f2d7b390f5eff4c7d37a963baba8257a",
+      "size": 1193,
+      "normalized_sha256": "a90cb6e3c83077c3338d7a7a9b7143566b0ad7610a70523bfbc45a78c654fcc2"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/scripts/setup_ios_cmake": {
+      "role": "index",
+      "sha256": "0e9797e84e603c7b2cab9d1956f2229cb9aa64b94a6fe8eb26d281655b80adf4",
+      "size": 490,
+      "normalized_sha256": "8be39e3e24aff9ec4e0f67047c2aa3e50ac58606c9aa081f23ae18c847e79ef1"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/stb/README.md": {
+      "role": "index",
+      "sha256": "4ac4eebf9f151c684bc08e0e7bfd9e5cc032e40753fbe602557031f3cd10ae44",
+      "size": 8641,
+      "normalized_sha256": "37da15e898e8c2cd57727b10dbed35f5a91cc49e1ec134b854f211c24d202bfc"
+    },
+    "Live2D/src/SDKRoot/OpenGL/thirdParty/stb/stb_image.h": {
+      "role": "index",
+      "sha256": "5ccee96a88994f6f597481b69f2ebff06f60909f334b7131317d6e84d4c964b0",
+      "size": 271170,
+      "normalized_sha256": "beef2cbf861508e6a74e7cfce2410f2258c1b829c3a1d81b052f71896ff93b93"
+    },
+    "Live2D/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "28b1700b6a37f2d3ae037dbada7741cdbbedea29caf51d706cae22dca0b0d2ce",
+      "size": 124,
+      "normalized_sha256": "f0f4b47043b24ea2136dabe1cd4309c3b71d84d779889989dbe6d6e5126bfd56"
+    },
+    "Live2D/src/main/assets/back_class_normal.png": {
+      "role": "index",
+      "sha256": "41600cbbd3b5335a95c4fc1277a55c1c7b8c859dc09a56809ef9c8ff746b9e90",
+      "size": 2358116
+    },
+    "Live2D/src/main/assets/close.png": {
+      "role": "index",
+      "sha256": "33dcf6cb063888f5894f05fb30772220c3d326bd3230c2df31dbde7353652bb9",
+      "size": 808
+    },
+    "Live2D/src/main/assets/icon_gear.png": {
+      "role": "index",
+      "sha256": "49827c9b8a2ffba4faf4a1de10b689cecb21ec96ba16c682ddcd4591b71a5d93",
+      "size": 1401
+    },
+    "Live2D/src/main/cpp/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "d510802babf1f18287c5ee75a5c2f67bdebda59d3b5f3fb452fddc62b707764a",
+      "size": 1248,
+      "normalized_sha256": "c3e3510ea00d251e6eb8468841b387fd4fdbd4a98009143d438ef7ff13a74c6c"
+    },
+    "Live2D/src/main/cpp/JniBridgeC.cpp": {
+      "role": "index",
+      "sha256": "fbf0513c472c1d592f64ebaa65af178a72a73056f12e8102faa3b33d31473812",
+      "size": 11261,
+      "normalized_sha256": "71862029144fe8e5be1bfbeefc4600b0fff2fff9c8c118852ae03771ca2e6bba"
+    },
+    "Live2D/src/main/cpp/JniBridgeC.hpp": {
+      "role": "index",
+      "sha256": "02b9fc530892ca92b08772495d88fddaa024ac7595ef4fd966f1e24520b1a9c0",
+      "size": 846,
+      "normalized_sha256": "43da51bb5d4dd9e776a69901da41c2f9d6f9df6c32f430cd013ef2c10daabe72"
+    },
+    "Live2D/src/main/cpp/L2DMath/CubismTargetPointEx.cpp": {
+      "role": "index",
+      "sha256": "a617d7593f5a8920ed3629b87aeab54a3402e11bfe0a775765a803893317f31f",
+      "size": 5615,
+      "normalized_sha256": "bc8316d452e2ccc89b825af296e6f9515ac334ea836aef5d66fb32d0d12a3e9c"
+    },
+    "Live2D/src/main/cpp/L2DMath/CubismTargetPointEx.hpp": {
+      "role": "index",
+      "sha256": "3c2929a6e80cc156573882a01a122b02acb3ded2cf500e74972ad04c15c78b5b",
+      "size": 2907,
+      "normalized_sha256": "ca033bbeb4669c185f0f4c38ad77653a106486c2b77ad100ffbeca33e1a41d4d"
+    },
+    "Live2D/src/main/cpp/LAppAllocator.cpp": {
+      "role": "index",
+      "sha256": "e3efbbb9154863694582c46bcd7046e78c5eef0b762b43fc2962d0c7aa3a43f3",
+      "size": 1286,
+      "normalized_sha256": "dce97280dae6ca4c53fc9b9d018c7c56a38f08c8709f4c1cb97944965787f6fc"
+    },
+    "Live2D/src/main/cpp/LAppAllocator.hpp": {
+      "role": "index",
+      "sha256": "59079e62bb74ea8229dc753ebc34f9c31424fe234874efc0d76e923f43c962b3",
+      "size": 1426,
+      "normalized_sha256": "ffff8816b4d0338e7396ca4330c03fa83dd025a47b85c2bf842866cd237a7005"
+    },
+    "Live2D/src/main/cpp/LAppDefine.cpp": {
+      "role": "index",
+      "sha256": "7e38b364d9ea86a5c0fabb3ef7ca9e538e1c41eb78b76f45a517d6065f913e08",
+      "size": 1762,
+      "normalized_sha256": "f0ac76ffcb99a9fec858c7302b32c1f0ef6c6871f2b527583ddf282ea8ac356d"
+    },
+    "Live2D/src/main/cpp/LAppDefine.hpp": {
+      "role": "index",
+      "sha256": "e735163da24374df1fb12cc029c0dd2bfca39d6ae88ad7af67ff596ee013aa02",
+      "size": 3175,
+      "normalized_sha256": "4a85c15526135e80d75e13fc77fc98bb07f541c1773746ade706564609cf1724"
+    },
+    "Live2D/src/main/cpp/LAppDelegate.cpp": {
+      "role": "index",
+      "sha256": "c2e9d1b9a3dc5b34d8a46e1f5171ca3f4067076335d301981e87d771cf7cd5c9",
+      "size": 7850,
+      "normalized_sha256": "a21189f074e51013fd53a1cc5c64aa7eba492c79c2a22a40d217138b2aa27835"
+    },
+    "Live2D/src/main/cpp/LAppDelegate.hpp": {
+      "role": "index",
+      "sha256": "199560a8649b9a70411d55c8924c08d85d5b8fad5506f6b9a04571eca2b97d7a",
+      "size": 6156,
+      "normalized_sha256": "cb6b9227b42084d5eb8b2325653993afa919b487ff94febf8733c7853aee8b0a"
+    },
+    "Live2D/src/main/cpp/LAppLive2DManager.cpp": {
+      "role": "index",
+      "sha256": "76c5b303ae20673936ffe0d1f99fa83d73570182340108f5e9c4925357f22221",
+      "size": 5626,
+      "normalized_sha256": "b71489138c311da5bee08c3681aee7c8410e24812fa52f3785e18a03c403954c"
+    },
+    "Live2D/src/main/cpp/LAppLive2DManager.hpp": {
+      "role": "index",
+      "sha256": "6e02e11c30945783a1c6452f16710cbee2d8c25f95a32ebf295e8bb89e697603",
+      "size": 2733,
+      "normalized_sha256": "6db66e4a6af6079c0b8a148099888ac53954fb203d44201b623efee9428d5dcf"
+    },
+    "Live2D/src/main/cpp/LAppModel.cpp": {
+      "role": "index",
+      "sha256": "8f540e10bb2875a9249029aeb8f7eb80c8692138bcebaf60bbfba468ddf9eced",
+      "size": 24989,
+      "normalized_sha256": "c072125ba171a907357970856546d55cea1726cab7be21237e12e76bf83fe89f"
+    },
+    "Live2D/src/main/cpp/LAppModel.hpp": {
+      "role": "index",
+      "sha256": "29a632be4e9c8297d0baf1958ca6f7a6819333b81d9dc86cbb4abb0677dda67a",
+      "size": 7927,
+      "normalized_sha256": "049c1ee700cddc04708420c4ed805677ea5452cb7f37d5c29ec891f08008f1b7"
+    },
+    "Live2D/src/main/cpp/LAppPal.cpp": {
+      "role": "index",
+      "sha256": "33a9205c3b5cd93ee7308f35463df45e929249b83668efccfcefa4c763c09e2a",
+      "size": 1921,
+      "normalized_sha256": "78c2207a5bef9329a6f78256448ffd7001e9b0cc3e5c19d644dd6f1d248efc83"
+    },
+    "Live2D/src/main/cpp/LAppPal.hpp": {
+      "role": "index",
+      "sha256": "5a6899f531978352b7c3a7985d86ebf214104ffd9c98eb5b733e494473fbc4ad",
+      "size": 2244,
+      "normalized_sha256": "00a8ad7795c4449e0c021ffecfce98b95a1da617fffe06b7758ca2f2daa3964c"
+    },
+    "Live2D/src/main/cpp/LAppSprite.cpp": {
+      "role": "index",
+      "sha256": "35340200cd281d174760abe641bdaabfba4f586200a3539c37014c5c84a6e8a4",
+      "size": 4835,
+      "normalized_sha256": "0f8309555a83cef189ccab5e7a3171ed40d8f710c34aa3d5ecc7de10374a9d01"
+    },
+    "Live2D/src/main/cpp/LAppSprite.hpp": {
+      "role": "index",
+      "sha256": "32888a3b8730287d55d072fb90eeaa66f998cbdb5690324bf33721b3185b5f33",
+      "size": 2780,
+      "normalized_sha256": "f3824b2e0dfdeded7627072b39130c6ce3c1f434ee2e9cc5c1f9f6e43d0155c4"
+    },
+    "Live2D/src/main/cpp/LAppTextureManager.cpp": {
+      "role": "index",
+      "sha256": "3560073677e64b7338be918936960baf7bfb8be05ba642c32a0f1925e7d1fce6",
+      "size": 4230,
+      "normalized_sha256": "b61dea619859ca6b237621c4747e9cad7dbdb4ec5436a49263e294738512fc22"
+    },
+    "Live2D/src/main/cpp/LAppTextureManager.hpp": {
+      "role": "index",
+      "sha256": "7a96e9c1e8ea6a69a09e05d7771243d4f60348f7fc6ca326c5b800da54deb8be",
+      "size": 2619,
+      "normalized_sha256": "fb77b23c68fbae8cb33fba3a52de91d65b54fafb474cb7840de236bbae7909ad"
+    },
+    "Live2D/src/main/cpp/LAppView.cpp": {
+      "role": "index",
+      "sha256": "dbe51ea8aa8c704b377446f233a7f24d68327f1e722600ff0c29ae3221ab53d9",
+      "size": 10166,
+      "normalized_sha256": "143dfe459014be63083d171ff52d57751899eaa2fbdfd6ad20c1be86c5e1925b"
+    },
+    "Live2D/src/main/cpp/LAppView.hpp": {
+      "role": "index",
+      "sha256": "bba2c9c8c1e25c74e55cc313369aa86d124debc4616728ce74d2197b7b5005aa",
+      "size": 5112,
+      "normalized_sha256": "aa9b66f8255516507f91b96fc3eaaf4b67e789c854534abfde5a6d625dca826f"
+    },
+    "Live2D/src/main/java/com/live2d/demo/GLRenderer.java": {
+      "role": "index",
+      "sha256": "ef771afeefff437677cba356d4130e0d5fb05158be4f9451cdb6f2cf6d1593b5",
+      "size": 877,
+      "normalized_sha256": "8b695d58dbcc34e8bef109ead8cadb2fd9bbfcd6d89705935317a5c91283e684"
+    },
+    "Live2D/src/main/java/com/live2d/demo/JniBridgeJava.java": {
+      "role": "index",
+      "sha256": "9021696f157d2dde78192b285cfb7c0677728d560041c2e439b477903fe4cb29",
+      "size": 5268,
+      "normalized_sha256": "2c9540c75c2bde29891b32fcca89e2137fb046c8053d2a24a1711c313d515261"
+    },
+    "MediapipeFaceLandmark/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "MediapipeFaceLandmark/build.gradle": {
+      "role": "index",
+      "sha256": "2c3038c8b5d21ec6c7a301f8e6c0332f655c596948dbbfad8738131b867c30ba",
+      "size": 1639,
+      "normalized_sha256": "8ac136c2e1b3da7941a65ade54afa41c78fc6a3ef612c64b0a2e5999ab55b84c"
+    },
+    "MediapipeFaceLandmark/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "MediapipeFaceLandmark/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "48c84bd2ac064ce2665b62a6e7c0e87f3b4fe259708a76e16625c2b43e1bc078",
+      "size": 770,
+      "normalized_sha256": "56fd960cf225f6ca40f982b13a5dbb0d8bc3dfde13ff76422825c6070d0a1890"
+    },
+    "MediapipeFaceLandmark/src/androidTest/java/com/example/mediapipefacelandmark/ExampleInstrumentedTest.kt": {
+      "role": "index",
+      "sha256": "4e2032b70b28919bbfeba6ac45bfc352624e9727e00670ffd8d03a6f2e606665",
+      "size": 721,
+      "normalized_sha256": "1f264d32dfb4c51176e0c2265c8d01308b1489aa9d54195fe92accc6a1fb8f97"
+    },
+    "MediapipeFaceLandmark/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "28b1700b6a37f2d3ae037dbada7741cdbbedea29caf51d706cae22dca0b0d2ce",
+      "size": 124,
+      "normalized_sha256": "f0f4b47043b24ea2136dabe1cd4309c3b71d84d779889989dbe6d6e5126bfd56"
+    },
+    "MediapipeFaceLandmark/src/main/assets/face_blendshape_mp.mnn": {
+      "role": "index",
+      "sha256": "586170a409982940cd3bbd6b4e8572e9517432fe5f96fff91442609b7b415b22",
+      "size": 1855852
+    },
+    "MediapipeFaceLandmark/src/main/assets/face_detector_mp.mnn": {
+      "role": "index",
+      "sha256": "6867f8fd8e3c2473032acac3422186d39bd1e21a6528975adbe7fee40d848154",
+      "size": 419032
+    },
+    "MediapipeFaceLandmark/src/main/assets/face_detector_mp_int8.mnn": {
+      "role": "index",
+      "sha256": "058ef06ba6df0eaa05f092edcb87b8ef601f2614debd5dcd5e6ab239a8def82a",
+      "size": 141912
+    },
+    "MediapipeFaceLandmark/src/main/assets/face_landmark_detector_mp.mnn": {
+      "role": "index",
+      "sha256": "fc9f18ed08819006ebcc37b2a75b78c82d05c3d38bdf9b86e868970e86ac65e2",
+      "size": 4887300
+    },
+    "MediapipeFaceLandmark/src/main/assets/face_landmarks_detector_mp_int8.mnn": {
+      "role": "index",
+      "sha256": "8cf114e6f3f8f013489fa7f0790bbd7c68eae1196491f703f0841f6c23e76934",
+      "size": 1386232
+    },
+    "MediapipeFaceLandmark/src/main/cpp/CMakeLists.txt": {
+      "role": "index",
+      "sha256": "ee28cd16e626761fe7b6b61a2ae93edad98ffa61660e3e56f827f379d36959b3",
+      "size": 3040,
+      "normalized_sha256": "c8822be1a2a1c07172e1dfcc4091392206b9694a9d52b79294a1b68a4ee9e99a"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/MediaPipeFaceLandmarkJNI.cpp": {
+      "role": "index",
+      "sha256": "fb29f895205c79b04e9f64a900f0e284f431586a0fd483951b6b1348fc49cb4a",
+      "size": 53117,
+      "normalized_sha256": "84753ba7e0ba4027d7a730c3c149ecad5c553344948c89ac1cece4cc355386dd"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/blendshape_predictor.h": {
+      "role": "index",
+      "sha256": "5b93bf1830679d19f4b4fb04915f75d2f484000a5481550475980958fbbd8fd7",
+      "size": 3830,
+      "normalized_sha256": "cce585395884c72e5dd1b656c5c4b22ad2601b0e8e2e3169912c763e677c217e"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/common/logging.h": {
+      "role": "index",
+      "sha256": "c5b71675d89bfc58791fe68798b60fe2ddd70dab8dd48d1ade0e01b04d921274",
+      "size": 1249,
+      "normalized_sha256": "0174b9094f96d0090a3bdbe27fe8492fb16b2f60e81850bfc8a55ccdf3b74096"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/common/perf_profiler.h": {
+      "role": "index",
+      "sha256": "1ad0fb1db93138386a15d297ad79d2f07f496036936f6f9322b111cefe2d3fbb",
+      "size": 7006,
+      "normalized_sha256": "2ca3f2522fdef4618936f1c29b6d98a9f7cd7f85f5dedcee729d3dba850f22a0"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/common/types.h": {
+      "role": "index",
+      "sha256": "eb1f7eac5cda4d0528d8a4212e099e0a06e237272dae9261dedd8b08ac39fe98",
+      "size": 6916,
+      "normalized_sha256": "7f3077578175bbcf7109f1380d5ffc3780e6e9a89871e3d4b28381e84425e31f"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_detector.h": {
+      "role": "index",
+      "sha256": "5697ca20d90a78858544ef5f625e20aac49c0a16a39adeeec0a79ac905d9f973",
+      "size": 6750,
+      "normalized_sha256": "1a9499942a8395b70829d3cab204ddbb13a42ef558cc14dc3cf4a061f245fbc7"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/README_NODEP.md": {
+      "role": "index",
+      "sha256": "91f79e1829a5d75918bf36ec27f27d6f425aaa5cc690d4b8b8cf1455c16cc980",
+      "size": 4636,
+      "normalized_sha256": "d4d672bcb1976e9a9ad49d60c3e7c5af903daf36815f0c552d0e975994ce809d"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/canonical_face_mesh_data.h": {
+      "role": "index",
+      "sha256": "fd98721fe46ac19e084ca1be00d4259550f68ed8f27fa869075b072ae3c669ce",
+      "size": 31145,
+      "normalized_sha256": "59ba76852ed3d4d41b7c132fab92f250314bd0f72a4a4659ef822fa0a5ccd433"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/geometry_pipeline_nodep.h": {
+      "role": "index",
+      "sha256": "c23906a60f8c6614f41de7c771db199ce072dad140853ddca747a2e34f7e2b62",
+      "size": 23453,
+      "normalized_sha256": "f39f8fe0abca7e55906e40dd1cf6221125cbaca0a16da906c988d45873d61e2f"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/mini_linalg.h": {
+      "role": "index",
+      "sha256": "83cd8bfea123ad5bdcce459a3c8a9714cd22ba8b257f797538c30af3aa685d45",
+      "size": 25489,
+      "normalized_sha256": "b1eacb79cca912459b754f7880e626bf1d5979e57202cce04377fe5f8bc560b2"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/neon_intrinsics.h": {
+      "role": "index",
+      "sha256": "99d5552ec9b7f3dd4df2e4d4ea90f837d12425d2690b61200ef2b94b6fa7440b",
+      "size": 20398,
+      "normalized_sha256": "f213b8f04411c000d1ad1fcae8a4ad4fbcdf43b810913e30d6c9dd0aab5d2507"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/procrustes_solver_nodep.h": {
+      "role": "index",
+      "sha256": "88ede6cd4c83418a00040ef2d368564b2ba96819ef4e37ce3e4bea2b8e1cda4e",
+      "size": 10413,
+      "normalized_sha256": "3e2534da1e6cb94a5c76b58a68126e5e115b1de3f9c6e02e8e6d63c6b1fb5cc3"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_geomentry/test_neon_optimization.h": {
+      "role": "index",
+      "sha256": "51e60925e7dbb9b07ce84f0640c69d0d997d558ecce456bd24d763723e60cbed",
+      "size": 15720,
+      "normalized_sha256": "4d375fc0bac2013fa9f8ba6138a8c9db3e0663d269b7b75865044ad30cf6c796"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_landmarker.h": {
+      "role": "index",
+      "sha256": "0b7983f270a8d37a951476eee42815e056a4f603df3313e9aee333f390463b82",
+      "size": 8938,
+      "normalized_sha256": "1a6d988f691b98222f9d3a8d70de231284d056dff308fd1a79c75501968a4287"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/face_pipeline_filter.h": {
+      "role": "index",
+      "sha256": "f5397bf07b06536c61cbeca1ae012fe405f8ad9127d0ac5369bd3311c459439c",
+      "size": 28691,
+      "normalized_sha256": "3ae8384db539ed566c1daebb982dd5c71b3eed96addb6335b1838318fe5330ed"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/mediapipe_face.h": {
+      "role": "index",
+      "sha256": "98e0fb5e2fe027817e229f278f7cd069c776d53e133235528ff1114b53eae32b",
+      "size": 846,
+      "normalized_sha256": "e14384f374829bd01a33b81699b0617e0e3d401707a72542ef69788aaa732dbb"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/include/utils/yuv_utils.h": {
+      "role": "index",
+      "sha256": "8524cfa059b24ae44e498f535ea66ab847a0786c2dfcb55fef34045e207f4fce",
+      "size": 7345,
+      "normalized_sha256": "f2b10dcd6a8524ddc93b55ee4deaf65f9c917614f5902ad848c1ec462b28510a"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/mnn_yuv_converter.cpp": {
+      "role": "index",
+      "sha256": "0626e482d083e55e331889d33a472937c8826338c59f246bd2bcad9e76099839",
+      "size": 12626,
+      "normalized_sha256": "50abbcc5fc6a5e8fb61ec10f42aaf9a4365038c02dadcebfbb52674ab54945ed"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/src/core/blendshape_predictor.cpp": {
+      "role": "index",
+      "sha256": "c172b57f2b59a8d3918422e3ff974d42692019429399ded40bc23c650e15d3b7",
+      "size": 11998,
+      "normalized_sha256": "bb1cda8ce358cba096e73ea4e0fccfc806a86851e8f7714d1457fc95d9aae450"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/src/core/face_detector.cpp": {
+      "role": "index",
+      "sha256": "8bc162522992367d213bae8556c429ec9806a1082ed58b417cb6d73d26630baa",
+      "size": 32734,
+      "normalized_sha256": "e7352fb840cddf004759532d65cde1e5ff396f35742b0e9174b0eee66586a864"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/src/core/face_landmarker.cpp": {
+      "role": "index",
+      "sha256": "92e813383ec499e52de0c1e3f27e40f27d9f12af51d3e9de8b970ceb1698c059",
+      "size": 29329,
+      "normalized_sha256": "2bbee19e76c4a7c5a97380988a1195b8c18bd605bd6a81421d072d1d7bfe2ef0"
+    },
+    "MediapipeFaceLandmark/src/main/cpp/yuv_converter.cpp": {
+      "role": "index",
+      "sha256": "57b2c34621d267a4415a173904c156e97ae4fa1873179d37a72b3a0fc428171b",
+      "size": 16898,
+      "normalized_sha256": "0107bf349f3a6f5d3bb655b5c7718d9fb181dfc7c7262891ae27b0085aa4db94"
+    },
+    "MediapipeFaceLandmark/src/main/java/com/example/mediapipefacelandmark/Camera2Manager.kt": {
+      "role": "index",
+      "sha256": "853d91f86b2cab64ee3c046989a544db65cd03a1e2465c745f2b477d19d0582b",
+      "size": 64422,
+      "normalized_sha256": "168f5dc71239dae63d67906ad76e09cc3d571e7efb042e1b481224e8ab0ec057"
+    },
+    "MediapipeFaceLandmark/src/main/java/com/example/mediapipefacelandmark/MNNYuvConverter.kt": {
+      "role": "index",
+      "sha256": "d438319a70710a879fe75fd87a7826242fef5e6200e4068da9aa305859f76d79",
+      "size": 3887,
+      "normalized_sha256": "486388dd6b1475a96d272c6e45cc0780e82ef50bb9e9324298061080823668e4"
+    },
+    "MediapipeFaceLandmark/src/main/java/com/example/mediapipefacelandmark/MediaPipeFaceDetector.kt": {
+      "role": "index",
+      "sha256": "5a95c990ccbcf0426fb075567dcd81b20dfe56b86ea2ea220d90c455e90f798a",
+      "size": 46679,
+      "normalized_sha256": "7674b0bc6714dadde22bac4befcd7df32c8a8baa846afb7fcbfb372982e5e93a"
+    },
+    "MediapipeFaceLandmark/src/main/java/com/example/mediapipefacelandmark/NeonOptimizationTest.kt": {
+      "role": "index",
+      "sha256": "7f37e9fdae8c89b190e12bae370f9961115894c9963117cb051a4ae2516825ea",
+      "size": 1251,
+      "normalized_sha256": "dc6ef3edb95b1d880278e9ee1bc12e66755f36f6f49512a2c4f7b6b5738d4194"
+    },
+    "MediapipeFaceLandmark/src/main/java/com/example/mediapipefacelandmark/YuvConverter.kt": {
+      "role": "index",
+      "sha256": "9381636c1fcaa46d17a584298c4fdff23e836928ac2d4a9f041101265282e675",
+      "size": 2786,
+      "normalized_sha256": "117f9e69fe1207f265051f6d1f8f044fee9b4e529f9e071f8627dc13e03b0944"
+    },
+    "MediapipeFaceLandmark/src/test/java/com/example/mediapipefacelandmark/ExampleUnitTest.kt": {
+      "role": "index",
+      "sha256": "a18c9a6451383a97973f284ff30eb90762102d2781cb9fe845444525b58c1562",
+      "size": 373,
+      "normalized_sha256": "19b42da8a40f9ef511c0ce572f0655c651b5333033b625eb9941dc5f98fd150f"
+    },
+    "MediapipeUpperBody/.gitignore": {
+      "role": "index",
+      "sha256": "ebf58e02d5be706313dda2446f633d7608bfcc579edf03021af30504e912caa5",
+      "size": 147,
+      "normalized_sha256": "d8a58db1460c01cea029aeeeb62d8c5b020eb8602482f1ee22da363ed3146b36"
+    },
+    "MediapipeUpperBody/README.md": {
+      "role": "index",
+      "sha256": "2a93196eb4752cd558449e1b83ed25f43bf7d3392b2b06146e03bb37e7a09757",
+      "size": 14705,
+      "normalized_sha256": "81117103c22003f4cea5d6f1ee0e68ee266d3feec60e153dbbfde5d5add7919f"
+    },
+    "MediapipeUpperBody/build.gradle": {
+      "role": "index",
+      "sha256": "3f175ec03c270742f62a351bfe4e12b902e26ab59d70c5af8301feb7603b76eb",
+      "size": 2257,
+      "normalized_sha256": "d29120106db1c8811bd3a767ea1d888192aa761e19e92eee74c951d056d6bb6a"
+    },
+    "MediapipeUpperBody/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "3b99c91168cb22d22e69ca96b89c323b2cdbfecc2a195bd85cc7f6d98e1a8198",
+      "size": 407,
+      "normalized_sha256": "0910d90d2f08078433fbf314546efb87f9481b03a68066b0b4c05f95852bc977"
+    },
+    "MediapipeUpperBody/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "6c553204e218ad8b4a7a4c655e6794fb42627e760908b126134b19fe13cf2857",
+      "size": 213,
+      "normalized_sha256": "3ad92b4806481ac8c433110df9f12ef73e32dc2a5c1b016f666c2be7471dbc16"
+    },
+    "MediapipeUpperBody/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "3fece6f1d33d82f5b8d56e4ae92591645978130f500caf854fe83c42449fdd82",
+      "size": 126,
+      "normalized_sha256": "6dbf673c9f38bb6f1d4a798a226ac4c73c6fb7154754fa891016ba57ee272a01"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/OneEuroFilter.kt": {
+      "role": "index",
+      "sha256": "e4fe3d8caba326b3fee3125997d685c3020c934cc118b20aff1dc64e4de4f20d",
+      "size": 3332,
+      "normalized_sha256": "aa0b93cb0d04044a183815be06a5947b0120a73be80f330b13d4a08c0e13cf56"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/TorsoBaseline.kt": {
+      "role": "index",
+      "sha256": "f036208723769fa43fa47c925bf00f48f23004b7ab99132fa2eea38b3a753aae",
+      "size": 2962,
+      "normalized_sha256": "ed520f83d07c453582841aeb3c29a2e1880a5b01f87994ce18aa21a4dd409796"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/UpperBodyGeometry.kt": {
+      "role": "index",
+      "sha256": "2032be00c96c5f9eaf97ca305959a33e5ae981d3cc7b307bd4cfd8a616467a48",
+      "size": 7139,
+      "normalized_sha256": "4f16c09a291caa9cb43232da4f795aa65a994dedce8574d9301fb9300b6e0a8b"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/UpperBodyPoseDetector.kt": {
+      "role": "index",
+      "sha256": "b40e80bed74d7a4eec0220f96d835ea5e1c3e27d5e4c98bffa6e38ad1df645bd",
+      "size": 39101,
+      "normalized_sha256": "9415018ee13b0fd3acbd147ad33a64d0a43571f36ddc905f1bb338aad89f7c66"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/UpperBodyRoi.kt": {
+      "role": "index",
+      "sha256": "6d921d3d5dd9c734710b88aa88609100517580b83d12f9c5c9f685ea07b01bea",
+      "size": 10352,
+      "normalized_sha256": "fb222233f465a59ec07ef8b4d409a7ab9c18cfa340a095e0a274f49d75be5f01"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/UpperBodySmoother.kt": {
+      "role": "index",
+      "sha256": "2bd640df0a71fef73fcb7cae22088ca518b543d2208c36d1f5b4aca038f6ac38",
+      "size": 3418,
+      "normalized_sha256": "07ee285d7ccd7020e3110ac6af54198c7426f940e710e9fb6d0dec28d038f2fe"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/Yuv420Frame.kt": {
+      "role": "index",
+      "sha256": "37a76d75bbfcabfbb254494522afa1f2727f0fb49a06ca3b1a9505daf9dd2ad5",
+      "size": 3041,
+      "normalized_sha256": "2cd0ea44c210236e1ef72d47e8212ae74e63d665c7151c21725c523abd7bbf0a"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/YuvBitmapConverter.kt": {
+      "role": "index",
+      "sha256": "d4303ff6ffc627bbc46ece2aab301eab136cf8449526a7aef3b6bddd11ae9a93",
+      "size": 5926,
+      "normalized_sha256": "c83a643ec89d41f3e44641d989aea0d78821746ffaebd13143f731c9b7975515"
+    },
+    "MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/YuvGeometry.kt": {
+      "role": "index",
+      "sha256": "ea0babb10f14660e7969b32af09dfc9159dfc744942b526ee576df4e0162630c",
+      "size": 3820,
+      "normalized_sha256": "884f5c379cd372aaa29e412d4d8520f50715caaa50e111810930bbd7ed5c2a69"
+    },
+    "MediapipeUpperBody/src/test/java/com/example/mediapipeupperbody/TorsoBaselineTest.kt": {
+      "role": "index",
+      "sha256": "3105be5f3376685298f3af1c67866161bd83a022125942b12832ff1ce9457b3b",
+      "size": 2247,
+      "normalized_sha256": "aab797aeb6678030529e949dba39a8c6337a120e5f5eb4ac257f6828b29e5d7f"
+    },
+    "MediapipeUpperBody/src/test/java/com/example/mediapipeupperbody/UpperBodyGeometryTest.kt": {
+      "role": "index",
+      "sha256": "f5cacaa869f32c2d32ff3a96d118edb3cc56f33050709df2b3d7e4dbc24efa1b",
+      "size": 8109,
+      "normalized_sha256": "53591ec21fcd5099f27580157bd52f097a28832be2a882fc179789dd7371db66"
+    },
+    "MediapipeUpperBody/src/test/java/com/example/mediapipeupperbody/UpperBodyRoiTest.kt": {
+      "role": "index",
+      "sha256": "0b59170ad255119576b23e8170b811b7b2fe6d3de4db8a05fd75b2d6c3565275",
+      "size": 11713,
+      "normalized_sha256": "24b7dd3ccd4dfeab480b9fe094335b7b0ee8ae71d388d41b9f7885d3f9ef3d8e"
+    },
+    "MediapipeUpperBody/src/test/java/com/example/mediapipeupperbody/UpperBodySmootherTest.kt": {
+      "role": "index",
+      "sha256": "a34d9fc9dc60e3ab7083830aea09126d6d5b0d9e2b00e58d8829dfe7f02648ee",
+      "size": 5104,
+      "normalized_sha256": "52a1be8d26dca4d0c363305ec7d6dc84c442ac75d1a71910f531c4cf5f6aabe2"
+    },
+    "MediapipeUpperBody/src/test/java/com/example/mediapipeupperbody/Yuv420FrameTest.kt": {
+      "role": "index",
+      "sha256": "f5c0cd1f9e2b10f76170a06b585be3ebe3c51e02f27cdbaa1b86a15702e4c9db",
+      "size": 4942,
+      "normalized_sha256": "4037a9157485377d1dc561047ee7f50d0b0da0d204441c669c070d9d962b4848"
+    },
+    "MediapipeUpperBody/src/test/resources/ub_post_fixture.txt": {
+      "role": "index",
+      "sha256": "03cfcbe3294a59c453a8790f099a0e133278280d1a363626f461a982e7d7f387",
+      "size": 21436,
+      "normalized_sha256": "03cfcbe3294a59c453a8790f099a0e133278280d1a363626f461a982e7d7f387"
+    },
+    "OpenSeeFaceProcess/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "OpenSeeFaceProcess/README.md": {
+      "role": "index",
+      "sha256": "9d0b939376f989b554bb06a3f9d2d9662c42da083d55698f0c785a7df446416f",
+      "size": 13680,
+      "normalized_sha256": "6bc898a23e99396072a55b74eaa581cf8a1751152aaca8d910d0aaba8392f9af"
+    },
+    "OpenSeeFaceProcess/build.gradle": {
+      "role": "index",
+      "sha256": "45ce97f4c82b1316305f56d90c7ebe58503234df6b4c07fe51e49f534322cca3",
+      "size": 1118,
+      "normalized_sha256": "b8cf3f2825c397a0e4fa8d71c80e8f3beeb4433651019005918195e8f89d5c64"
+    },
+    "OpenSeeFaceProcess/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalized_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "OpenSeeFaceProcess/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "48c84bd2ac064ce2665b62a6e7c0e87f3b4fe259708a76e16625c2b43e1bc078",
+      "size": 770,
+      "normalized_sha256": "56fd960cf225f6ca40f982b13a5dbb0d8bc3dfde13ff76422825c6070d0a1890"
+    },
+    "OpenSeeFaceProcess/src/androidTest/java/com/example/openseefaceprocess/ExampleInstrumentedTest.kt": {
+      "role": "index",
+      "sha256": "00ec84d8b9206cd29c9f2a08e4b69c2ab9c5d9aaa0158382918a4a4cc5885a9c",
+      "size": 715,
+      "normalized_sha256": "12e808fc2fd7ad9de0d8ad5898326847a72f9b668b7955b4dfb9ddd0dc583ad2"
+    },
+    "OpenSeeFaceProcess/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "28b1700b6a37f2d3ae037dbada7741cdbbedea29caf51d706cae22dca0b0d2ce",
+      "size": 124,
+      "normalized_sha256": "f0f4b47043b24ea2136dabe1cd4309c3b71d84d779889989dbe6d6e5126bfd56"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/AdvancedBlendShapeExtractor.kt": {
+      "role": "index",
+      "sha256": "786d93237e3c320fd935edf8f6bd7b74366f9a3fa737a5e570cd6da3146daf47",
+      "size": 23364,
+      "normalized_sha256": "5826f460cf88556b365ec63ceb57f22bf92b4b0b8332f3f335221165576d1f11"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/BlendShapeExtractor.kt": {
+      "role": "index",
+      "sha256": "5230ca3d11e179fe14c47691b87865076c267d8652ff5d6ec2a53e418d6216b2",
+      "size": 12631,
+      "normalized_sha256": "e8b81d8d0cad9df9aa0e4f49e7206a67d645f79c37763e0ef1cb6d13ef168105"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/BlinkCurveProcessor.kt": {
+      "role": "index",
+      "sha256": "a89b9335e9d8139ce81fce8d2928f949360061f7f81ad70222b67a8f45ef9d67",
+      "size": 25288,
+      "normalized_sha256": "4b3b9ac1972e87e99df8f1ea8ba15e6e21a01d93107a9f5725197af74248a690"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/FaceCapturePipeline.kt": {
+      "role": "index",
+      "sha256": "a0adac13fb7a5dfb12f2ecca15b640524b4cc00e753e90e5ff805d4e3534ade8",
+      "size": 12917,
+      "normalized_sha256": "c00858294aaf6d2f63e44241411bac1167b22694c069e7c2b4f15f1c31c53da9"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/SimpleEyeExtractor.kt": {
+      "role": "index",
+      "sha256": "38db1d7677f03c8961849ec48be09bcd0994d570534e9ee13f4a78397b44255a",
+      "size": 38292,
+      "normalized_sha256": "05800c7db111c4b5471a9de2728fe38e5c3250b19c06558fc057712ca1e7eed4"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/SimpleMouthExtractor.kt": {
+      "role": "index",
+      "sha256": "b7df0fa9a3c95d5b40282daa6ff04a78cb34f930c8e488d387874509e82dfd1e",
+      "size": 11642,
+      "normalized_sha256": "ed091efae7b352fc5f2214bc8800c5d472ca5d263551e7abe349314eecf298c8"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/SimpleSmileExtractor.kt": {
+      "role": "index",
+      "sha256": "e24f02221ffe5229f4e70d2531d7591869a4bce3192ccac4540da44aad269cc6",
+      "size": 14367,
+      "normalized_sha256": "37997cab53ea4057e785a9fa2c0967fa8d70570af17fee1a8dc0ade7424a4f90"
+    },
+    "OpenSeeFaceProcess/src/main/java/com/live2d/facecapture/TrackingConfidenceDetector.kt": {
+      "role": "index",
+      "sha256": "b7b71836f5b4c881a0e1c322d0c382251b8a56b3299c170318c595f25a2fc475",
+      "size": 11940,
+      "normalized_sha256": "d35f3e858de5aee23e4e4caff056a466aa83b4491976643b1ac24ecaed57e792"
+    },
+    "OpenSeeFaceProcess/src/test/java/com/example/openseefaceprocess/ExampleUnitTest.kt": {
+      "role": "index",
+      "sha256": "8c616c331c661ccfe95c01a1c9165816a345c32c572265b9298ad059132f212b",
+      "size": 370,
+      "normalized_sha256": "f6774e493d4f7cdbcfdf5f56a6ab903660acd3cb1975e2114fb747d2a04f8c0d"
+    },
+    "PERFORMANCE.md": {
+      "role": "index",
+      "sha256": "6cf8af48b24fe6b3ba4a2544d71b0012faa85e15eb56581f1614ca2596141eb1",
+      "size": 47181,
+      "normalized_sha256": "0c32e2ec691d4070957b2f05c40a9ace3bdb062d8b6f7fece818d6504ac80817"
+    },
+    "README.en.md": {
+      "role": "index",
+      "sha256": "312becde18d2121cc59f03cf0823e7a3709576bdef4d125012f74d210a1e5443",
+      "size": 34148,
+      "normalized_sha256": "449dfbf90105e0354f78797c0b242057c43512ce3e3e09e9eb0ff0427d50c775"
+    },
+    "README.md": {
+      "role": "index",
+      "sha256": "53d06bc463d7ac78a6d1e657bee0543e1657a606d0bc4f91174ee2b880289718",
+      "size": 37792,
+      "normalized_sha256": "7576efb29ddd67c274bb0919405cae18eff5cd00c23ef228f1df1251e1e6d313"
+    },
+    "aoci.code.txt": {
+      "role": "index",
+      "sha256": "eaf533e228a018ab23c7d3d80150f24f7f8cafbb8737236bbbc65023b4a33c96",
+      "size": 7974,
+      "normalized_sha256": "eaf533e228a018ab23c7d3d80150f24f7f8cafbb8737236bbbc65023b4a33c96"
+    },
+    "aoci.meta.txt": {
+      "role": "index",
+      "sha256": "fbc304fa05182547e96f1f8404c7c30ad6c366bba9589523f1019c2c1da0427c",
+      "size": 1989,
+      "normalized_sha256": "fbc304fa05182547e96f1f8404c7c30ad6c366bba9589523f1019c2c1da0427c"
+    },
+    "aoci.txt": {
+      "role": "index",
+      "sha256": "81d216338beb77ab548bb2b8ff70025644ca0068067d665e28710846ad64039f",
+      "size": 311,
+      "normalized_sha256": "81d216338beb77ab548bb2b8ff70025644ca0068067d665e28710846ad64039f"
+    },
+    "app/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "app/build.gradle": {
+      "role": "index",
+      "sha256": "391a3b6bc7dd5b3ede836d73eb0df41bc5d483532537e19153fa66352838bc57",
+      "size": 6223,
+      "normalized_sha256": "1623032847ca4a6f4cbd45a7ba09d5b6393588033a40b4d67717b0ce261a692a"
+    },
+    "app/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "48c84bd2ac064ce2665b62a6e7c0e87f3b4fe259708a76e16625c2b43e1bc078",
+      "size": 770,
+      "normalized_sha256": "56fd960cf225f6ca40f982b13a5dbb0d8bc3dfde13ff76422825c6070d0a1890"
+    },
+    "app/src/androidTest/java/com/example/live2dfacepipeline/ExampleInstrumentedTest.kt": {
+      "role": "index",
+      "sha256": "d0bb60934620a5bd11d0317166fd03e652012df6ffd8655327efef5389eeccf6",
+      "size": 710,
+      "normalized_sha256": "e88a90d6c8d1453076c5674ff6524d06bb1ac1d83f6e437343327746abea0d19"
+    },
+    "app/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "27354a304386da6d72afbebc44b802eee72dee499d2df6e2c5fd6ba5ce4a5236",
+      "size": 2601,
+      "normalized_sha256": "bb9e25e8b6f622a50ba1c10975e75989207b9e4d7a1bb38200e3706a0e5048c4"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/CalibrationOverlayView.kt": {
+      "role": "index",
+      "sha256": "7d2387922a3a07bc00a968e723a3ec4fead24eb8639dece202d8e52a2931f2fa",
+      "size": 8547,
+      "normalized_sha256": "92968a530eb4226c922a6ae771c27be80f3b3c06982ffe07f3b31fe6fed61465"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/CameraPreviewView.kt": {
+      "role": "index",
+      "sha256": "d3d328aa3311e88b89d0d4b0334423186f6f4a7e6f29c5e35dbd5b164930eeed",
+      "size": 31523,
+      "normalized_sha256": "162ce935f20ebe8b53fb8a9640601cba1832a6f993096c4ec2e68871371a42ac"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/FileExt.kt": {
+      "role": "index",
+      "sha256": "15d072bc30084f64bb026312f08c0a61a132135a7c9ac4219badd9b51e199d8a",
+      "size": 938,
+      "normalized_sha256": "23047abca9d7df024243fd07ba37a3c268af7f7a94bca87ca30d95cf99f6c626"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/FileUtils.kt": {
+      "role": "index",
+      "sha256": "5fa990c09727aab9b7c78bbfd8cb3e52119934a9c1c2bee65dd900e973aeec6b",
+      "size": 8015,
+      "normalized_sha256": "547ddf0b747123401f0e54354afed29280c8ffbdbeb47f0a83e6db469dcebd16"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/LogExporter.kt": {
+      "role": "index",
+      "sha256": "6c2e1c6194aa0cbe81e406f40ca0b6bb2f9dba0439f6a0dd8686c7de3a0483f4",
+      "size": 15982,
+      "normalized_sha256": "8717f4e0e7b8ba930460e07eed61053498709ef7ec58ae946de186462bb5831d"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/MainActivity.kt": {
+      "role": "index",
+      "sha256": "b9457c29364a82306a07f82d62d29d7492622992c9a1844ce0ab014eb7b885c9",
+      "size": 80679,
+      "normalized_sha256": "8ad38efbca86f83d1257458031735a2f0911144839ce3a187ba2cc8a18385553"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/PerformanceMonitor.kt": {
+      "role": "index",
+      "sha256": "58f6086f94514c677322c6bcc09c692f8a734534c0333f113045e604ea4c1d86",
+      "size": 10910,
+      "normalized_sha256": "bc8e9e8b96a56107b23844592e08d03e98b8ef43a1188ad9f2f2cc79aa9f0eb7"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/UpperBodyPoseController.kt": {
+      "role": "index",
+      "sha256": "45252c5c1a161cd73eafcc94f1a94529b4bc24466127fb083debb13d81714dca",
+      "size": 18241,
+      "normalized_sha256": "6844b65fd586ff45925c4730e4ce57eaaeae367d7bfce9970cc50a02061af4d3"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/VfcApp.kt": {
+      "role": "index",
+      "sha256": "827929e4270d7832e544b65960dd29daef888af916c08c627ab52657f88e8a4b",
+      "size": 1701,
+      "normalized_sha256": "d4f04b2342cc494254c7269e48f3325dc3b802f24bd243553b38eb40a2e41f3f"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/tracking/TrackingFrameBuffer.kt": {
+      "role": "index",
+      "sha256": "323169c4d6ed42cc5fd71ce8646b155f3a15e5b7735dcbbf4cfa04d6cdf131bd",
+      "size": 10317,
+      "normalized_sha256": "323169c4d6ed42cc5fd71ce8646b155f3a15e5b7735dcbbf4cfa04d6cdf131bd"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/tracking/TrackingOutputManager.kt": {
+      "role": "index",
+      "sha256": "84533df6cba4159da3d6d024f4d61037eb5ad71a235e0bd5a73c8e70a987700f",
+      "size": 9433,
+      "normalized_sha256": "2c9bf26cb21f7fccc69d4a7c2ca5e518a9731e5e7406e069ba0d748880e9a862"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/tracking/TrackingProtocol.kt": {
+      "role": "index",
+      "sha256": "6257c494b1d5da223033fb9efa3b790c2540db5b67fa538a650fcc6e6573b33e",
+      "size": 26793,
+      "normalized_sha256": "9da13c58ed2009696b2dae388e76fdd4d38a9e508b873e2fa09d6d9cf1c43a06"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/tracking/TrackingSendQueue.kt": {
+      "role": "index",
+      "sha256": "d4131c02d67d6d27dedcfd28e5edb0b54ea2c950ac079e66303abbe163dccd7d",
+      "size": 6993,
+      "normalized_sha256": "d4131c02d67d6d27dedcfd28e5edb0b54ea2c950ac079e66303abbe163dccd7d"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/tracking/TrackingServer.kt": {
+      "role": "index",
+      "sha256": "3b945f14b20a4449b9985d2dec6c2f3d997cc0bfbb8a99ff8a8ba028e43a0189",
+      "size": 52735,
+      "normalized_sha256": "263b4a8acb6b1be0f2f16d21c01028b22acdf4771cd60d2d27d9c85e705d9e5c"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/ui/theme/Color.kt": {
+      "role": "index",
+      "sha256": "d4e0c6f18001503395935a49a272719e85eae1459eecd5100a55178d09913b49",
+      "size": 304,
+      "normalized_sha256": "9183ec2f641b666526e58d23fbdd5bab10ff8f53fb8c5906ff6520bdb695e8e1"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/ui/theme/Theme.kt": {
+      "role": "index",
+      "sha256": "73e3326ccbbcc01c852fb3a9ec85729fe5042cb802efef5f290920f27a490a53",
+      "size": 1773,
+      "normalized_sha256": "5338773f512c7d71eeeecf6100d2339b263633f0d889b288fa7feb9e0e99adde"
+    },
+    "app/src/main/java/com/example/virtualfacecapture/ui/theme/Type.kt": {
+      "role": "index",
+      "sha256": "ad8aba5737f5feb4d9fbb3079cb901b9a18ced5ef1e0ef95c3f3df3fed03292d",
+      "size": 1032,
+      "normalized_sha256": "c3c57a3475693d6526009ba7fe1864cd977a4f6791d57ce803eef82428198543"
+    },
+    "app/src/main/res/drawable/ic_launcher_background.xml": {
+      "role": "index",
+      "sha256": "38381d0d0a64770d992c98e5b5e492555690af40e2fc6ee59e5a1c2a7c0fdcde",
+      "size": 5776,
+      "normalized_sha256": "ed423c73a6f40a4d2909f0901e60527b3a807cd59e1b5593bcaae1808b1c6321"
+    },
+    "app/src/main/res/drawable/ic_launcher_foreground.xml": {
+      "role": "index",
+      "sha256": "6e3c1bb64d9bec079cf0030d867c58b064d2fb19ca6c5a691543c43134f64a2a",
+      "size": 1731,
+      "normalized_sha256": "01d1a6a6c1234eb7fe270d097eb283d72b9c95ae5118886f1b6573aad280f1f7"
+    },
+    "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": {
+      "role": "index",
+      "sha256": "e7c073fbec1a51a73f678b266a1cb207aa6468e3ea1504d24f43591f31d2b7c5",
+      "size": 348,
+      "normalized_sha256": "88f7653499ef524126ea5018a99baf9cc3269e7e584d6205dfdd76db39f39cc0"
+    },
+    "app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml": {
+      "role": "index",
+      "sha256": "e7c073fbec1a51a73f678b266a1cb207aa6468e3ea1504d24f43591f31d2b7c5",
+      "size": 348,
+      "normalized_sha256": "88f7653499ef524126ea5018a99baf9cc3269e7e584d6205dfdd76db39f39cc0"
+    },
+    "app/src/main/res/mipmap-hdpi/ic_launcher.webp": {
+      "role": "index",
+      "sha256": "dd00996198640ed28fbc09cdcd7a3807cf8707f3eb255b659634da3ca6a6ff01",
+      "size": 1404
+    },
+    "app/src/main/res/mipmap-hdpi/ic_launcher_round.webp": {
+      "role": "index",
+      "sha256": "1ed73f5341a69d3b41c7e02e126803f50cc8c3284adf4bbb737f0c93577aef07",
+      "size": 2898
+    },
+    "app/src/main/res/mipmap-mdpi/ic_launcher.webp": {
+      "role": "index",
+      "sha256": "846219e6f72fe9a6c104ca8919cbee36a101e7d2ff8da9da67b689a5888f060d",
+      "size": 982
+    },
+    "app/src/main/res/mipmap-mdpi/ic_launcher_round.webp": {
+      "role": "index",
+      "sha256": "4e2c58b91de01130e6479e00cbbaaf6e77cd961dd2c8e303cf13cd077fa92632",
+      "size": 1772
+    },
+    "app/src/main/res/mipmap-xhdpi/ic_launcher.webp": {
+      "role": "index",
+      "sha256": "398340dad816fc9a6338cb151a8cf1e45b926f9bfb70628b24c4bd2523cc94d4",
+      "size": 1900
+    },
+    "app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp": {
+      "role": "index",
+      "sha256": "91b490aef86574901137f0a252272e1f1add99c1ad709e0696ed68929b88d261",
+      "size": 3918
+    },
+    "app/src/main/res/mipmap-xxhdpi/ic_launcher.webp": {
+      "role": "index",
+      "sha256": "58ae87fa0c5b5d1562d27fd648d2c061553fe20e3ed570bde588162d01ea7a27",
+      "size": 2884
+    },
+    "app/src/main/res/mipmap-xxhdpi/ic_launcher_gpt.webp": {
+      "role": "index",
+      "sha256": "01ea45d5355836d1a91bf937e5bf7027c5d352d40084f5f6fd143228faef2197",
+      "size": 94222
+    },
+    "app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp": {
+      "role": "index",
+      "sha256": "3009fad079f5772f30ecd767f98924367fbe0f81c30048d672d4fda2d5ca7d12",
+      "size": 5914
+    },
+    "app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp": {
+      "role": "index",
+      "sha256": "f98fef5bc3bfe5b65692c40ad1cbae2bec4faf9f1b249c397626740db71b62d8",
+      "size": 3844
+    },
+    "app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp": {
+      "role": "index",
+      "sha256": "5faf033745c8c882c43bb1b372d4e4a5890caec63d9892a2e756c954108b85dc",
+      "size": 7778
+    },
+    "app/src/main/res/values/colors.xml": {
+      "role": "index",
+      "sha256": "31e0230ab2d96fa128a11705e85e590f3462745dc3c04bc851bc724a445921c1",
+      "size": 387,
+      "normalized_sha256": "b5626527d503417f0d8e5b1e08f338de7b31173bf0e122815f03e64932adbd88"
+    },
+    "app/src/main/res/values/strings.xml": {
+      "role": "index",
+      "sha256": "130474ef49740fedd3a5a8c50eca3c6c701718f8aa15302e4a16a576cc73b46b",
+      "size": 82,
+      "normalized_sha256": "f1bcaa398d4ade693da2090211722cf4888ced9718462e85867800fc42f05f98"
+    },
+    "app/src/main/res/values/themes.xml": {
+      "role": "index",
+      "sha256": "0c1a54d06e05e6c9420342675c625d39cd0c091fe0549e3373eb2568ff754e49",
+      "size": 164,
+      "normalized_sha256": "13f5745efea07f27e6a291a62345767c91657cb3085143f9de70ae508dba1317"
+    },
+    "app/src/main/res/xml/backup_rules.xml": {
+      "role": "index",
+      "sha256": "132d1affabfa7b73fe2b510957e671bc2c0fbd14ed43e84c73eecd95d6e11729",
+      "size": 539,
+      "normalized_sha256": "25b2c7073e9d2edf186d587d06d6a7f507d9ffe531925426c42f0437d29e2b0c"
+    },
+    "app/src/main/res/xml/data_extraction_rules.xml": {
+      "role": "index",
+      "sha256": "12a22a87cf3042ea99ba594d4cf11556a9d2cde0709cd96123af5a1cce1712a0",
+      "size": 565,
+      "normalized_sha256": "d1174562ba7d3e7177fda7a0a7ef73e7288488c378d188e57e464350b0ae9864"
+    },
+    "app/src/test/java/com/example/live2dfacepipeline/ExampleUnitTest.kt": {
+      "role": "index",
+      "sha256": "7063a8e87ba96ee4169ff448b16965e4be4dd9a182d62683e814ada78f0bbec0",
+      "size": 370,
+      "normalized_sha256": "c7264da8b49946e3fd7bcdbf234b9321a0f12c32a9a41af850cbcdb03fd3c3c4"
+    },
+    "app/src/test/java/com/example/virtualfacecapture/tracking/TrackingFrameBufferTest.kt": {
+      "role": "index",
+      "sha256": "4e6656f0322a2665000e90d67e7c501545df1abac1eb2f2691af86c86d609e25",
+      "size": 7895,
+      "normalized_sha256": "4e6656f0322a2665000e90d67e7c501545df1abac1eb2f2691af86c86d609e25"
+    },
+    "app/src/test/java/com/example/virtualfacecapture/tracking/TrackingProtocolTest.kt": {
+      "role": "index",
+      "sha256": "a6dd7cdba2b394d212438bbe9130b5939e1e849657867fed2da377b76ccb25ae",
+      "size": 23182,
+      "normalized_sha256": "6af9a397e9db5089d65c9690a997867bd61770e72e87fcc29cb3d75c8b226d43"
+    },
+    "build.gradle": {
+      "role": "index",
+      "sha256": "e2739ef335f49dbbcbdacb29e7dcafc89e396f0c85a65f14e58c1329d562a8c1",
+      "size": 355,
+      "normalized_sha256": "2f021a96fce4652e918c6a67912e9ea4650b5ff3f9c6182c74aa3515ddc6b959"
+    },
+    "check_setup.sh": {
+      "role": "index",
+      "sha256": "7a5d774d97b6f035a8f264a9f9ae00847ed39d55e0fd54c9ce797cace6f33352",
+      "size": 3558,
+      "normalized_sha256": "b790bc5d92e9a335799346570145aa47ba361f56da7ca4613aedd182fa85d2df"
+    },
+    "docs/perf/audit-kotlin.md": {
+      "role": "index",
+      "sha256": "bf765be0c6dc68e3bf20b8b1ddd4e5e87f8c8ebe4d9a65d6643f8e2baad0df2d",
+      "size": 48923,
+      "normalized_sha256": "67d68907edc5119bee5d34a52430b7aab84bd26cdb7ee7893bd85176b757f895"
+    },
+    "docs/perf/audit-native.md": {
+      "role": "index",
+      "sha256": "bb2d855b468dd2ef068e0724b2e1d18df82e4cb37b21b7b483385681cf13a609",
+      "size": 41584,
+      "normalized_sha256": "18bf7bb087d1f1fd98fe0c4a3beaed1442bf2a2b23e0aaf8439ab9923a6ab327"
+    },
+    "docs/perf/round2-roi.md": {
+      "role": "index",
+      "sha256": "590032a2149be420f3e5767778c951a9f4cbdfed812e527d9debdf9992c8f1a5",
+      "size": 12908,
+      "normalized_sha256": "4de9d3f6196382ba985f28cdfc72c50b634e024db2db45ad5f568d3474a36c2a"
+    },
+    "docs/perf/round3-gpu.md": {
+      "role": "index",
+      "sha256": "f43859a157565fd28e68f30fc07f135cc86603a40b8dbfb49f468025ad974f6c",
+      "size": 40392,
+      "normalized_sha256": "f64d7aba4c3e64f1d7be98d69f4ab56c55905608740433ceba87901408c2dbfb"
+    },
+    "docs/perf/round3-kotlin.md": {
+      "role": "index",
+      "sha256": "faad7110d05a52cd9b57ceb32b0b65bf08b161ad7e450f75273e5437b4e12482",
+      "size": 54873,
+      "normalized_sha256": "2d096f2084bf1f161aec82ee9ae1824d84bc6fcf07be9946e34df12aaadaaa92"
+    },
+    "docs/perf/round3-native.md": {
+      "role": "index",
+      "sha256": "e86d3d27dc88d25df2be6ac41431a712ed1a946dc14969c34a650b8a8f45e6d7",
+      "size": 46076,
+      "normalized_sha256": "b5674ac1339444476e2e6f53f2686c49d5c1230e8e62cfa50cc9d4538a0c2588"
+    },
+    "docs/perf/round3.md": {
+      "role": "index",
+      "sha256": "75dad28313864e848bd0fc5beb7de6c3ca8fbcc559ebb313eb42ab1aca7275e8",
+      "size": 14032,
+      "normalized_sha256": "b0bfa2e0e79406253e51de3b3473dbc6c915d188f8b391346508aa6e17365f0a"
+    },
+    "docs/pipeline.md": {
+      "role": "index",
+      "sha256": "d42e4acd3c0648fea37d3276dacd63d34b81ce6e484c227586ed768e3e900da8",
+      "size": 50610,
+      "normalized_sha256": "06c5716e4954d8b2e54d6cbfc8b3265b7ec562a88f7e9816c027e14cb8e3a56f"
+    },
+    "docs/tracking-protocol.md": {
+      "role": "index",
+      "sha256": "1a167ddc6c66ef6095f2c43ca338a7c05eba5052743fa433ea1f9b3ba12866d6",
+      "size": 32623,
+      "normalized_sha256": "4c5bec5a6aa66568450c8797076f6eee4d389ff84ace9964c65a42174df6a4f7"
+    },
+    "docs/upper-body.md": {
+      "role": "index",
+      "sha256": "a7479f140ba04e720635bd331e4017f75717d43c1e0ebf82023bb2de42624e15",
+      "size": 18437,
+      "normalized_sha256": "6d39317395ebdc919064ce0818ebd64d13067ccc1a457ca4171458b24714c7ed"
+    },
+    "facecapture-sdk/.gitignore": {
+      "role": "index",
+      "sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4",
+      "size": 6,
+      "normalized_sha256": "5c3174b74edc6f2b9e0743594b8bd3c7f31e4f4405758cc9872b3fe1de1d28b4"
+    },
+    "facecapture-sdk/README.md": {
+      "role": "index",
+      "sha256": "2a6e763e106983befca8e31140394cf144d374e95dc8cb9f8cf7bf8cfe7757c5",
+      "size": 14398,
+      "normalized_sha256": "9f896c02e31bb864e2257d702e89faf01d52a32fea6e78010bfba05ea6dc29ed"
+    },
+    "facecapture-sdk/build.gradle": {
+      "role": "index",
+      "sha256": "41214d24ab4e47f3ce04c0ec3bb67df737e5bc287e36ba170823926348204302",
+      "size": 5962,
+      "normalized_sha256": "5b5876d605b3680d2c1f717f9204384b35ce3be8546ab3aecc6f3002ae6ef377"
+    },
+    "facecapture-sdk/consumer-rules.pro": {
+      "role": "index",
+      "sha256": "745a9d425cbb9e1f24c1436a89a8e1a376cc99b956c27b9918f9a2f07bba360b",
+      "size": 1158,
+      "normalized_sha256": "c31e6a850f875a3c73fad7fad6baec98923ed4e9b23edcd8f00df3f213780ced"
+    },
+    "facecapture-sdk/proguard-rules.pro": {
+      "role": "index",
+      "sha256": "dae65d8ebe23a715453b541429bbb82f8afd0ce26ebac566f076486072bf0de2",
+      "size": 70,
+      "normalized_sha256": "0f6e9de51d33179ad1dd800577fead05c19e24fb3b3b8ae77b6b68f1918e41c9"
+    },
+    "facecapture-sdk/src/main/AndroidManifest.xml": {
+      "role": "index",
+      "sha256": "faaba9392e4f5baf2dfc419b7598c06068afc4cf53f57dee439078abd607da41",
+      "size": 54,
+      "normalized_sha256": "daa0fb1f32ba7ea85a07ef6302ab3d58c3407d7fd2aa03ec132cb9e38e8d9849"
+    },
+    "facecapture-sdk/src/main/java/com/facecapture/sdk/FaceCaptureEngine.kt": {
+      "role": "index",
+      "sha256": "4c416dc8d36a401edef2402084da36b78d17111eb9c4ce314cc37215cb48d1f0",
+      "size": 10744,
+      "normalized_sha256": "4694634673ce6e74037ef8e27deb9ef59c018e3bef0f689348073ea8e2efc76d"
+    },
+    "facecapture-sdk/src/main/java/com/facecapture/sdk/FrameReorderBuffer.kt": {
+      "role": "index",
+      "sha256": "6861a9f62911d0d306eba30a8ebd9433830c42c3bad9f2a6afc6ea1c53099d83",
+      "size": 5285,
+      "normalized_sha256": "6861a9f62911d0d306eba30a8ebd9433830c42c3bad9f2a6afc6ea1c53099d83"
+    },
+    "facecapture-sdk/src/main/java/com/facecapture/sdk/PipelineFaceTracker.kt": {
+      "role": "index",
+      "sha256": "35e7e456fa60bc9f6493827ba3f02e102dc53b3f342cddb8cb82bfd0be6dad5b",
+      "size": 78506,
+      "normalized_sha256": "90224759e92566e67955c1f0678fc12d6c7b6b682bac1203291ac37171e09c30"
+    },
+    "facecapture-sdk/src/main/java/com/facecapture/sdk/internal/FaceCaptureEngineImpl.kt": {
+      "role": "index",
+      "sha256": "080fca00a53abafd9781bc47fb3ba7406d755c37966cfd04eb8de6b8e6ff0eaf",
+      "size": 5922,
+      "normalized_sha256": "0970915ea3996c4b9f82990c2da78d460a4b0fbb0c120d64e5bb71f41d0220b9"
+    },
+    "facecapture-sdk/src/test/java/com/facecapture/sdk/FrameReorderBufferTest.kt": {
+      "role": "index",
+      "sha256": "88f33e8c7655cc58446343d46d65efee0437b55de80d07e7efb7ce9073ddd557",
+      "size": 4934,
+      "normalized_sha256": "88f33e8c7655cc58446343d46d65efee0437b55de80d07e7efb7ce9073ddd557"
+    },
+    "gradle.properties": {
+      "role": "index",
+      "sha256": "12eb3b313b277e77d4fb6df6fd0183c648a54b59627b53eebc442c87fedaa003",
+      "size": 1368,
+      "normalized_sha256": "51e4b5a131eb01b1cdeb2f6f26aaba69d367a4a9d4ccd10c6d6f6d12fd545b66"
+    },
+    "gradle/libs.versions.toml": {
+      "role": "index",
+      "sha256": "758c96ec06af6231d467e86960467670cf90b596e61f751f0f26580d36df856d",
+      "size": 2492,
+      "normalized_sha256": "7010307385436cd80ea89c58c5d0d5aee10a712137c3db24ec84301880509901"
+    },
+    "gradle/wrapper/gradle-wrapper.jar": {
+      "role": "index",
+      "sha256": "e996d452d2645e70c01c11143ca2d3742734a28da2bf61f25c82bdc288c9e637",
+      "size": 59203
+    },
+    "gradle/wrapper/gradle-wrapper.properties": {
+      "role": "index",
+      "sha256": "c71061ca944b7afdf043fb39e53547c794be0ccb345d7dd8f298540a514bc6c2",
+      "size": 237,
+      "normalized_sha256": "8ac9e13139755d78a234fd4191345ec163cf11d9270d9c97d08b559c2f2ba3a6"
+    },
+    "gradlew": {
+      "role": "index",
+      "sha256": "c15a47b60a4eeede9ffee33433fd990d8b6236607372b9bb1f6dc51b07b78c39",
+      "size": 5951,
+      "normalized_sha256": "63135287117a1e6d12c84580f1f49c61d1ba02218ecd28660605e97f976e7d65"
+    },
+    "gradlew.bat": {
+      "role": "index",
+      "sha256": "af835f98787e9269af5a046edcb821a592fed372139df7b947b471a63cfc236b",
+      "size": 2763,
+      "normalized_sha256": "c46a27c79007746de5922b17abb6230d64ad8b1ba3ad1585ee5c6543c2a9b129"
+    },
+    "sensi.gif": {
+      "role": "index",
+      "sha256": "a0b35defa6c6cc22259860c378a277ec534c52c9a577b279355ed6a50df56794",
+      "size": 3007771
+    },
+    "settings.gradle": {
+      "role": "index",
+      "sha256": "d42c34c2461380fcdc3900856ade53c46745cb1312212936ca5215f0683b7bd3",
+      "size": 924,
+      "normalized_sha256": "c0fe32e17c393de16bc7e43830bf59c440b0163aeef73fa9855065bad2de4a90"
+    },
+    "tools/fetch-pose-model.ps1": {
+      "role": "index",
+      "sha256": "08797514087f664c6dbd2b6c1aad86392c7e0bc38a637fb55c4d794a73980796",
+      "size": 3510,
+      "normalized_sha256": "4a286ccdb649a151bdf0e9b8a25838de78a1ac2400dbd6cfb9eda63f4c26cfe3"
+    },
+    "tools/fetch-pose-model.sh": {
+      "role": "index",
+      "sha256": "3d2c472d6b8b7ffbf0b79dc1b7c439463d4360ca38169f1d62e345eaf13add22",
+      "size": 2625,
+      "normalized_sha256": "d601a504d1d96ca63f14ce1b63041a1826eb17c8ae001cdbbd4ff5067b4aea7c"
+    },
+    "tools/fetch-sample-models.mjs": {
+      "role": "index",
+      "sha256": "cabe0069fb48cd92cf97cbc6c70641706f8fcbcc5d7bb412287e464887b87358",
+      "size": 4065,
+      "normalized_sha256": "285f08a844db9ae0e7345fa4ec2974bd0bb4ab2315bd83a2d8d1e5a953145cea"
+    },
+    "tools/verify/REPORT.md": {
+      "role": "index",
+      "sha256": "fe3b11f98a41401d778ac0f7d599c74572a56bf8042e606170a10b0b78ae590e",
+      "size": 18148,
+      "normalized_sha256": "cd8f6252551d4a771336137fcffd2282c8d910c31b037a928ee9fbba826555ad"
+    },
+    "tools/verify/gen-ub-post-fixture.mjs": {
+      "role": "index",
+      "sha256": "5d26d211cc7a70103db3f84ebd180d609d88250f23bc6754054dfaec0c25b59d",
+      "size": 13638,
+      "normalized_sha256": "5d26d211cc7a70103db3f84ebd180d609d88250f23bc6754054dfaec0c25b59d"
+    },
+    "tools/verify/mapping-test.mjs": {
+      "role": "index",
+      "sha256": "f94a943dc05088c9d69379608657b78b865ce4214224bd2ad14c4a092d45f845",
+      "size": 34618,
+      "normalized_sha256": "980f98573546cb7515d2c5422b845ac078dd0d230bd9c09b4c1299eb13ef0e46"
+    },
+    "tools/verify/mock-tracker.js": {
+      "role": "index",
+      "sha256": "f134f55874231d440ac95dcdd0fbb57070b294a5efffe3fb550b05a43f148327",
+      "size": 13731,
+      "normalized_sha256": "e102c80bc70422f9d53977b4004490d43770019942a00f247dc25e6352ad4764"
+    },
+    "tools/verify/package-lock.json": {
+      "role": "index",
+      "sha256": "a725976e0b23b78ec0af2b6159763809cea0f70fe128a0633130d10d5319d520",
+      "size": 12340,
+      "normalized_sha256": "05121eb49287385de3fbf335a17a02143f6775ee0700216d8f4b446eb8f3787f"
+    },
+    "tools/verify/package.json": {
+      "role": "index",
+      "sha256": "d25c2ec833fe9fc1072a7f1b7e4e0b48e55c0689cc2d388669beab81cc382d29",
+      "size": 112,
+      "normalized_sha256": "d52a002d072272837fdf7a4eb3d5b7983a5cd2052e38cb37951663ea75907661"
+    },
+    "tools/verify/run-verify.mjs": {
+      "role": "index",
+      "sha256": "54d01893c0076d6ebde2981916ef8afa0705199a56d7c05a5808724ecd53cf0d",
+      "size": 67870,
+      "normalized_sha256": "6fc35aef25a883a203020bac1de3c5a4497a625370317cb19f323c9a119f185b"
+    },
+    "version.gradle": {
+      "role": "index",
+      "sha256": "2562ee08990bf2ab7a59c33ee14806e6eb652f72b3bb10c758a93a849844b16b",
+      "size": 384,
+      "normalized_sha256": "fd20d9546e929a4f1058f0a410d4b4cd3b1c71e7e8fe689e159099b252da058a"
+    },
+    "windows-client/.gitignore": {
+      "role": "index",
+      "sha256": "85a1e9476daa30f68fc6cffcc7fd87eb37d48f0edff7503abfd0e20c6753a0e2",
+      "size": 330,
+      "normalized_sha256": "8ce0a7d6eaef6edb398a01478294c658e6c2390833fcc8555e8a8922533f309b"
+    },
+    "windows-client/README.md": {
+      "role": "index",
+      "sha256": "9eb2ddac8fc6a6eb639b62dbeb31e39769646864036397492894c27fd65fedd8",
+      "size": 24904,
+      "normalized_sha256": "25b555a47f7d7499cf60ea7f328270af556b336bdb4e839409127cad552b017a"
+    },
+    "windows-client/electron/main.js": {
+      "role": "index",
+      "sha256": "8581ef746533a7689130ffa65ce4a33ca325d1b61fc45b5915bcb638265f0aa7",
+      "size": 9753,
+      "normalized_sha256": "7379ac4f44fb6270ce8ba53e65762b39611b85b72b6821789fed4d808c67e0bd"
+    },
+    "windows-client/electron/preload.cjs": {
+      "role": "index",
+      "sha256": "b43415bb47b3477ffefad8748ef8a1d560173cd986a0aa9414df49ea6ae9435c",
+      "size": 933,
+      "normalized_sha256": "6d4ae00acb555c976f6a94829178a661142c82ffb76cde824dbbd1bd3e1f1ca4"
+    },
+    "windows-client/models/ATRI/ATRI.model3.json": {
+      "role": "index",
+      "sha256": "d3102aaf4f6d1d4aab67edeff82ec95dc59d0859d5ee1a966596eba9418dff2f",
+      "size": 504,
+      "normalized_sha256": "d8c0dd286a74143fc2639c96269eb3a712a9d161e5b30c7ca1278288659f1ad8"
+    },
+    "windows-client/models/ATRI/atri_8.4096/texture_00.png": {
+      "role": "index",
+      "sha256": "b3a9ef2a2ecec0525138912f73b020faace8874d5c6e4e523a2aa05c75c97cab",
+      "size": 8183483
+    },
+    "windows-client/models/ATRI/atri_8.4096/texture_01.png": {
+      "role": "index",
+      "sha256": "95e5935c4c25736a66f58ea1a70612496ad1bff3423e14d01d50af38d72bc35a",
+      "size": 21193
+    },
+    "windows-client/models/ATRI/atri_8.cdi3.json": {
+      "role": "index",
+      "sha256": "1c5ef24fa9d6937cf3414d7910f61ab56d60ed3ed939e6ad0bbcde4f10642149",
+      "size": 10349,
+      "normalized_sha256": "2740d11d51ab03d87a6fc23284b5ed00487d4bf93df8ed3a7ed8956f3131302e"
+    },
+    "windows-client/models/ATRI/atri_8.moc3": {
+      "role": "index",
+      "sha256": "e7fefd9a58c4c04bf3da602f3b11b762ae6938a2007e7adfe301fbda4ad129b3",
+      "size": 717952
+    },
+    "windows-client/models/ATRI/atri_8.physics3.json": {
+      "role": "index",
+      "sha256": "c34125e91c0302d80dd3c5e09d5b884f553f0c7cfa24895378ca10d32f424334",
+      "size": 19548,
+      "normalized_sha256": "7894482cb7eacbe8affffca72695d69a60b3c9c88b3904b1db1ef0e82d3d57e0"
+    },
+    "windows-client/models/ATRI/dec-l.motion3.json": {
+      "role": "index",
+      "sha256": "dbdccac4b82f4ae1c89f0326d50ec91d673c220591d52c0e4cd815d1f77fd02e",
+      "size": 1338,
+      "normalized_sha256": "fe9b57d9619091dec618a2b9aa8558368c6441b400108d22312d32d4d6ecdbc4"
+    },
+    "windows-client/models/ATRI/dec-r.motion3.json": {
+      "role": "index",
+      "sha256": "1f6abf60ef8e8f6a43a57b905b8232693c90e0ad94a5b83a8d82e9d17de9364b",
+      "size": 1338,
+      "normalized_sha256": "61560ce711af75c27ee716b2db16bee75428863e8cd3a2d534c9645a9274c7ad"
+    },
+    "windows-client/models/ATRI/expression1.exp3.json": {
+      "role": "index",
+      "sha256": "b9e26c5ca7634c1aa37c52124a3cebbce06fce098b8841dc7b2f8e206231d9d6",
+      "size": 126,
+      "normalized_sha256": "f80b9bc8239acc343aa98341ceb9b7fe302545e10c2ea22ec745bb018f1adf34"
+    },
+    "windows-client/models/ATRI/expression10.exp3.json": {
+      "role": "index",
+      "sha256": "b8d28a9893eb1f626dfda4915c6bd0e0362bad21ad9eec9ee0979e386bdda5a7",
+      "size": 124,
+      "normalized_sha256": "2d8fb71b4798308481c4fa9bbdfd0fd47ec3799f735622c7a578a59a0b7fa1a0"
+    },
+    "windows-client/models/ATRI/expression11.exp3.json": {
+      "role": "index",
+      "sha256": "c1140a8a96bd1be6f3ea63b0bccbec52af01bf9a87bc9136900641b6db66166e",
+      "size": 124,
+      "normalized_sha256": "ea744c22da4c602b03582c1329a68438091d3dbc26c5ed377ce86ba0a460fc06"
+    },
+    "windows-client/models/ATRI/expression12.exp3.json": {
+      "role": "index",
+      "sha256": "adc0ecf8242de484d8355272f23166b13fa91e6ab77d1766cef71faca0c7c295",
+      "size": 125,
+      "normalized_sha256": "ed90dc91be2cb66a4afce8e316fb3f8ba7e8f77ee03ef19151492a67c027c671"
+    },
+    "windows-client/models/ATRI/expression13.exp3.json": {
+      "role": "index",
+      "sha256": "2267d70cc8e92510334e58b5f3851ceff24ede8537665023c474998bfbab08f6",
+      "size": 124,
+      "normalized_sha256": "07b81b946c1b81e212f109a44922d870d337cec79cbce99ba713f39f1b432009"
+    },
+    "windows-client/models/ATRI/expression14.exp3.json": {
+      "role": "index",
+      "sha256": "3f5eeaba5d94d6a78a841e44c58bac0440391c31e5eb4930f46481cf1ec12560",
+      "size": 123,
+      "normalized_sha256": "f7c2d2622ee656ca607cac9aa7f53d0529fdeeb08915dac5b0bf82272e92da87"
+    },
+    "windows-client/models/ATRI/expression15.exp3.json": {
+      "role": "index",
+      "sha256": "e70a3f64dec8a51a1068f208838e7cf248b68902464946bc3497e1d9ab285fab",
+      "size": 124,
+      "normalized_sha256": "00434cf03348288a74c08a7d0cb57eb6161f96c20e5058370cedb9ebff7d8d29"
+    },
+    "windows-client/models/ATRI/expression16.exp3.json": {
+      "role": "index",
+      "sha256": "b683b463217e94e58cfb9bc2c9153667bcf629a3bd76abdefbd6476359f979ec",
+      "size": 260,
+      "normalized_sha256": "d69e360e4051a71543fe196abf120966ebfaa0cb2a5769dbcd59d4b6bc41eb5b"
+    },
+    "windows-client/models/ATRI/expression2.exp3.json": {
+      "role": "index",
+      "sha256": "081256601eb8d998b94de576131589a42be48acd82770a5786c10cbb7f027119",
+      "size": 124,
+      "normalized_sha256": "e0bc57da677dbcc39d316b68c1f8fbd400a63f71580b9e39dc5743ba60add290"
+    },
+    "windows-client/models/ATRI/expression3.exp3.json": {
+      "role": "index",
+      "sha256": "ae100a08e8b82bfe9cb4390c14a4464e8a35c2c51fe58f1f70f64bc18db5c6e7",
+      "size": 124,
+      "normalized_sha256": "cbba35cb482da6e2274a8d4523af1136f660b7a1332835ed5165cac00e1f04b5"
+    },
+    "windows-client/models/ATRI/expression4.exp3.json": {
+      "role": "index",
+      "sha256": "9f984bf232a04ec04d682b1c82d3a9d01e35786f6091f6f2ee5400f1f60e4987",
+      "size": 124,
+      "normalized_sha256": "703578cb907e03fbaff882d6d95593e0af7662b1eb30382821436f0dc207786a"
+    },
+    "windows-client/models/ATRI/expression5.exp3.json": {
+      "role": "index",
+      "sha256": "f78826cca569118a71c5e85d53cfec1362c9313f0b9c87665503462277d3e9a3",
+      "size": 124,
+      "normalized_sha256": "a61b5af08cb5281b1bb70f09160d5c2aacfefffbd0981a65bb94d42c1ccd8eff"
+    },
+    "windows-client/models/ATRI/expression6.exp3.json": {
+      "role": "index",
+      "sha256": "cb88d3de3872c0ee108b866b06490899bbda736cf0ed64c00e929f413e1c40ba",
+      "size": 124,
+      "normalized_sha256": "644f02651e0eb87b02f1f92488ab154508e6cf259bfe5eec79e90f968a664e41"
+    },
+    "windows-client/models/ATRI/expression7.exp3.json": {
+      "role": "index",
+      "sha256": "6ae26cb231f3e77507bd9b1d12a59c3e3d42aa5e85fcd4fdcc70b94e96483142",
+      "size": 124,
+      "normalized_sha256": "980d656a31f6f9f5249ba2bd3f82eb4de5ca751dbf833a49a55a661153164a26"
+    },
+    "windows-client/models/ATRI/expression8.exp3.json": {
+      "role": "index",
+      "sha256": "eaebb7bbc106d45b0a914854921e4873d596ed2fbfbef22571319c0aa9e62664",
+      "size": 124,
+      "normalized_sha256": "f759eb45d4acb27563659ee14b57e57bcaacb9df8c8c6a55d3eb432e99015cb8"
+    },
+    "windows-client/models/ATRI/expression9.exp3.json": {
+      "role": "index",
+      "sha256": "1edc5128f4d717ba7170e8df55d516bb7a155a5e747b9440dec8ba8dfd727358",
+      "size": 124,
+      "normalized_sha256": "1105210a3f5e9cfc098530bbb7970d89a7cd8fa9d9b71f4b5e1b6135201abb76"
+    },
+    "windows-client/models/ATRI/model.motion3.json": {
+      "role": "index",
+      "sha256": "b9b2ecf73b648c9a6f4d88d7af44b35039b1064c6d67ae9a94eb9cff99fe3a8b",
+      "size": 262,
+      "normalized_sha256": "bc1ac725e9403161b50396da00323df9cff4a39f0b141f65b1b9565c1228bec2"
+    },
+    "windows-client/models/Yuuka/ARKitFaceTrackerSettingBeta.json": {
+      "role": "index",
+      "sha256": "5fd79aca4ec0837a9226279eedf8351682dadfeea5236d40d89a2982a7f77631",
+      "size": 6392,
+      "normalized_sha256": "583dd7efde5325fef83f3150443c467cf6c63e798dd1e169406ea23d0b0cfe29"
+    },
+    "windows-client/models/Yuuka/Yuuka.model3.json": {
+      "role": "index",
+      "sha256": "97aee4013e29c7e3b01680cdfbf70ebcbe4c117a6e308ced237e09cc92ece5bb",
+      "size": 415,
+      "normalized_sha256": "bbdad945a429ba0dd5bd7d675880ca5e15359173af4275c2d088de3f513d4a4b"
+    },
+    "windows-client/models/Yuuka/yuuka.4096/texture_00.png": {
+      "role": "index",
+      "sha256": "73965dd50423fa924ef5b3a45bb80a7cc5635dc678212ef382b6ba3c6513d74b",
+      "size": 5260671
+    },
+    "windows-client/models/Yuuka/yuuka.cdi3.json": {
+      "role": "index",
+      "sha256": "0916cc3e48e575106b31184adbf58bbb8f008c306e52534a09f9cd716151fce9",
+      "size": 8106,
+      "normalized_sha256": "fd71d8608e7d6689ccde7c9d957f0a376fabc816778ff1709e4dfd622522d7a1"
+    },
+    "windows-client/models/Yuuka/yuuka.moc3": {
+      "role": "index",
+      "sha256": "628aac7663192947f0da343472709b205b4a3ff9da948ce93d1ecf08304a2abe",
+      "size": 2123968
+    },
+    "windows-client/models/Yuuka/yuuka.physics3.json": {
+      "role": "index",
+      "sha256": "72a42607a9d7e96d56582e73b58317bdae7a0d359338bf07d546fcab023ba481",
+      "size": 24320,
+      "normalized_sha256": "c30feff9385075447b7e0001eab8e1239dd3306acd91f7a442658b24da002478"
+    },
+    "windows-client/models/Yuuka/yuuka.prprl2d.json": {
+      "role": "index",
+      "sha256": "a6ff3e65df575382ce57f1448bd22804db1b97b6bf6f4042d1f916b4dcafa46a",
+      "size": 8786,
+      "normalized_sha256": "1caec830f2cc3ab834427cc361592b197bcf8aec3f8452242a11710f9f49cf0b"
+    },
+    "windows-client/models/sensei/Scene1.motion3.json": {
+      "role": "index",
+      "sha256": "301e7c5ddacab0a2e945cae4ff446aa283f0a19184d262ac4cf113072435b4fc",
+      "size": 4680,
+      "normalized_sha256": "ad54745c5dfe07d64826dc7f5bd471ffd0815a9c752a6d72ccb8904e472eaecc"
+    },
+    "windows-client/models/sensei/Scene2.motion3.json": {
+      "role": "index",
+      "sha256": "de1d9ae5bfce1df8cd6422f4930ba020dfe224191373a72d9095f32c2a035f10",
+      "size": 1228,
+      "normalized_sha256": "c0f0692199016c3d5089e2d452395ace617bd8ac7e6fc84b89084979d49b6526"
+    },
+    "windows-client/models/sensei/items_pinned_to_model.json": {
+      "role": "index",
+      "sha256": "3b3939ed47c35a69135b987916a295b1202ee85af1fd13b13770bc0dea39fc6a",
+      "size": 431,
+      "normalized_sha256": "f90cdcd3bb767fb00c9236a765841cbd4ab3d9f39f598a7ad78f591cc80d4826"
+    },
+    "windows-client/models/sensei/sensei.4096/texture_00.png": {
+      "role": "index",
+      "sha256": "9c7977f0cd50cb59eef6e94d283cfdcbe702ae6bb410022a1981bfc1d4830309",
+      "size": 1581680
+    },
+    "windows-client/models/sensei/sensei.cdi3.json": {
+      "role": "index",
+      "sha256": "e76bb971758e7ea6da361eef94f9d5ed8ea764d28e13eae0441039a1d8702d71",
+      "size": 4713,
+      "normalized_sha256": "4d5beaadab9f406d21e46c8b533134bb1b687909c5949fa3c980f340f11839e4"
+    },
+    "windows-client/models/sensei/sensei.moc3": {
+      "role": "index",
+      "sha256": "2cc4eada50eb2c3f55ba5eb58827383ce13c6913c400c02edd502409cc78eb2c",
+      "size": 196224
+    },
+    "windows-client/models/sensei/sensei.model3.json": {
+      "role": "index",
+      "sha256": "a6e262bae44661ee455d6f24bb1d5bc23c6a69cf0158f3e9624be14cd964b9da",
+      "size": 528,
+      "normalized_sha256": "20834a52e1a4eda5201e79c54b645c4097524a7a059519537c586d3ec3894dce"
+    },
+    "windows-client/models/sensei/sensei.physics3.json": {
+      "role": "index",
+      "sha256": "e57501512636b6940cc12c087bde12811173d4c0285510c4db733feb5617b3a2",
+      "size": 4807,
+      "normalized_sha256": "e37d54379243448045856dc022133ed04509ff3c8d6a4c084125daa5812d7542"
+    },
+    "windows-client/models/sensei/sensei.vtube.json": {
+      "role": "index",
+      "sha256": "7ac7c41280ca1b983c06c91938b34f51465ed8c0a26ded70787169447b39a19a",
+      "size": 25041,
+      "normalized_sha256": "784a09d3d9006794200738ced6081855c47379b0a752ee7c4902c4cafd3e6426"
+    },
+    "windows-client/models/sensei/兔子.exp3.json": {
+      "role": "index",
+      "sha256": "122142d9a819b50cba893405402691bd41235617d10c393cfe5503a1fbd0c533",
+      "size": 173,
+      "normalized_sha256": "2dabd903f8bd818047d70afbe0ff0549de6604449443c0a953cb44b18ae46c4d"
+    },
+    "windows-client/models/sensei/表情.exp3.json": {
+      "role": "index",
+      "sha256": "10192088cafdf06935038dbec2459488d8f13870246f1015af45a44caa7ef7a8",
+      "size": 174,
+      "normalized_sha256": "5d08136f82688eb8b8197aeb33fd614317149da0e4a57a8e70e58027a4bb0367"
+    },
+    "windows-client/models/sensei/鸡儿.exp3.json": {
+      "role": "index",
+      "sha256": "7006d6b67e361113362c86cc2149df0bb36a71d47d9dedce95176f310c1d8748",
+      "size": 174,
+      "normalized_sha256": "b4ba69c87a889da6d04ef9e514865866c321022a65dd80c240828d856684991a"
+    },
+    "windows-client/models/zzzz/ARKitFaceTrackerSettingBeta.json": {
+      "role": "index",
+      "sha256": "5fd79aca4ec0837a9226279eedf8351682dadfeea5236d40d89a2982a7f77631",
+      "size": 6392,
+      "normalized_sha256": "583dd7efde5325fef83f3150443c467cf6c63e798dd1e169406ea23d0b0cfe29"
+    },
+    "windows-client/models/zzzz/cc_names_zz.cfg": {
+      "role": "index",
+      "sha256": "6767c5429a2737269b604862e50e97eb50d38e0d7feb80164185c3f6b1da2db8",
+      "size": 92,
+      "normalized_sha256": "e4cfbbe7bd065a51fde11a9e56f43474fccdd38b0429fc34b96b38d3a346e29a"
+    },
+    "windows-client/models/zzzz/cc_zz.cfg": {
+      "role": "index",
+      "sha256": "30aefac3a243cb3b8330daa6bf85ff60d8a778e37a0a0a7f371bb62a22b44850",
+      "size": 352,
+      "normalized_sha256": "510e53f865fe1fda9f1987292c0439fafe1ab664519d6ed3e43efd6e8114e209"
+    },
+    "windows-client/models/zzzz/zz.2048/texture_00.png": {
+      "role": "index",
+      "sha256": "9053013ca6947b86fd522d750921bdba4caf175f7af45be5dc19e093e1282bed",
+      "size": 3100977
+    },
+    "windows-client/models/zzzz/zz.cdi3.json": {
+      "role": "index",
+      "sha256": "b93c443a415034cf4bc03109b37700b266fcf5366afe55de95584b937409e4be",
+      "size": 13986,
+      "normalized_sha256": "1c8855f27c25e36763a62503772b3650b6f669c8a197b7a94e9f07cdaa78a417"
+    },
+    "windows-client/models/zzzz/zz.moc3": {
+      "role": "index",
+      "sha256": "9deb616bb3640b622dd3788aa629702b0e876a0c7991744f350891dd946e0998",
+      "size": 1467968
+    },
+    "windows-client/models/zzzz/zz.model3.json": {
+      "role": "index",
+      "sha256": "b0cbf0cbf76dfa3a9b65e7701b84b43e520f0353053f2d2005dca225b7672666",
+      "size": 295,
+      "normalized_sha256": "b0cbf0cbf76dfa3a9b65e7701b84b43e520f0353053f2d2005dca225b7672666"
+    },
+    "windows-client/models/zzzz/zz.physics3.json": {
+      "role": "index",
+      "sha256": "299c7b9ae2c1433bea6bdcaa85b45dadefb9e06b34fc16b26a219575e65620ee",
+      "size": 32601,
+      "normalized_sha256": "c7b2c029ddb3ac1572f0f22b6d947497a31d3fae5356ba7be814f98954dcbb04"
+    },
+    "windows-client/models/zzzz/zz.prprl2d.json": {
+      "role": "index",
+      "sha256": "031e28d0b86b98084358bdc7de053f629c44142cb66793365211df32a2391025",
+      "size": 11484,
+      "normalized_sha256": "9733f0f2785a921d71126445afa907d06eff3aa48b1e3a95dd7e92e853989957"
+    },
+    "windows-client/package-lock.json": {
+      "role": "index",
+      "sha256": "72f45c66ed0bb1c421f33774f9235c2547f1309417149f1fed63a37e4dc85507",
+      "size": 60067,
+      "normalized_sha256": "1e86a8c877c9fc06116a96441efb4cad14b570c0b6543ecd5c89cfcf0df42eb9"
+    },
+    "windows-client/package.json": {
+      "role": "index",
+      "sha256": "23e4a041527923b865702d39c065054bb10f9a5c79cb85bb3066d61451c147ec",
+      "size": 852,
+      "normalized_sha256": "2c29d940a1531b417c7a4b4efd593169c27b2688ab14cf31763106b2c9d6d3d9"
+    },
+    "windows-client/renderer/app.js": {
+      "role": "index",
+      "sha256": "9d68587377795573ba14b1e15126e36372a9d72903323e68788e2a820e34099c",
+      "size": 70636,
+      "normalized_sha256": "2257ca66e8ba4d3561aeba2aaa01b016cbdce07dbe61bcfe939c5c68a9eb0a7a"
+    },
+    "windows-client/renderer/calibrate.js": {
+      "role": "index",
+      "sha256": "0a2928e28e0ecc8fd36effaf52ecf467c56afa4547f547c8a7fd35f1fe77c810",
+      "size": 24790,
+      "normalized_sha256": "0a2928e28e0ecc8fd36effaf52ecf467c56afa4547f547c8a7fd35f1fe77c810"
+    },
+    "windows-client/renderer/filter.js": {
+      "role": "index",
+      "sha256": "b592d5f07a4a06d035322202e2c0255196e432f8bd7aadf618e1111ebcbceb27",
+      "size": 13388,
+      "normalized_sha256": "b592d5f07a4a06d035322202e2c0255196e432f8bd7aadf618e1111ebcbceb27"
+    },
+    "windows-client/renderer/index.html": {
+      "role": "index",
+      "sha256": "3b71b97d68dd85fd28cb80776efa977c14ba4b6ba0baeaa3ea4d0b422699d1db",
+      "size": 5343,
+      "normalized_sha256": "683b66b31b768a6513b2aa164ca41c5acbab65e494448420a8ea5db77694e362"
+    },
+    "windows-client/renderer/interp.js": {
+      "role": "index",
+      "sha256": "dbe38cf8e18885b0d49cca8468443818082e2d77cccc8d76bfd641c89b0f74ec",
+      "size": 33260,
+      "normalized_sha256": "dbe38cf8e18885b0d49cca8468443818082e2d77cccc8d76bfd641c89b0f74ec"
+    },
+    "windows-client/renderer/live2d.js": {
+      "role": "index",
+      "sha256": "6fc38bdfbd7486639dbc6186a29314481b1b613dfda90d5faf5a666ef2d87ce3",
+      "size": 29805,
+      "normalized_sha256": "c8a29fb5222cbde2282b4b470a6a09b9a6a6164ad8678bca57c11e27b9111232"
+    },
+    "windows-client/renderer/mapping.js": {
+      "role": "index",
+      "sha256": "8d68f0c049596ebe77f797e8d397fdc5b5d7ef95c287a70b9941db8b87739108",
+      "size": 43201,
+      "normalized_sha256": "89232baee45355da6ecbc5113f42fc18efa5f51d9f115f00b088bd70e5064b91"
+    },
+    "windows-client/renderer/style.css": {
+      "role": "index",
+      "sha256": "df05118d5db5eca0d8ac15df64f9581204fcae165d18c62d57d0b7452b44304b",
+      "size": 8886,
+      "normalized_sha256": "b5e9d2b41094af0fa17d1581f62914f0424789a78ef618ba85afd4fb3e91cc6e"
+    },
+    "windows-client/renderer/vendor/live2dcubismcore.min.js": {
+      "role": "observe",
+      "sha256": "5e0b59fe996fffaf123bdccd3d0f948cddd54fc39faa8dba4617656bdc9eef3b",
+      "size": 150396,
+      "normalized_sha256": "29b32715c117b2c00ddd9e978cb0eb951105f56477b40f309d9feb3290bf1386"
+    },
+    "windows-client/renderer/vendor/pixi-live2d-display.js": {
+      "role": "index",
+      "sha256": "f7b13964a792dc9dca64f11e4ad43aca971a1047e7ad4169c5cb5c451ad2ceac",
+      "size": 119923,
+      "normalized_sha256": "af1267e6d52759b245766c578d905bfa025b532d5c3cc727c370957c4409e21b"
+    },
+    "windows-client/renderer/vendor/pixi.min.js": {
+      "role": "observe",
+      "sha256": "b88dfa8fc79ee50b7e511c4cf5e5c459fbc1c8569a40f6e2529b46995df0d7d9",
+      "size": 457258,
+      "normalized_sha256": "712a3e1943b062a907d86c5bb56b67c7b32a3f03b3654768b00b7016d30a24c6"
+    },
+    "windows-client/server.js": {
+      "role": "index",
+      "sha256": "ab5070a47b26ebce77cb6af32e19da8c4e25f6a5373009a772a146ce832560fe",
+      "size": 9459,
+      "normalized_sha256": "88c4fb1b550a8a86460d59caf3a30f0c3a091b68f7f904c89e33eb6725eb7027"
+    },
+    "windows-client/tools/evals/closed.js": {
+      "role": "index",
+      "sha256": "017b92f1ed48acb936fc74b34be37640f55f98daaf364868b1931c795fd1b475",
+      "size": 758,
+      "normalized_sha256": "34aff1b6c9f8f55fe82748102d2f695f38dfadad6230231896fba008855ac75f"
+    },
+    "windows-client/tools/evals/diag-arms.js": {
+      "role": "index",
+      "sha256": "3622139e8de681d81081f8c16cac3c5bf550b679af35a318eb075708323dec13",
+      "size": 3621,
+      "normalized_sha256": "6eb29e9fe7e06d827d11f942266da986c660fdddea01f5085835e1797d8f48f8"
+    },
+    "windows-client/tools/evals/m3-pose-offset.js": {
+      "role": "index",
+      "sha256": "106b9377401b49654e16d596b1fa4787f4189e141353e9a58f37d03807f997fe",
+      "size": 2744,
+      "normalized_sha256": "106b9377401b49654e16d596b1fa4787f4189e141353e9a58f37d03807f997fe"
+    },
+    "windows-client/tools/evals/model-info.js": {
+      "role": "index",
+      "sha256": "a5382c1b0073db75fcfbd17d7350cfd42f952d175d30f0cf8e90b69fc2002d16",
+      "size": 264,
+      "normalized_sha256": "0a7928801457197dfb83ccc45b801e719499dce72b29f7336f965fe5d92d004b"
+    },
+    "windows-client/tools/evals/mouth-open.js": {
+      "role": "index",
+      "sha256": "438df7257ca4df8917292d3e7649e25d9ce8bb845ca9754acfb674d52f078aa8",
+      "size": 767,
+      "normalized_sha256": "a7171acfadb578784b57f70d4d695d62a1007b088e8d3ec2ca23bfb5da30d644"
+    },
+    "windows-client/tools/evals/neutral.js": {
+      "role": "index",
+      "sha256": "548c2fa230d4e6b96ff7531c8275f4c3a67eeadcdc3c6007852b175afbe8b103",
+      "size": 696,
+      "normalized_sha256": "63a1692f027fc72d90d08fa47f16d1ed303f1a745c30cfae8366b42495e7c7da"
+    },
+    "windows-client/tools/evals/transparent.js": {
+      "role": "index",
+      "sha256": "073e070ffdbee36a8d79fa15d3263eec15b07f609a1521214c2558b57f7144d9",
+      "size": 842,
+      "normalized_sha256": "ed5393dcb617bdb8562cd8422fbaf054fb8aa774e7b330cbbeb757852fcf93bb"
+    },
+    "windows-client/tools/evals/yaw-left.js": {
+      "role": "index",
+      "sha256": "82d3998600c2e9d2657ad0a393d3e3fc37c5fe42c73a1ee9e391029b0ffae66a",
+      "size": 698,
+      "normalized_sha256": "69dcae818380194975b0037b72722ac2c32687760eabc8ccb928c3cc2e129148"
+    },
+    "windows-client/tools/evals/yaw-right.js": {
+      "role": "index",
+      "sha256": "5617767fb0e39887b05756289819c7e06ea21771fd47b4e3adfd1b3ce07756ff",
+      "size": 700,
+      "normalized_sha256": "d0bc0a9f083d24dab3cc5dd8718c8113f0f60d140d595249168a187b85d40493"
+    },
+    "windows-client/tools/mock-body.js": {
+      "role": "index",
+      "sha256": "0db72583e881cddff2af106a03f7bcc424dc809b731e86d7481dbe0d099b2e4c",
+      "size": 7915,
+      "normalized_sha256": "b5cba931d7fd958cdf1422e035fb24fe2b7e30b75b189bf90b6dc19f11926180"
+    },
+    "windows-client/tools/mock-tracker.js": {
+      "role": "index",
+      "sha256": "c3e5a9d996af2d340f26bbd0ba30a548f84637a679c61217cbaa480330f5f844",
+      "size": 21077,
+      "normalized_sha256": "c590ee9faf6f829abbe7888ca10046201af605aee9b1e5d5f00370ca370df567"
+    },
+    "windows-client/tools/package-windows.js": {
+      "role": "index",
+      "sha256": "9dedff40411105e53a78498b3541867936f8e624bb562a55fe02eec740cbd2f0",
+      "size": 7649,
+      "normalized_sha256": "9dedff40411105e53a78498b3541867936f8e624bb562a55fe02eec740cbd2f0"
+    },
+    "windows-client/tools/selftest.js": {
+      "role": "index",
+      "sha256": "979e1bae6ba70134b5c4fc7c7e61d0d6d2214b28156fbfcbacd7ed9509750b34",
+      "size": 67560,
+      "normalized_sha256": "f82dd52108a82700357606b103255674da7eb60f01dd312d44de616125f7039d"
+    },
+    "windows-client/tools/shot.js": {
+      "role": "index",
+      "sha256": "34bdd2d7b5455f074bfd43ba1713c25e7eac3fdaa77feb9478d1c095c7188aee",
+      "size": 13295,
+      "normalized_sha256": "750146e9609e841a8a8c6fceb92e73cb7b0be5e09360a658dd79043efd2a4917"
+    },
+    "windows-client/tools/start-electron.js": {
+      "role": "index",
+      "sha256": "a11cf364a9e2abfff6cfa2a1d1c46776dcd0d9fecce20b6534dba234117bb4d7",
+      "size": 3218,
+      "normalized_sha256": "22504c9fd45e9614c1098b9c7d85c588220881b6c885450b353861b950039d4a"
+    },
+    "windows-client/tools/vendor-assets.js": {
+      "role": "index",
+      "sha256": "27ce08cbfbec3c3e468027d9573afd3f89d2057869349dfb334770835e0a5c03",
+      "size": 2101,
+      "normalized_sha256": "491b96e3b9c730ca1c2d41b1822cde43203b09f18f64d018dfc2c2e8de4094d3"
+    },
+    "windows-client/tools/web-launch.js": {
+      "role": "index",
+      "sha256": "acdc1eb20b9703d3a4e84a5efcd20be8be2b7ef9073148231b0c96c2a43a8357",
+      "size": 4078,
+      "normalized_sha256": "56ee4904aba1cf0b313babb475ace54def1d73a126093e7e2c20912cf4cc6cae"
+    },
+    "zzzz.gif": {
+      "role": "index",
+      "sha256": "819f12cf626b069847484cbe1c76181bdad979c04a9af7423b9bc06ba9ab9621",
+      "size": 31391172
+    }
+  },
+  "managed_scope": {
+    "version": "managed-scope-baseline/v1",
+    "policy_identity": "3b029307ca9a998f7863146b9aae29089dbd7d695d8e543a5334a9ba32f41394",
+    "observe_change_policy": "review_required",
+    "budget_policy_identity": "15e9b37a6c57e9bf03c9df3d0d049eb5b9a7f5540f9d34960408114e2538a32d",
+    "budget_policy": {
+      "version": "cognition-budget-policy/v1",
+      "mode": "enforce",
+      "whole_index": {
+        "target_tokens": 200000,
+        "warning_tokens": 300000,
+        "max_tokens": 400000
+      },
+      "r": [
+        {
+          "min_c": 1,
+          "max_c": 4,
+          "target_tokens": 25,
+          "max_tokens": 50
+        },
+        {
+          "min_c": 5,
+          "max_c": 7,
+          "target_tokens": 45,
+          "max_tokens": 90
+        },
+        {
+          "min_c": 8,
+          "max_c": 8,
+          "target_tokens": 70,
+          "max_tokens": 140
+        },
+        {
+          "min_c": 9,
+          "max_c": 9,
+          "target_tokens": 90,
+          "max_tokens": 180
+        }
+      ],
+      "s": [
+        {
+          "min_c": 1,
+          "max_c": 4,
+          "target_tokens": 20,
+          "max_tokens": 40
+        },
+        {
+          "min_c": 5,
+          "max_c": 7,
+          "target_tokens": 40,
+          "max_tokens": 80
+        },
+        {
+          "min_c": 8,
+          "max_c": 8,
+          "target_tokens": 70,
+          "max_tokens": 140
+        },
+        {
+          "min_c": 9,
+          "max_c": 9,
+          "target_tokens": 100,
+          "max_tokens": 200
+        }
+      ]
+    },
+    "apply_authorization_mode": "auto"
+  }
+}

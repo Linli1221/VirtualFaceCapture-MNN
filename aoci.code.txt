@@ -1,0 +1,48 @@
+#AOCI-CODE-VOLUME: 1
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/===
+.gitattributes[FC8T]: F:仓库行尾策略：文本统一 LF 检出 | R:- | A:- | S:Windows autocrlf 改写字节会让 AOCI 基线把整个工作区判为漂移
+.gitignore[FV7T]: F:忽略构建产物、IDE 本地目录、签名私钥与禁再分发的示例模型 | R:- | A:- | S:keystore.properties 与 *.jks/*.keystore/*.p12 永不提交；Live2D 示例模型 Haru/Hiyori 许可禁止再分发，只能本地由 tools/fetch-sample-models.mjs 下载
+.gitmodules[FV6T]: F:声明 ThirdParty/MNN 子模块指向 alibaba/MNN | R:- | A:- | S:-
+AGENTS.md[SG9S]: F:仓库级 Agent 工作约定：AOCI 认知层接入、认知建立与恢复门禁、任务收尾维护和专项流程边界 | R:code:aoci.txt,code:aoci.meta.txt,code:aoci.code.txt | A:- | S:AOCI 语义只能由模型基于真实证据创作，禁止按路径/AST/规则引擎预填；受管理对象变更后只在最终稳定状态调用一次 aoci_maintain 并提交完整候选批次；用户明确禁止写 AOCI 资产时以用户限制为准
+LICENSE[SG3M]: F:Apache License 2.0 全文 | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/.github/workflows/===
+android-ci.yml[OV8M]: F:push/PR/标签触发的 Android CI：并行构建 arm64 debug 与 release APK，release 附 SDK AAR，v* 标签发 GitHub Release | R:code:app/build.gradle,code:facecapture-sdk/build.gradle | A:产物 VirtualFaceCapture-<sha>-arm64-debug 与 arm64-release，workflow_dispatch 手动触发，同分支新 push 取消旧构建 | S:SDK 版本必须与 version.gradle 一致（android-36 / NDK 28.2.13676358 / CMake 3.22.1+3.18.1）；pose_landmarker_lite.task 不进 Git，构建前必须下载进 assets，否则 APK 缺模型
+auto-delete-merged-branch.yml[OV4S]: F:PR 合并后自动删除 head 分支，也可手动 dispatch 删指定分支 | R:- | A:仅处理已合并的同仓 PR 与 workflow_dispatch，权限 contents:write | S:master/main/develop/release/*/hotfix/* 与 fork PR 一律跳过；只有意外错误才 exit 1，避免合并后留红叉
+windows-client-ci.yml[OV7S]: F:构建 Windows 客户端便携版 zip：selftest + 打包 + 启动 exe 做渲染就绪自检，v* 标签附 Release | R:code:windows-client/package.json | A:产物 VFC-Live2D-win32-x64-<sha7>.zip 与 SHA256SUMS.txt，仅 windows-latest | S:构建成功的定义是打包后的 exe 真的能启动并渲染就绪（smoke-result.json ready），smoke 失败即失败；跑 smoke 前必须清掉 ELECTRON_RUN_AS_NODE
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/===
+.gitignore[FV2T]: F:忽略模块构建输出目录 | R:- | A:- | S:-
+build.gradle[FV7T]: F::CommonData 库模块构建：compileSdk 36、minSdk 24、JVM 11，依赖 androidx 与 JUnit | R:code:CommonData/src/main/AndroidManifest.xml | A:namespace com.example.commondata，consumer-rules.pro 随 AAR 发布 | S:compileSdk 36 / minSdk 24 在此硬编码而其他模块用 rootProject.ext，升级 SDK 需两处同步
+proguard-rules.pro[FV1T]: F:ProGuard 规则占位，当前全部注释 | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/src/androidTest/java/com/example/commondata/===
+ExampleInstrumentedTest.kt[TQ2T]: F:模板 instrumented 测试：断言测试包上下文 | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/src/main/===
+AndroidManifest.xml[FV2T]: F::CommonData 库清单占位，空 manifest | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/src/main/java/com/example/commondata/===
+BlendShapeResult.kt[CG6T]: F:封装 MediaPipe 52 维 ARKit 兼容 BlendShape 数组，暴露常用项与逐索引取值 | R:code:CommonData/src/main/java/com/example/commondata/Landmark.kt | A:get(index) 越界返回 0f，toARKitBlendShapes() 转统一结构 | S:values 必须保持 MediaPipe 原始 52 项索引序，toARKitBlendShapes 按下标直读
+CameraDeviceInfo.kt[CG7T]: F:描述一台 Camera2 相机：朝向、sensor 方向、垂直视场、等效焦距与逻辑/物理多摄关系 | R:code:facecapture-sdk/src/main/java/com/facecapture/sdk/PipelineFaceTracker.kt | A:isFrontFacing/isBackFacing，physicalCameraId 标记物理传感器条目 | S:物理多摄条目不能直接 openCamera(id)：id 是所属逻辑相机，须开逻辑相机后用 OutputConfiguration.setPhysicalCameraId 绑定（API 28+）
+FaceLandmarkIndices.kt[CG8M]: F:MediaPipe 478 点位索引的唯一定义：眼睑/虹膜/眉/鼻/嘴/轮廓各分组点集 | R:code:CommonData/src/main/java/com/example/commondata/Landmark.kt | A:各分组暴露 UPPER_EYELID/LOWER_EYELID/IRIS_CENTER/ALL_* 点集常量 | S:命名按图像左/右而非真人左右（前置镜像下图像左=真人右）；468/473 是虹膜中心，469-472/474-477 是虹膜边缘
+FaceVisualizationData.kt[CG5T]: F:预览叠加用面捕数据：关键点、检测框、头姿角与平移、图幅、时间戳 | R:code:CommonData/src/main/java/com/example/commondata/Landmark.kt | A:DetectionBox 归一化坐标加 score，HeadPoseData.isValid 判任一角非 0 | S:-
+Landmark.kt[CG7L]: F:共享几何与特征结构：Point3D 运算、FaceKeyPoints/EyePoints、ARKitBlendShapes 52 字段 | R:code:CommonData/src/main/java/com/example/commondata/BlendShapeResult.kt | A:Point3D 距离与四则运算符，ARKitBlendShapes.fromMediaPipeArray(FloatArray) | S:ARKitBlendShapes 字段顺序必须与 MediaPipe 原始数组下标一致，fromMediaPipeArray 按下标直读
+UpperBodyPose.kt[CG8M]: F:上半身 13 点协议唯一语义：MediaPipe 33 点常量、协议顺序 ORDER、骨架连线、BodyPoint/TorsoAngles/UpperBodyPoseFrame | R:code:MediapipeUpperBody/src/main/java/com/example/mediapipeupperbody/UpperBodyPoseDetector.kt,code:windows-client/renderer/mapping.js | A:ORDER 与 P_* 协议下标、UpperBodySkeleton.BONES 15 条连线、UpperBodyPoseFrame.empty/sanitizePoints/isUsable | S:ORDER 顺序或数量变更等于协议不兼容，必须同步 Android 产出、track.ub 序列化与 Windows mapping.js 三处
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/src/main/java/com/vfc/log/===
+VfcLog.kt[CO8L]: F:带文件落盘的日志门面：Log.x 同时异步追加 filesDir/logs/vfc.log 供 debug 导出 | R:- | A:init(enable)/flush/withWriteLock 导出接口，级别常量与 android.util.Log 一致 | S:仅 debug 包落盘，release 恒关闭；单线程队列 4096 满即丢弃并计数，绝不反压相机/推理线程；写盘连续失败 5 次自动停用且不抛异常
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/CommonData/src/test/java/com/example/commondata/===
+ExampleUnitTest.kt[TQ2T]: F:模板 JVM 单测占位 | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/Live2D/===
+.gitignore[FV2T]: F:忽略模块构建输出目录 | R:- | A:- | S:-
+CMakeLists.txt[FV7T]: F:native-live2d 共享库构建：静态导入 Cubism Core，编入 Framework 与 src/main/cpp | R:code:Live2D/build.gradle | A:产出 libnative-live2d.so，链接 Framework、Live2DCubismCore、GLESv2、log | S:Live2DCubismCore 取 SDKRoot/Core/lib/android/<ABI> 预编译 .a 且只有 arm64-v8a；CSM_TARGET_ANDROID_ES2 必须定义在 Framework 上，否则渲染目标编译失败
+build.gradle[FV7T]: F::Live2D 库模块构建：CMake 3.18.1 原生构建，仅 arm64-v8a，C++11 | R:code:Live2D/CMakeLists.txt | A:namespace com.live2d.demo，开 ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES | S:只允许 abiFilters arm64-v8a：Cubism Core 仅有该 ABI 预编译库，新增 ABI 会链接失败
+proguard-rules.pro[FV1T]: F:ProGuard 规则占位，当前全部注释 | R:- | A:- | S:-
+
+===C:/Users/linzero/Desktop/VirtualFaceCapture-MNN/Live2D/src/SDKRoot/Core/===
+CHANGELOG.md[SL2M]: F:Live2D Cubism Core 官方变更记录 | R:- | A:- | S:-
+LICENSE.md[SL3T]: F:Live2D Cubism Core 专有许可说明 | R:- | A:- | S:分发须遵守 Live2D 专有许可，与仓库根 Apache LICENSE 不同
