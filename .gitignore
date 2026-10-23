@@ -25,6 +25,11 @@ windows-client/node_modules/
 windows-client/dist/
 tools/verify/node_modules/
 
+# Live2D 官方示例模型（Haru / Hiyori）：免费素材许可禁止再分发，只在本机用
+# 由 tools/fetch-sample-models.mjs 按需下载
+windows-client/models/Haru/
+windows-client/models/Hiyori/
+
 /MNNSource/
 /MNNDemo/
 /OpenSeeFaceSource/

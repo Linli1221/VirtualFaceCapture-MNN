@@ -598,11 +598,17 @@ await test("到达节奏比手机时钟略快（两端时钟频差）：偏移�
 
 console.log("[selftest] server.js · 模型发现与静态路由");
 const models = await discoverModels();
-await test("模型目录发现 4 个模型（ATRI/sensei/Yuuka/zzzz）", () => {
-  assert.equal(models.length, 4);
-  // JS 默认排序按 UTF-16 码位：大写字母在小写之前
-  const names = models.map((m) => m.name).sort();
-  assert.deepEqual(names, ["ATRI", "Yuuka", "sensei", "zzzz"]);
+await test("模型目录含 4 个内置模型（ATRI/sensei/Yuuka/zzzz），可选 Haru/Hiyori", () => {
+  const names = models.map((m) => m.name);
+  for (const bundled of ["ATRI", "Yuuka", "sensei", "zzzz"]) {
+    assert.ok(names.includes(bundled), "缺少内置模型 " + bundled);
+  }
+  // Haru/Hiyori 由 tools/fetch-sample-models.mjs 按需导入（许可禁止入库，CI 上没有）：
+  // 存在时校验入口文件名，不存在不算失败
+  for (const optional of ["Haru", "Hiyori"]) {
+    const found = models.find((m) => m.name === optional);
+    if (found) assert.ok(found.entry.endsWith("/" + optional + ".model3.json"), optional + " 入口应为 *.model3.json");
+  }
   assert.ok(models.find((m) => m.name === "ATRI").entry.endsWith("/ATRI.model3.json"));
 });
 
@@ -621,8 +627,11 @@ try {
     const response = await fetch(base + "/api/models");
     assert.equal(response.status, 200);
     const data = await response.json();
-    assert.equal(data.count, 4);
+    // 内置 4 个必在；Haru/Hiyori 可选（fetch-sample-models 按需导入，CI 上没有）
+    assert.ok(data.count >= 4, "至少应有 4 个内置模型，实际 " + data.count);
+    assert.equal(data.models.length, data.count);
     assert.ok(data.models.some((m) => m.name === "ATRI"));
+    assert.ok(data.models.some((m) => m.name === "sensei"));
   });
 
   await test("GET /models/ATRI/ATRI.model3.json 可访问且为 JSON", async () => {

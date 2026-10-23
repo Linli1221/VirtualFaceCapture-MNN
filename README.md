@@ -333,7 +333,9 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
 - **PC 自动消费**：13 点换算成上半身运动骨骼（脊柱 → 锁骨 → 上臂 → 前臂），躯干驱动
   `ParamBodyAngleX/Y/Z`、肩驱动 `ParamShoulderL/R`、手臂驱动 `ParamArmLA/RA`、肘驱动
   `ParamArmLB/RB`；模型没有这些参数时**自动跳过**（仓库自带 4 个模型只有
-  `ParamBodyAngleX/Y/Z`，所以肩 / 手臂 / 肘动作在它们身上看不到，属预期降级）。
+  `ParamBodyAngleX/Y/Z`，所以肩 / 手臂 / 肘动作在它们身上看不到，属预期降级；
+  在仓库根执行 `node tools/fetch-sample-models.mjs` 可导入 Live2D 官方 Haru / Hiyori
+  验收完整骨骼驱动——许可禁止再分发，不进 Git）。
 - **丢失平滑回默认**：`ubOk=false` 或 1.5 s 没更新时，参数按帧向 0 衰减回模型自己的 idle motion。
 - **预览 / 调试可见**：手机预览叠加 13 点骨架；PC 调试面板有上半身参数组，
   `D` 面板 + `?skeleton=1` 可看浮层骨架。

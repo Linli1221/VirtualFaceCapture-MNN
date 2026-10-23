@@ -346,7 +346,9 @@ wrists / hips) plus **baseline-relative torso angles**, so the avatar can lean, 
   shoulders `ParamShoulderL/R`, the arms `ParamArmLA/RA`, the elbows `ParamArmLB/RB`;
   parameters a model does not have are **skipped** (the four bundled models only
   ship `ParamBodyAngleX/Y/Z`, so shoulder/arm/elbow motion will not visibly move there —
-  expected degradation).
+  expected degradation). Run `node tools/fetch-sample-models.mjs` at the repo root to
+  import the official Live2D Haru / Hiyori sample models for verifying the full skeleton
+  drive (their license forbids redistribution, so they are not committed).
 - **Smooth fallback**: on `ubOk=false` or 1.5 s without an update the parameters decay toward 0
   per frame, handing control back to the model's own idle motion.
 - **Visible while debugging**: skeleton overlay on the phone preview; PC debug panel gets an

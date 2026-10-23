@@ -223,9 +223,14 @@ PC 端自动消费，不需要任何开关：
   `ParamArmLB/RB`、`ParamShoulderL/R`、`ParamHandL/R` 一个都没有）。所以现在能看到
   **躯干跟着侧倾 / 转身**，但**肩 / 手臂 / 肘不会动**——这是模型缺参数，不是数据没到。
   `Live2DStage` 用 `coreModel.getParameterIndex(id) >= 0` 判断，模型没有的参数一律跳过
-  （不算错误），`__vfcDebug.body.support` 能看每个 id 的支持情况。想验证骨骼链路：换一个带
-  手臂 / 肩参数的模型（Cubism 4 标准参数的模型，例如 Live2D 官方 Haru / Hiyori），
-  或临时给模型加这些参数。
+  （不算错误），`__vfcDebug.body.support` 能看每个 id 的支持情况。
+- **验收骨骼链路：导入 Live2D 官方 Haru / Hiyori**（推荐）：仓库根执行
+  `node tools/fetch-sample-models.mjs`（来源为 Live2D 官方 CubismWebSamples 仓库；
+  免费素材许可**禁止再分发**，故不进 Git、`.gitignore` 已排除）。两个模型都带
+  `ParamArmLA/RA`、`ParamArmLB/RB`（肘）与 `ParamBodyAngleX/Y/Z`（cdi3 参数表已核对），
+  导入后 `?model=Haru` / `?model=Hiyori` 即可看到肩 / 手臂 / 肘跟着骨架动。
+  注意：Hiyori 只有单参数 `ParamShoulder`（不是 `ParamShoulderL/R`），锁骨差动对不上、
+  不驱动；`ParamHandL/R`（Hiyori 有）依旧不驱动——13 点协议没有手部关键点。
 - **调试骨架**：按 `D` 打开调试面板（或 URL 加 `?skeleton=1`），画布右下角出现 13 点 /
   15 条边（与 `CommonData.UpperBodySkeleton.BONES` 一致）的骨架，直接画在归一化坐标上；
   低可见度点灰显，`ubOk=false` 时整具骨架灰显并显示「无上半身数据」或「过期」。
@@ -273,6 +278,7 @@ PC 端自动消费，不需要任何开关：
   或换 ATRI / zzzz 等参数齐全的模型。
 - **身体会侧倾但肩/手臂/肘不动**：自带 4 个模型都没有手臂 / 肩参数，属预期降级（见上文
   「上半身关键点」）；`__vfcDebug.body.support.ParamArmLA === false` 即为此情况。
+  要看完整骨骼驱动：`node tools/fetch-sample-models.mjs` 导入 Haru / Hiyori 后切模型。
 - **上半身数据过期 / 骨架灰了**：`__vfcDebug.body.ageMs` 超过 1500 ms。看手机端「上半身
   关键点」开关是否开着、`hello.upperBody` 是否为 true（手机端上半身推理掉帧时 age 会持续涨）。
 - **透明窗口有黑底**：确认用 `npm start`（纯浏览器拿不到真实窗口透明），且页面已切到透明模式。
