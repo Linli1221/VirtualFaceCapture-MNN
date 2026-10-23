@@ -11,7 +11,13 @@
  * 做法：
  *   在映射之前叠加一个本地偏移（不改协议、不要求手机配合）：
  *
- *       pose_calibrated = pose_received + offset
+ *       最终角度 = track.pose + pcOffset
+ *
+ *   **符号约定（严禁改变）**：pitch 上正下负、yaw 本人左转为正、roll 本人左倾为正。
+ *   **基线语义（严禁重复减）**：`track.pose` 是手机端已经减过中性基线的值（手机首 1s
+ *   基线 / extractor.calibrate / BlinkCurveProcessor 都在手机端，本模块不迁移、也不
+ *   重新实现）。`pcOffset` 与手机基线是**叠加**关系：PC 端只做加法，绝不再减一次基线，
+ *   也绝不要求手机发送 poseRaw / 478 点 / 关键点。
  *
  *   offset 有两种来源：
  *     1. 一键校准：保持当前坐姿几秒，把这段时间收到的 pose 取平均后取反
@@ -276,5 +282,328 @@ export class PoseOffsetCollector {
       },
       offset: this.computeOffset(),
     };
+  }
+}
+
+// ================================================================
+// 角色 profile（按角色保存偏移）+ 平滑过渡 + 可选缓慢自适应
+// ================================================================
+
+/**
+ * 角色 profile 持久化 key（由 app.js 读写）。
+ *
+ * 存储结构（JSON）：
+ *   { "version": 1,
+ *     "profiles": {
+ *       "<模型名>": {
+ *         "pitchOffset": 0, "yawOffset": 0, "rollOffset": 0,   // 三轴偏移（度）
+ *         "rangeScale": 1                                       // 可选：量程偏好（0.5~2.0）
+ *       } } }
+ *
+ * 与旧版全局 `POSE_OFFSET_STORAGE_KEY`（vfc.poseOffset）的关系：
+ *   - 新代码以 profile store 为准，按**当前角色**读写；
+ *   - 每次保存时同步镜像一份到 vfc.poseOffset（最后生效的偏移），老客户端 / 老版本
+ *     只认这个 key 也不受影响；
+ *   - 首次迁移：某角色没有 profile 时，用 vfc.poseOffset 的值播种，行为与旧版一致。
+ */
+export const POSE_PROFILE_STORAGE_KEY = "vfc.poseProfiles";
+
+/** 缓慢自适应偏移的总开关 key（默认关闭；值为 "1" 才开启）。 */
+export const POSE_ADAPTIVE_STORAGE_KEY = "vfc.poseAdaptive";
+
+/** 量程偏好的上下限（乘在映射归一化的默认量程上；1 = 与现在完全一致）。 */
+export const RANGE_SCALE_MIN = 0.5;
+export const RANGE_SCALE_MAX = 2;
+export const DEFAULT_RANGE_SCALE = 1;
+
+/** 中性角色 profile：三轴偏移 0、量程偏好 1。 */
+export const DEFAULT_POSE_PROFILE = Object.freeze({
+  pitchOffset: 0,
+  yawOffset: 0,
+  rollOffset: 0,
+  rangeScale: DEFAULT_RANGE_SCALE,
+});
+
+/** 量程偏好：有限数字，截断到 [0.5, 2]，坏数据回落 1。 */
+export function sanitizeRangeScale(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_RANGE_SCALE;
+  return Math.max(RANGE_SCALE_MIN, Math.min(RANGE_SCALE_MAX, n));
+}
+
+/**
+ * 把任意输入整理成合法的角色 profile：
+ * `{ pitchOffset, yawOffset, rollOffset, rangeScale }`。
+ * 也兼容直接传 `{pitch,yaw,roll}`（自动映射到 *Offset 字段）。
+ */
+export function sanitizePoseProfile(profile) {
+  const source = profile && typeof profile === "object" ? profile : {};
+  const offset = sanitizePoseOffset({
+    pitch: source.pitchOffset ?? source.pitch,
+    yaw: source.yawOffset ?? source.yaw,
+    roll: source.rollOffset ?? source.roll,
+  });
+  return {
+    pitchOffset: offset.pitch,
+    yawOffset: offset.yaw,
+    rollOffset: offset.roll,
+    rangeScale: sanitizeRangeScale(source.rangeScale),
+  };
+}
+
+/** profile → offset 对象（feedTrack 用的 {pitch,yaw,roll}）。 */
+export function profileToOffset(profile) {
+  const p = sanitizePoseProfile(profile);
+  return { pitch: p.pitchOffset, yaw: p.yawOffset, roll: p.rollOffset };
+}
+
+/** offset 对象 → profile（保留原量程偏好）。 */
+export function offsetToProfile(offset, rangeScale = DEFAULT_RANGE_SCALE) {
+  const o = sanitizePoseOffset(offset);
+  return {
+    pitchOffset: o.pitch,
+    yawOffset: o.yaw,
+    rollOffset: o.roll,
+    rangeScale: sanitizeRangeScale(rangeScale),
+  };
+}
+
+/** 角色名 → profile key（大小写不敏感，与 findModel 一致）。 */
+export function profileKeyFor(modelName) {
+  const name = String(modelName ?? "").trim();
+  return name ? name.toLowerCase() : "__default__";
+}
+
+/**
+ * 反序列化 profile store。坏 JSON / 旧版本 / 手改值都回落到空 store，不抛异常。
+ * 兼容三种历史形态：空、`{profiles:{...}}`、直接 `{ "<模型名>": {...} }`。
+ */
+export function decodePoseProfileStore(raw) {
+  const empty = { version: 1, profiles: {} };
+  if (raw == null || raw === "") return empty;
+  let data = raw;
+  if (typeof data === "string") {
+    try {
+      data = JSON.parse(data);
+    } catch {
+      return empty;
+    }
+  }
+  if (!data || typeof data !== "object") return empty;
+  const table = data.profiles && typeof data.profiles === "object" ? data.profiles : data;
+  const profiles = {};
+  for (const [key, value] of Object.entries(table)) {
+    if (key === "version" || key === "profiles") continue;
+    if (!value || typeof value !== "object") continue;
+    profiles[String(key)] = sanitizePoseProfile(value);
+  }
+  return { version: 1, profiles };
+}
+
+/** 序列化 profile store。 */
+export function encodePoseProfileStore(store) {
+  const decoded = decodePoseProfileStore(store);
+  return JSON.stringify(decoded);
+}
+
+/** 读某个角色的 profile（没有则返回中性 profile，不修改 store）。 */
+export function getProfileFor(store, modelName) {
+  const table = decodePoseProfileStore(store).profiles;
+  const hit = table[profileKeyFor(modelName)];
+  return hit ? { ...hit } : { ...DEFAULT_POSE_PROFILE };
+}
+
+/** 写某个角色的 profile（返回新的 store 对象，调用方负责持久化）。 */
+export function setProfileFor(store, modelName, profile) {
+  const decoded = decodePoseProfileStore(store);
+  decoded.profiles[profileKeyFor(modelName)] = sanitizePoseProfile(profile);
+  return decoded;
+}
+
+/**
+ * 偏移平滑过渡器：把「应用中的偏移」缓慢趋近「目标偏移」，避免重置 / 换零点时模型瞬移。
+ *
+ * 语义：
+ *   - `setTarget(offset, {snap:true})` 立即生效（滑块、程序化设置走这条，行为与旧版一致）；
+ *   - `setTarget(offset)`（手动重置 / 手机重做基线）按 `maxSlewDegPerSec` 限速逼近，
+ *     每轴独立、同时到位，过渡期间不改变符号与叠加公式；
+ *   - `sample(dtMs)` 由每帧调用，返回当前应使用的 offset。
+ */
+export class OffsetRamp {
+  /** @param {{maxSlewDegPerSec?:number,epsilon?:number}} [options] */
+  constructor(options = {}) {
+    this.maxSlew = Math.max(1, toFiniteNumber(options.maxSlewDegPerSec, 25));
+    this.epsilon = Math.max(1e-4, toFiniteNumber(options.epsilon, 0.01));
+    this.current = { ...DEFAULT_POSE_OFFSET };
+    this.target = { ...DEFAULT_POSE_OFFSET };
+  }
+
+  /** 设置目标偏移。snap=true 立即跳到目标（旧版行为）；否则限速逼近。 */
+  setTarget(offset, { snap = false } = {}) {
+    this.target = sanitizePoseOffset(offset);
+    if (snap) this.current = { ...this.target };
+    return this.snapshot();
+  }
+
+  /** 是否已经贴上目标（用于判断要不要继续走帧循环 / 持久化）。 */
+  get settled() {
+    for (const axis of ["pitch", "yaw", "roll"]) {
+      if (Math.abs(this.target[axis] - this.current[axis]) > this.epsilon) return false;
+    }
+    return true;
+  }
+
+  /**
+   * 推进 dtMs 毫秒，返回当前应用中的 offset（新对象）。
+   * 每轴步进 ≤ maxSlew × dt，剩余距离小于一步时直接贴上，绝不超调。
+   */
+  sample(dtMs) {
+    const dt = Math.max(0, toFiniteNumber(dtMs, 0)) / 1000;
+    const step = this.maxSlew * dt;
+    for (const axis of ["pitch", "yaw", "roll"]) {
+      const diff = this.target[axis] - this.current[axis];
+      const move = Math.abs(diff) <= Math.max(step, this.epsilon) ? diff : Math.sign(diff) * step;
+      this.current[axis] = clampOffset(this.current[axis] + move);
+    }
+    return this.snapshot();
+  }
+
+  snapshot() {
+    return { ...this.current };
+  }
+}
+
+/**
+ * 可选的「缓慢自适应偏移」（默认关闭）。
+ *
+ * 目标：人坐久了中性姿态会慢慢漂（靠背、换重心），固定 offset 会显得越来越歪。
+ * 做法：**只在低运动、低表情变化时**，把 offset 以每帧 `rate`（0.001~0.005）的
+ * 速度朝「让最终角度归零」的方向挪一点点：
+ *
+ *     offset ← offset − 最终角度 × rate      （最终角度 = track.pose + offset）
+ *
+ * 防污染（验收：说话 / 眨眼不许碰 offset）：
+ *   - 表情门：相邻两帧 bs[52] 的最大绝对变化 > 表情阈值 → 说话 / 眨眼 / 挑眉，直接跳过；
+ *     这里只用「整段 bs 向量的变化量」做门限，**不从 bs[52] 反推**任何嘴 / 眼 / 微笑特征；
+ *   - 运动门：相邻两帧 pose 任一轴变化 > 运动阈值 → 头在动，直接跳过；
+ *   - 需要连续 `quietFrames` 帧都安静才开始更新，偶发一两帧安静（说话间隙）不足以触发；
+ *   - face === false / 坏数据一律跳过；
+ *   - 自适应能挪动的范围锚定在「手动 / 一键校准」给出的 anchor ± maxDriftDeg 之内，
+ *     不会无限跑飞；rate 极小（默认 0.002/帧，30fps 下时间常数约 17s）。
+ *
+ * 默认 disabled=true 时 update() 恒不改 offset，行为与没有这个模块完全一致。
+ */
+export class AdaptivePoseOffset {
+  /**
+   * @param {{rate?:number,motionLimitDeg?:number,expressionLimit?:number,
+   *          quietFrames?:number,maxDriftDeg?:number}} [options]
+   *   rate           = 每帧更新系数，合法区间 [0.001, 0.005]，默认 0.002；
+   *   motionLimitDeg = 相邻帧单轴 pose 变化超过它算「在动」（度，默认 1.5）；
+   *   expressionLimit= 相邻帧 bs 最大绝对变化超过它算「表情在变」（默认 0.06）；
+   *   quietFrames    = 连续安静多少帧才开始更新（默认 15）；
+   *   maxDriftDeg    = 相对 anchor 允许漂移的上限（度，默认 10）。
+   */
+  constructor(options = {}) {
+    const rate = toFiniteNumber(options.rate, 0.002);
+    this.rate = Math.max(0.001, Math.min(0.005, rate));
+    this.motionLimitDeg = Math.max(0.05, toFiniteNumber(options.motionLimitDeg, 1.5));
+    this.expressionLimit = Math.max(0.005, toFiniteNumber(options.expressionLimit, 0.06));
+    this.quietFrames = Math.max(1, Math.round(toFiniteNumber(options.quietFrames, 15)));
+    this.maxDriftDeg = Math.max(0.5, toFiniteNumber(options.maxDriftDeg, 10));
+    /** 总开关：默认关闭（默认行为 = 现状）。 */
+    this.enabled = false;
+    this.anchor = { ...DEFAULT_POSE_OFFSET };
+    this.prevPose = null;
+    this.prevBs = null;
+    this.quietStreak = 0;
+    this.stats = { updates: 0, skippedMotion: 0, skippedExpression: 0, skippedFace: 0, skippedData: 0 };
+  }
+
+  /** 手动 / 一键校准落了新偏移：以它为锚点重新允许 ±maxDriftDeg 的缓慢漂移。 */
+  setAnchor(offset) {
+    this.anchor = sanitizePoseOffset(offset);
+  }
+
+  /** 换人 / 重连 / 手机重做基线：丢掉历史帧，避免用旧姿态污染新会话。 */
+  reset() {
+    this.prevPose = null;
+    this.prevBs = null;
+    this.quietStreak = 0;
+  }
+
+  /**
+   * 喂一帧 `track`（协议 §4.2），必要时返回缓慢修正后的 offset。
+   * @param {object} track 需要 `pose`（[pitch,yaw,roll]）与 `bs`（52 项）
+   * @param {{pitch:number,yaw:number,roll:number}} offset 当前（目标）偏移
+   * @returns {{changed:boolean, offset:object, reason:string}}
+   *   changed=true 时 offset 是修正后的新偏移（已按 anchor ± maxDriftDeg 截断）。
+   */
+  update(track, offset) {
+    const current = sanitizePoseOffset(offset);
+    const safeReturn = (reason) => ({ changed: false, offset: current, reason });
+    if (!this.enabled) return safeReturn("disabled");
+
+    const pose = track && (Array.isArray(track.pose) || ArrayBuffer.isView(track.pose)) ? track.pose : null;
+    const bs = track && (Array.isArray(track.bs) || ArrayBuffer.isView(track.bs)) ? track.bs : null;
+    if (!pose || pose.length < 3 || !bs) {
+      this.stats.skippedData += 1;
+      this.reset();
+      return safeReturn("bad-data");
+    }
+    const p = [Number(pose[0]), Number(pose[1]), Number(pose[2])];
+    if (!p.every((v) => Number.isFinite(v) && Math.abs(v) <= 100)) {
+      this.stats.skippedData += 1;
+      this.reset();
+      return safeReturn("bad-data");
+    }
+    if (track.face === false) {
+      this.stats.skippedFace += 1;
+      this.reset();
+      return safeReturn("face-lost");
+    }
+
+    const prevPose = this.prevPose;
+    const prevBs = this.prevBs;
+    this.prevPose = p;
+    this.prevBs = Float64Array.from(bs, (v) => (Number.isFinite(Number(v)) ? Number(v) : 0));
+    if (!prevPose || !prevBs) return safeReturn("warming-up");
+
+    // 表情门：只看整段 bs 向量的变化量，不反推任何具体特征。
+    let exprDelta = 0;
+    const n = Math.min(prevBs.length, this.prevBs.length);
+    for (let i = 0; i < n; i++) {
+      const d = Math.abs(this.prevBs[i] - prevBs[i]);
+      if (d > exprDelta) exprDelta = d;
+    }
+    if (exprDelta > this.expressionLimit) {
+      this.stats.skippedExpression += 1;
+      this.quietStreak = 0;
+      return safeReturn("expression-active");
+    }
+
+    // 运动门：相邻帧单轴 pose 变化过大 = 在动。
+    const moving = p.some((v, i) => Math.abs(v - prevPose[i]) > this.motionLimitDeg);
+    if (moving) {
+      this.stats.skippedMotion += 1;
+      this.quietStreak = 0;
+      return safeReturn("motion-active");
+    }
+
+    this.quietStreak += 1;
+    if (this.quietStreak < this.quietFrames) return safeReturn("quiet-warming");
+
+    // 缓慢归零：offset ← offset − 最终角度 × rate，且不越过 anchor ± maxDriftDeg。
+    const next = { ...current };
+    const axes = ["pitch", "yaw", "roll"];
+    for (let i = 0; i < 3; i++) {
+      const axis = axes[i];
+      const finalAngle = p[i] + current[axis];
+      const candidate = current[axis] - finalAngle * this.rate;
+      const lo = this.anchor[axis] - this.maxDriftDeg;
+      const hi = this.anchor[axis] + this.maxDriftDeg;
+      next[axis] = clampOffset(Math.max(lo, Math.min(hi, candidate)));
+    }
+    this.stats.updates += 1;
+    return { changed: true, offset: next, reason: "adapted" };
   }
 }

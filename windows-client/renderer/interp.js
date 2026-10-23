@@ -37,10 +37,40 @@
  *   - 上升 / 下降都限速（maxRiseRate / maxFallRate），保证 sampleAt 单调递增，
  *     画面只会轻微放慢或加快，**不会倒带**。
  *
+ * ────────────────────────────────────────────────────────────────────────────
+ * jitterBufferV1 模式（options.jitterBuffer = true，M1：把手机端固定 500 ms 发送缓冲
+ * 迁到 PC）——**职责边界**（不要在别处再叠一层缓冲，两层延迟会相加）：
+ *
+ *   ┌─ jitter buffer（自适应缓冲深度控制器，本类的 delayMs / primed 部分）────────┐
+ *   │  决定「渲染时刻应落后输入时间轴多少」：                                     │
+ *   │   · 起播预缓冲（primed）与断流后重新预缓冲；                                │
+ *   │   · 深度目标分档：稳定 80~150 ms / 抖动 200~300 ms / 剧烈 400~500 ms；      │
+ *   │   · 依据：输入间隔 p85/p95、连续大间隔次数、seq 跳变次数、缓冲见底次数；    │
+ *   │   · 快升慢降 + 变化限速（保证 sampleAt 单调、绝不倒带）；                   │
+ *   │   · 见底 / 溢出统计。它**不持有报文队列**，只输出一个 delayMs。             │
+ *   └──────────────────────────────────────────────────────────────────────────┘
+ *   ┌─ ParamTimeline（播放时间轴，本类的 samples / push / sample 部分）───────────┐
+ *   │  决定「给定播放时刻，参数应该是什么」：                                     │
+ *   │   · 样本存储（track.t + 时钟偏移 → 媒体时间轴）与线性插值；                 │
+ *   │   · 时钟偏移估计（最近 12 帧「到达−采集」最小值，逐帧小步跟随）；           │
+ *   │   · 断流外推上限（≤40 ms 且 ≤0.75 个输入间隔）与乱序丢弃。                 │
+ *   │   它不决定延迟多少，只消费 jitter buffer 给出的 delayMs。                   │
+ *   └──────────────────────────────────────────────────────────────────────────┘
+ * 两层共用同一条时间轴（sampleAt = now − delayMs 在 samples 上插值），
+ * **不存在第二套队列**，所以延迟不会叠加。
+ *
+ * jitterBufferV1 的三档深度由信号强弱决定（见 _targetDelayJitter）：
+ *   - 稳定（无大间隔、无 seq 跳变、无见底、传输滞后小）：80~150 ms；
+ *   - 抖动（偶发大间隔 / 少量 seq 跳变 / 滞后 p90-p10 ≥ 40 ms）：200~300 ms；
+ *   - 剧烈（连续 ≥3 次大间隔 / 2 s 内 ≥3 次 seq 跳变或见底 / 滞后 ≥150 ms）：400~500 ms。
+ * 上升快（attack，抖动一出现立即加深）、回落慢（release，稳定后慢慢收回）。
+ * 延迟估计一律用**分位数**（p85/p95），不用最大值——单次 200 ms 抽风不应永久抬高延迟。
+ * ────────────────────────────────────────────────────────────────────────────
+ *
  * 边界行为：
  *   - 乱序样本直接丢弃（seq 丢旧帧已在上层做过，这里只做最后一道保险）；
  *   - 断流时最多外推 extrapolateMs（默认 40 ms），不会让模型飞出去；
- *   - 断流超过 maxIntervalMs 清空样本、重新测节奏。
+ *   - 断流超过 maxIntervalMs 清空样本、重新测节奏；jitterBufferV1 下同时重新预缓冲。
  *
  * `sample()` 返回的是内部复用对象（用完即弃），调用方不要保存引用。
  */
@@ -85,6 +115,44 @@ export const INTERP_DEFAULTS = Object.freeze({
   offsetWindow: 12,
   /** 偏移突变超过该值时重新锚定（ms）：手机端帧缓冲重新预缓冲 / 网络路径切换。 */
   offsetJumpMs: 120,
+
+  // ---- jitterBufferV1（PC 侧自适应抖动缓冲）专属默认值 ----
+  /** 总开关：true = 自适应深度 + 起播预缓冲（M1 新逻辑）；false = 旧行为（快速输入延迟为 0）。 */
+  jitterBuffer: false,
+  /** 缓冲深度分档（ms）：稳定 / 抖动 / 剧烈。 */
+  depthMinMs: 80,
+  depthStableMaxMs: 150,
+  depthJitterMinMs: 200,
+  depthJitterMaxMs: 300,
+  depthHeavyMinMs: 400,
+  depthHeavyMaxMs: 500,
+  /** 深度估计用的间隔分位数（p85 做基线展示、p95 做余量；禁止用最大值）。 */
+  intervalMidQuantile: 0.5,
+  intervalHighQuantile: 0.95,
+  /** 单个间隔超过「p50 × 该倍数」（且不小于 bigGapMinMs）算一次大间隔。 */
+  bigGapRatio: 2.0,
+  bigGapMinMs: 80,
+  /** 连续大间隔 ≥ 该次数 → 判为剧烈抖动。 */
+  bigGapStreakHeavy: 3,
+  /** 2 s 窗口内 seq 跳变 ≥ 该次数：1 次 → 抖动档，heavy 次 → 剧烈档。 */
+  seqGapWindowMs: 2000,
+  seqGapHeavyCount: 3,
+  /** 2 s 窗口内缓冲见底 ≥ 该次数 → 剧烈档（见底说明当前深度不够用）。 */
+  starveWindowMs: 2000,
+  starveHeavyCount: 3,
+  /** 传输滞后抖动（p90 − p10）阈值：≥ light 进抖动档，≥ heavy 进剧烈档（ms）。 */
+  transitJitterLightMs: 40,
+  transitJitterHeavyMs: 150,
+  /** 输入间隔抖动（p95 − p50）阈值：≥ light 进抖动档，≥ heavy 进剧烈档（ms）。 */
+  spreadLightMs: 40,
+  spreadHeavyMs: 120,
+  /** 起播预缓冲超时（ms）：低帧率 / 单帧流下等不到「攒够深度」时兜底起播。 */
+  primeTimeoutMs: 800,
+  /** jitter 模式的延迟变化时间常数与限速：快升慢降，且 rise rate < 1 保证不倒带。 */
+  attackMsJitter: 100,
+  releaseMsJitter: 2500,
+  maxRiseRateJitter: 0.75,
+  maxFallRateJitter: 0.1,
 });
 
 function nowMs() {
@@ -132,6 +200,11 @@ export class ParamTimeline {
   /** @param {Partial<typeof INTERP_DEFAULTS>} [options] */
   constructor(options = {}) {
     this.options = { ...INTERP_DEFAULTS, ...options };
+    const o = this.options;
+    this.jitter = Boolean(o.jitterBuffer);
+    // jitter 模式要留得住「一个缓冲深度」的样本（500 ms @ 60 fps ≈ 30 帧），否则溢出把
+    // 深度吃掉、见底计数飙升；样本对象很轻（t + 参数引用），64 条上限仍然有界。
+    if (this.jitter && options.maxSamples == null) this.options.maxSamples = 64;
     /** @type {{t:number, params:object}[]} 按时间升序排列（t 为播放时间轴，不是到达时间） */
     this.samples = [];
     /** 最近一次 sample() 的复用输出对象。 */
@@ -158,6 +231,24 @@ export class ParamTimeline {
     this._baseWindow = [];
     this._lastStamp = null;
     this._starved = false;
+
+    // ---- jitterBufferV1 状态 ----
+    /** 是否已起播（jitter 模式）：false = 还在预缓冲，sample() 保持首帧不推进时间轴。 */
+    this.primed = !this.jitter;
+    /** 本次预缓冲的起点（到达时间口径，超时兜底用）。 */
+    this._primeStartAt = null;
+    /** sampleAt 单调保护：播放时刻绝不允许倒退。 */
+    this._lastSampleAt = -Infinity;
+    /** 最近 seqGapWindowMs 内 seq 跳变发生的时刻（到达时间口径）。 */
+    this._seqGapAt = [];
+    /** 最近 starveWindowMs 内见底 episode 开始的时刻。 */
+    this._starveAt = [];
+    /** 连续大间隔计数（正常间隔清零）。 */
+    this._bigGapStreak = 0;
+    /** 上一帧 seq（丢帧 / 跳变检测用；null = 未见过）。 */
+    this._lastSeq = null;
+    /** 当前深度档（调试 / 调试面板展示）："stable" | "jitter" | "heavy"。 */
+    this.depthTier = "stable";
   }
 
   get count() {
@@ -169,7 +260,11 @@ export class ParamTimeline {
     return this.delayMs > 0.5;
   }
 
-  /** @param {{keepTiming?:boolean}} [options] keepTiming = 保留已测出的节奏与时钟偏移。 */
+  /**
+   * @param {{keepTiming?:boolean, keepPriming?:boolean}} [options]
+   *   keepTiming  = 保留已测出的节奏与时钟偏移；
+   *   keepPriming = 保留起播状态（截图 / 单步 renderNow 用：不想因为一次 reset 又进入预缓冲）。
+   */
   reset(options = {}) {
     this.samples.length = 0;
     this.delayMs = 0;
@@ -178,6 +273,12 @@ export class ParamTimeline {
     this.starvedFrames = 0;
     this.starvedEpisodes = 0;
     this._starved = false;
+    this._lastSampleAt = -Infinity;
+    if (this.jitter && !options.keepPriming) {
+      // 新会话 / 断线：重新走起播预缓冲（M1 要求：onopen / onhello / 重连都要重新 primed）
+      this.primed = false;
+      this._primeStartAt = null;
+    }
     if (!options.keepTiming) {
       this._intervals.length = 0;
       this.inputIntervalMs = 0;
@@ -186,6 +287,11 @@ export class ParamTimeline {
       this._stampBase = null;
       this._baseWindow.length = 0;
       this._lastStamp = null;
+      this._seqGapAt.length = 0;
+      this._starveAt.length = 0;
+      this._bigGapStreak = 0;
+      this._lastSeq = null;
+      this.depthTier = "stable";
     }
   }
 
@@ -198,6 +304,11 @@ export class ParamTimeline {
     if (stampMs != null) this._baseWindow.push(atMs - stampMs);
     this._lastStamp = stampMs;
     this._starved = false;
+    if (this.jitter) {
+      // 时间基准重开（手机时钟回跳 / 时间戳模式切换）：重新预缓冲，避免新段时间轴被旧延迟拖着
+      this.primed = false;
+      this._primeStartAt = atMs;
+    }
   }
 
   /**
@@ -205,13 +316,25 @@ export class ParamTimeline {
    * @param {object} params 形如 { ParamAngleX: number, ... }
    * @param {number} [at] 到达时间（performance.now() 口径，ms）
    * @param {number} [stamp] 手机采集时间戳（track.t，手机本地毫秒）；缺省则按到达时间排队
+   * @param {number} [seq] 帧序号（track.seq）；仅用于跳变统计，去重在上层已做过
    * @returns {boolean} 是否入队（乱序 / 参数缺失返回 false）
    */
-  push(params, at = nowMs(), stamp = null) {
+  push(params, at = nowMs(), stamp = null, seq = null) {
     if (!params || typeof params !== "object") return false;
     const o = this.options;
     const atMs = isFiniteNumber(at) ? at : this.samples.length ? this._lastAt : 0;
     const stampMs = isFiniteNumber(stamp) ? Number(stamp) : null;
+
+    // seq 跳变统计（2 s 窗口）：跳变 = 丢帧 / 网络拥塞，是加深缓冲的信号之一。
+    // seq 回跳（新会话从 0 重新计数）不算跳变，只重置基线。
+    const seqNum = isFiniteNumber(seq) ? Number(seq) : null;
+    if (seqNum != null) {
+      if (this._lastSeq != null && seqNum > this._lastSeq + 1) {
+        this._seqGapAt.push(atMs);
+        this._pruneWindow(this._seqGapAt, atMs, o.seqGapWindowMs);
+      }
+      this._lastSeq = seqNum;
+    }
 
     if (stampMs == null) {
       // 从「有手机时间戳」退回「按到达时间」：两套时间基准不能混用，重开一段
@@ -270,6 +393,12 @@ export class ParamTimeline {
         this.inputIntervalMs = 0;
         this.inputJitterMs = 0;
         this.transitJitterMs = 0;
+        this._bigGapStreak = 0;
+        if (this.jitter) {
+          // 断流恢复：重新走起播预缓冲（不倒带：新段时间轴只向前，sampleAt 由单调保护兜底）
+          this.primed = false;
+          this._primeStartAt = atMs;
+        }
         if (stampMs != null) {
           this._stampBase = atMs - stampMs;
           this._baseWindow.length = 0;
@@ -281,6 +410,10 @@ export class ParamTimeline {
         if (this._intervals.length > o.intervalWindow) this._intervals.shift();
         this.inputIntervalMs =
           this.inputIntervalMs > 0 ? this.inputIntervalMs + (dt - this.inputIntervalMs) * o.intervalSmoothing : dt;
+        // 连续大间隔统计：比 p50 的 bigGapRatio 倍还大才算，单帧抽风不触发
+        const p50 = percentile(this._intervals, o.intervalMidQuantile);
+        if (dt > Math.max(o.bigGapMinMs, p50 * o.bigGapRatio)) this._bigGapStreak += 1;
+        else this._bigGapStreak = 0;
       }
     }
 
@@ -296,6 +429,7 @@ export class ParamTimeline {
     if (this.samples.length > o.maxSamples) this.samples.shift();
     this._lastAt = t;
     this._lastStamp = stampMs;
+    if (this.jitter && !this.primed && this._primeStartAt == null) this._primeStartAt = atMs;
     return true;
   }
 
@@ -316,6 +450,7 @@ export class ParamTimeline {
 
   /** 根据输入节奏 / 传输抖动算出的目标延迟：输入跟得上渲染就是 0。 */
   targetDelayMs() {
+    if (this.jitter) return this._targetDelayJitter(this._lastAt);
     const o = this.options;
     if (!this._intervals.length) return 0;
     const high = percentile(this._intervals, o.intervalQuantile);
@@ -323,6 +458,61 @@ export class ParamTimeline {
     // 只有「帧比时间轴晚到」才需要额外缓冲；早到由偏移吸收，不加延迟
     const lag = this._lags.length ? Math.max(0, percentile(this._lags, o.lagQuantile)) : 0;
     return Math.min(high + lag + o.jitterMarginMs, o.maxDelayMs);
+  }
+
+  /** 从时刻数组里剔除掉出窗口的记录（数组按时间升序，头部弹出即可）。 */
+  _pruneWindow(list, nowMs, windowMs) {
+    while (list.length && nowMs - list[0] > windowMs) list.shift();
+  }
+
+  /**
+   * jitterBufferV1 的深度目标：按信号强弱分三档（稳定 / 抖动 / 剧烈），
+   * 档内由「输入间隔 p85 + 传输滞后 p95 + 余量」的**分位数**决定（绝不用最大值）。
+   *
+   * 信号一览（详见类头部文档）：
+   *   · 输入间隔 p85/p95：p95 − p50 越大说明生产节奏越不稳；
+   *   · 连续大间隔次数（_bigGapStreak）：≥3 次直接判剧烈；
+   *   · seq 跳变（2 s 窗口）：丢帧 / 拥塞的直接证据；
+   *   · 缓冲见底次数（2 s 窗口）：当前深度不够用的直接证据；
+   *   · 传输滞后抖动（p90 − p10）：到达时间被网络 / 调度抖成什么样。
+   */
+  _targetDelayJitter(now) {
+    const o = this.options;
+    if (!this._intervals.length) {
+      // 节奏还没测出来（预缓冲初期）：先按稳定档下限起步，别以 0 延迟开播
+      this.depthTier = "stable";
+      return o.depthMinMs;
+    }
+    const p50 = percentile(this._intervals, o.intervalMidQuantile);
+    const p85 = percentile(this._intervals, o.intervalQuantile);
+    const p95 = percentile(this._intervals, o.intervalHighQuantile);
+    const spread = Math.max(0, p95 - p50);
+    const lag95 = this._lags.length ? Math.max(0, percentile(this._lags, o.lagQuantile)) : 0;
+
+    this._pruneWindow(this._seqGapAt, now, o.seqGapWindowMs);
+    this._pruneWindow(this._starveAt, now, o.starveWindowMs);
+    const seqGaps = this._seqGapAt.length;
+    const starves = this._starveAt.length;
+
+    const heavy =
+      this._bigGapStreak >= o.bigGapStreakHeavy ||
+      seqGaps >= o.seqGapHeavyCount ||
+      starves >= o.starveHeavyCount ||
+      this.transitJitterMs >= o.transitJitterHeavyMs ||
+      spread >= o.spreadHeavyMs;
+    const light =
+      this._bigGapStreak >= 1 ||
+      seqGaps >= 1 ||
+      starves >= 1 ||
+      this.transitJitterMs >= o.transitJitterLightMs ||
+      spread >= o.spreadLightMs;
+    this.depthTier = heavy ? "heavy" : light ? "jitter" : "stable";
+
+    // 分位数估计（p85 覆盖典型节奏、lag95 覆盖典型迟到）+ 固定余量，再夹进当前档位的深度范围
+    const base = p85 + lag95 + o.jitterMarginMs;
+    if (heavy) return Math.min(Math.max(base, o.depthHeavyMinMs), o.depthHeavyMaxMs);
+    if (light) return Math.min(Math.max(base, o.depthJitterMinMs), o.depthJitterMaxMs);
+    return Math.min(Math.max(base, o.depthMinMs), o.depthStableMaxMs);
   }
 
   /**
@@ -336,8 +526,30 @@ export class ParamTimeline {
     const o = this.options;
     const now = isFiniteNumber(at) ? at : this._lastAt;
 
+    // ---- 起播预缓冲（jitterBufferV1）----
+    // 缓冲深度直接定到目标（此时还没播过任何东西，跳变不算倒带）；
+    // 内容攒够一个深度（或超时兜底，防止单帧流永远不播）才开始推进播放时间轴。
+    // 预缓冲期间保持**首帧**：恢复播放时从它接着播，绝不「冻结在最后一帧」或往回跳。
+    if (this.jitter && !this.primed) {
+      this.delayMs = this._targetDelayJitter(now);
+      this._delayAt = now;
+      const first0 = this.samples[0];
+      const last0 = this.samples[count - 1];
+      const enough = last0.t - first0.t >= this.delayMs;
+      const timedOut = this._primeStartAt != null && now - this._primeStartAt >= o.primeTimeoutMs;
+      if (enough || timedOut) {
+        this.primed = true;
+      } else {
+        return copyParams(first0.params, this.out);
+      }
+    }
+
     // 延迟缓变：快升慢降 + 限速，保证 sampleAt 单调递增（不会「倒带」）
-    const target = this.targetDelayMs();
+    const target = this.jitter ? this._targetDelayJitter(now) : this.targetDelayMs();
+    const attackMs = this.jitter ? o.attackMsJitter : o.attackMs;
+    const releaseMs = this.jitter ? o.releaseMsJitter : o.releaseMs;
+    const riseRate = this.jitter ? o.maxRiseRateJitter : o.maxRiseRate;
+    const fallRate = this.jitter ? o.maxFallRateJitter : o.maxFallRate;
     if (this._delayAt == null) this._delayAt = now;
     const elapsed = Math.max(0, Math.min(now - this._delayAt, 100));
     this._delayAt = Math.max(this._delayAt, now);
@@ -346,20 +558,21 @@ export class ParamTimeline {
         this.delayMs = 0;
       } else {
         const rising = target > this.delayMs;
-        const tau = rising ? o.attackMs : o.releaseMs;
+        const tau = rising ? attackMs : releaseMs;
         let next = this.delayMs + (target - this.delayMs) * (1 - Math.exp(-elapsed / tau));
-        const maxDelta = elapsed * (rising ? o.maxRiseRate : o.maxFallRate);
+        const maxDelta = elapsed * (rising ? riseRate : fallRate);
         next = Math.max(this.delayMs - maxDelta, Math.min(this.delayMs + maxDelta, next));
-        this.delayMs = Math.max(0, Math.min(next, o.maxDelayMs));
+        this.delayMs = Math.max(0, Math.min(next, this.jitter ? o.depthHeavyMaxMs : o.maxDelayMs));
         if (target <= 0 && this.delayMs < 0.5) this.delayMs = 0;
       }
     } else if (target <= 0 && this.delayMs <= 0.5) {
       this.delayMs = 0;
     }
 
-    const first = this.samples[0];
-    const last = this.samples[count - 1];
-    const sampleAt = now - this.delayMs;
+    // 播放时刻单调保护：无论延迟怎么变，sampleAt 只前进、绝不倒退（不会倒带 / 跳帧回放）
+    let sampleAt = now - this.delayMs;
+    if (sampleAt < this._lastSampleAt) sampleAt = this._lastSampleAt;
+    this._lastSampleAt = sampleAt;
 
     if (count === 1 || sampleAt <= first.t) {
       this._starved = false;

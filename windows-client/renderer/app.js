@@ -24,14 +24,26 @@ import {
 import {
   ALIGN_DURATION_MS,
   DEFAULT_POSE_OFFSET,
+  DEFAULT_POSE_PROFILE,
+  POSE_ADAPTIVE_STORAGE_KEY,
   POSE_OFFSET_STORAGE_KEY,
+  POSE_PROFILE_STORAGE_KEY,
+  AdaptivePoseOffset,
+  OffsetRamp,
   PoseOffsetCollector,
   applyPoseOffset,
   decodePoseOffset,
+  decodePoseProfileStore,
   encodePoseOffset,
+  encodePoseProfileStore,
   formatPoseOffset,
   isNeutralOffset,
+  offsetToProfile,
+  profileKeyFor,
+  profileToOffset,
   sanitizePoseOffset,
+  sanitizePoseProfile,
+  setProfileFor,
 } from "./calibrate.js";
 import { Live2DStage, checkEnvironment } from "./live2d.js";
 
@@ -153,8 +165,23 @@ const state = {
   phoneFps: null,
   fpsWindowFrames: 0,
   fpsWindowStart: performance.now(),
-  /** 本地姿态偏移（镜头没正对你时的校准量，会持久化）。 */
+  /** 本地姿态偏移（镜头没正对你时的校准量）。最终角度 = track.pose + 本偏移。
+   *  poseOffset = 当前**应用中**的值（平滑过渡期间可能还没到目标）；
+   *  poseOffsetTarget = 目标值（滑块 / 持久化 / UI 显示用）。 */
   poseOffset: decodePoseOffset(storeGet(POSE_OFFSET_STORAGE_KEY)),
+  poseOffsetTarget: decodePoseOffset(storeGet(POSE_OFFSET_STORAGE_KEY)),
+  /** 按角色保存的 profile store（pitchOffset/yawOffset/rollOffset + 量程偏好）。 */
+  poseProfiles: decodePoseProfileStore(storeGet(POSE_PROFILE_STORAGE_KEY)),
+  /** 当前角色的量程偏好（映射归一化默认量程的倍率，1 = 与现在一致）。 */
+  poseRangeScale: DEFAULT_POSE_PROFILE.rangeScale,
+  /** 可选的缓慢自适应偏移（默认关闭，见 calibrate.js 的 AdaptivePoseOffset）。 */
+  poseAdaptive: new AdaptivePoseOffset(),
+  adaptiveEnabled: false,
+  /** 平滑过渡器：手动重置 / 手机重做基线时偏移限速趋近目标，模型不瞬移。 */
+  poseRamp: new OffsetRamp(),
+  lastPoseRampAt: null,
+  lastAdaptiveSavedAt: 0,
+  lastAdaptiveSavedOffset: null,
   /** 正在跑的一键校准：{collector, startedAt, durationMs, timer, promise, resolve}。 */
   align: null,
   /** 最近一次成功校准的报告（调试 / 提示用）。 */
@@ -486,6 +513,7 @@ const client = new TrackerClient({
     ui.btnConnect.textContent = "连接";
     // 断线后不要保留最后一帧的表情：清掉归一化窗口 + 平滑回模型默认姿态，再由 idle motion 接管
     mapper.reset();
+    state.poseAdaptive.reset();
     state.faceMissingSince = null;
     resetBodyState();
     if (stage.ready) stage.relax();
@@ -510,6 +538,7 @@ const client = new TrackerClient({
     // hello = 新会话的起点：兜底重置 seq 跟踪与自适应归一化窗口
     client.lastSeq = -1;
     mapper.reset();
+    state.poseAdaptive.reset();
     resetBodyState();
     state.faceMissingSince = null;
     state.device = typeof message.device === "string" ? message.device : "";
@@ -532,10 +561,10 @@ const client = new TrackerClient({
       setStatus("手机正在校准（已重置姿态归一化）…", "connecting");
     } else {
       // 手机重做基线后，pose 的零点已经由手机重新定义：本地偏移再叠上去会「双重校准」，
-      // 模型反而朝反方向偏。calib 之后基线一定变了，无条件清掉本地偏移；
+      // 模型反而朝反方向偏。calib 之后基线一定变了，无条件清掉本地偏移（平滑过渡，不瞬移）；
       // 需要更细的对齐再点「一键校准」。
-      if (!isNeutralOffset(state.poseOffset)) {
-        applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true });
+      if (!isNeutralOffset(state.poseOffsetTarget)) {
+        applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true, smooth: true });
         setCalibHint("手机端基线已更新，本地对齐偏移已清零。如果模型还是歪的，点「一键校准」再对齐一次。", "warn");
       }
       setStatus(state.device ? `已连接 · ${state.device}` : "已连接", "connected");
@@ -577,8 +606,20 @@ function feedTrack(track) {
   if (!track || typeof track !== "object") return false;
 
   const now = performance.now();
-  // 本地姿态校准：镜头没正对你时，收到的 pose 会带一个固定偏移，先叠加本地 offset 再映射。
+  // ---- 本地姿态偏移（PC 端，叠加在手机基线之上）----
+  //
+  //     最终角度 = track.pose + pcOffset
+  //
+  // `track.pose` 已经在手机端减过中性基线（首 1s 基线 / extractor.calibrate 都在手机），
+  // PC 端的 pcOffset 与手机基线是**叠加**关系：这里只做加法，绝不重复减基线，
+  // 也不要求手机发 poseRaw / 478 点。符号约定不变：pitch 上正下负、yaw 本人左转为正、
+  // roll 本人左倾为正。
+  const rampDtMs = state.lastPoseRampAt == null ? 0 : now - state.lastPoseRampAt;
+  state.lastPoseRampAt = now;
+  if (!state.poseRamp.settled) state.poseOffset = state.poseRamp.sample(rampDtMs);
   const pose = applyPoseOffset(track.pose, state.poseOffset);
+  // 可选缓慢自适应（默认关）：只在低运动 + 低表情变化时极慢地微调偏移
+  if (state.poseAdaptive.enabled) maybeAdaptOffset(track);
   const result = mapper.apply(track.bs ?? [], pose);
   // 上半身：解析 ub / ubOk / ubT / body；丢失 / 过期时按帧平滑回 0（不跳变）
   const body = updateBodyState(track, now);
@@ -929,19 +970,110 @@ function setCalibHint(text, tone = "muted") {
   ui.calibHint.dataset.tone = tone;
 }
 
-/** 把 offset 落到 state / localStorage / 归一化窗口，并刷新校准 UI。 */
-function applyPoseCalibration(offset, { persist = true, resetNormalizers = true } = {}) {
-  state.poseOffset = sanitizePoseOffset(offset);
+/** 把当前偏移写进「当前角色」的 profile store，并镜像一份到旧的全局 key（老客户端兼容）。 */
+function persistPoseProfile() {
+  state.poseProfiles = setProfileFor(
+    state.poseProfiles,
+    state.modelName,
+    offsetToProfile(state.poseOffsetTarget, state.poseRangeScale),
+  );
+  storeSet(POSE_PROFILE_STORAGE_KEY, encodePoseProfileStore(state.poseProfiles));
+  // 旧版全局 key 继续写「最后生效的偏移」：老版本客户端只认它也不受影响。
+  storeSet(POSE_OFFSET_STORAGE_KEY, encodePoseOffset(state.poseOffsetTarget));
+}
+
+/**
+ * 把 offset 落到 state / localStorage / 归一化窗口，并刷新校准 UI。
+ *
+ * 公式不变：最终角度 = track.pose + pcOffset（track.pose 已减手机基线，PC 端只叠加）。
+ *
+ * smooth=true 时经 OffsetRamp 限速过渡（手动重置 / 手机重做基线用，避免模型瞬移）；
+ * 默认 snap：立即生效（滑块 / __vfc.setPoseOffset，行为与旧版一致）。
+ */
+function applyPoseCalibration(offset, { persist = true, resetNormalizers = true, smooth = false } = {}) {
+  const target = sanitizePoseOffset(offset);
+  state.poseOffsetTarget = target;
+  state.poseOffset = state.poseRamp.setTarget(target, { snap: !smooth });
   // 旧的自适应量程是按旧零点观察到的：换零点后重来，否则前几秒模型会「不跟手」。
   if (resetNormalizers) mapper.reset();
-  if (persist) storeSet(POSE_OFFSET_STORAGE_KEY, encodePoseOffset(state.poseOffset));
+  // 手动 / 一键校准给出新锚点：缓慢自适应只允许在它 ±10° 内慢慢漂，不会无限跑飞。
+  state.poseAdaptive.setAnchor(target);
+  if (persist) persistPoseProfile();
   renderCalibUi();
   publishDebug();
-  return { ...state.poseOffset };
+  return { ...state.poseOffsetTarget };
+}
+
+/**
+ * 切换角色：加载该角色的 profile（三轴偏移 + 量程偏好）并立即生效。
+ * 每个角色各存各的 offset，切回时原样恢复（验收：不同角色保存不同 offset，切换后生效）。
+ */
+function activatePoseProfile(modelName) {
+  const key = profileKeyFor(modelName);
+  if (!state.poseProfiles.profiles[key]) {
+    // 迁移：该角色还没有 profile → 用旧全局偏移播种（升级前的行为延续给每个角色）。
+    const seeded = sanitizePoseProfile({
+      ...decodePoseOffset(storeGet(POSE_OFFSET_STORAGE_KEY)),
+      rangeScale: DEFAULT_POSE_PROFILE.rangeScale,
+    });
+    state.poseProfiles = setProfileFor(state.poseProfiles, modelName, seeded);
+  }
+  const profile = state.poseProfiles.profiles[key];
+  state.poseRangeScale = profile.rangeScale;
+  mapper.setRangeScale(profile.rangeScale); // 量程偏好：1 = 与现在完全一致
+  state.poseAdaptive.reset();
+  applyPoseCalibration(profileToOffset(profile), { persist: true, resetNormalizers: true, smooth: false });
+}
+
+/**
+ * 可选缓慢自适应（默认关闭）：低运动 + 低表情变化时极慢地把偏移朝「最终角度归零」挪。
+ * 说话 / 眨眼 / 摇头都会被 AdaptivePoseOffset 的门限挡掉，不污染 offset。
+ */
+function maybeAdaptOffset(track) {
+  const outcome = state.poseAdaptive.update(track, state.poseOffsetTarget);
+  if (!outcome.changed) return;
+  state.poseOffsetTarget = outcome.offset;
+  state.poseOffset = { ...outcome.offset };
+  state.poseRamp.setTarget(outcome.offset, { snap: true });
+  // 持久化节流：累计变化 ≥ 0.2° 或距上次保存 ≥ 5s 才写 localStorage（每帧都写会伤盘）。
+  const now = performance.now();
+  const last = state.lastAdaptiveSavedOffset;
+  const drift = last
+    ? Math.max(
+        Math.abs(outcome.offset.pitch - last.pitch),
+        Math.abs(outcome.offset.yaw - last.yaw),
+        Math.abs(outcome.offset.roll - last.roll),
+      )
+    : Infinity;
+  if (drift >= 0.2 || now - state.lastAdaptiveSavedAt >= 5000) {
+    persistPoseProfile();
+    state.lastAdaptiveSavedAt = now;
+    state.lastAdaptiveSavedOffset = { ...outcome.offset };
+  }
+  renderCalibUi();
+  publishDebug();
+}
+
+/** 开关缓慢自适应（默认关；只影响 PC 本地偏移，不改协议、不动手机端）。 */
+function setAdaptiveEnabled(enabled) {
+  state.poseAdaptive.enabled = Boolean(enabled);
+  state.adaptiveEnabled = state.poseAdaptive.enabled;
+  state.poseAdaptive.reset();
+  state.poseAdaptive.setAnchor(state.poseOffsetTarget);
+  storeSet(POSE_ADAPTIVE_STORAGE_KEY, state.poseAdaptive.enabled ? "1" : "0");
+  if (ui.tgPoseAdaptive) ui.tgPoseAdaptive.checked = state.poseAdaptive.enabled;
+  setCalibHint(
+    state.poseAdaptive.enabled
+      ? "已开启缓慢自适应：只在你安静不动、不说话时极慢微调偏移；想固定就关掉或点「清零」。"
+      : "已关闭缓慢自适应：偏移只由「一键校准 / 滑块 / 清零」决定。",
+    "muted",
+  );
+  publishDebug();
 }
 
 function renderCalibUi() {
-  const offset = state.poseOffset;
+  // 滑块 / 提示显示「目标偏移」（平滑过渡期间模型还在追，但 UI 已是新值）。
+  const offset = state.poseOffsetTarget;
   for (const axis of POSE_AXES) {
     const input = ui.calibSliders[axis];
     const label = ui.calibValues[axis];
@@ -1114,6 +1246,8 @@ async function loadModel(name) {
     state.modelName = target.name;
     storeSet(STORE_KEYS.model, target.name);
     debugState.model = target.name;
+    // 每个角色各存各的偏移 + 量程偏好：加载完模型就把该角色的 profile 装上（立即生效）。
+    activatePoseProfile(target.name);
     if (state.lastResult) stage.setTargetParams(state.lastResult.params);
     setStatus(state.connected ? (state.device ? `已连接 · ${state.device}` : "已连接") : "未连接", connPhase());
     publishDebug();
@@ -1335,25 +1469,26 @@ function wireUi() {
     input.max = String(45);
     input.step = "0.5";
     input.addEventListener("input", () => {
-      const next = { ...state.poseOffset, [axis]: Number(input.value) };
+      const next = { ...state.poseOffsetTarget, [axis]: Number(input.value) };
       applyPoseCalibration(next, { persist: false });
       setCalibHint(
-        `正在微调「${POSE_AXIS_LABELS[axis]}」${signedDeg(state.poseOffset[axis])}：拖到模型正对镜头，松手后自动保存。`,
+        `正在微调「${POSE_AXIS_LABELS[axis]}」${signedDeg(state.poseOffsetTarget[axis])}：拖到模型正对镜头，松手后自动保存。`,
         "muted",
       );
     });
     input.addEventListener("change", () => {
-      storeSet(POSE_OFFSET_STORAGE_KEY, encodePoseOffset(state.poseOffset));
+      persistPoseProfile();
       setCalibHint(
-        `已保存偏移 ${formatPoseOffset(state.poseOffset)}。换座位 / 重新架手机后点一次「一键校准」更省事。`,
+        `已保存偏移 ${formatPoseOffset(state.poseOffsetTarget)}（仅当前角色）。换座位 / 重新架手机后点一次「一键校准」更省事。`,
         "ok",
       );
     });
   }
 
   ui.btnCalibReset?.addEventListener("click", () => {
-    applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true });
-    setCalibHint("已清零：模型重新按手机端基线驱动。", "muted");
+    // 手动重置：目标清零但**限速过渡**（OffsetRamp），模型缓慢回正、不瞬移。
+    applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true, smooth: true });
+    setCalibHint("已清零（平滑过渡）：模型正缓慢回到手机端基线驱动。", "muted");
   });
 
   ui.btnHide.addEventListener("click", () => toggleUiHidden());

@@ -81,13 +81,14 @@ export const PARAM_IDS = Object.freeze([
   "ParamBodyAngleX",
 ]);
 
-/** createMapper 默认系数（协议 §8.2）。 */
+/** createMapper 默认系数（协议 §8.2）。rangeScale = 角色量程偏好，1 = 协议默认（行为不变）。 */
 export const DEFAULT_OPTIONS = Object.freeze({
   invertPitch: false,
   invertYaw: false,
   invertRoll: false,
   angleScale: 30,
   bodyScale: 10,
+  rangeScale: 1,
 });
 
 export function clamp(v, lo, hi) {
@@ -111,11 +112,29 @@ export class AdaptiveAngleNormalizer {
   constructor(defaultNegativeRange, defaultPositiveRange, minRange = 5, adaptationRate = 0.1) {
     this.defaultNeg = defaultNegativeRange;
     this.defaultPos = defaultPositiveRange;
+    /** 未缩放的基准量程（角色 profile 的量程偏好只乘在基准上，1 = 与协议默认一致）。 */
+    this.baseNeg = defaultNegativeRange;
+    this.basePos = defaultPositiveRange;
+    /** 当前量程偏好倍率（0.5~2，1 = 不缩放）。 */
+    this.scale = 1;
     this.minRange = minRange;
     this.rate = adaptationRate;
     this._pctNeg = 0;
     this._pctPos = 0;
     this._samples = 0;
+  }
+
+  /**
+   * 应用「量程偏好」（角色 profile 的 rangeScale）：整体缩放默认量程，
+   * 不改变符号约定与自适应逻辑。scale=1 时与协议默认完全一致。
+   */
+  setScale(scale) {
+    const s = Number(scale);
+    const clamped = Number.isFinite(s) ? Math.max(0.5, Math.min(2, s)) : 1;
+    this.scale = clamped;
+    this.defaultNeg = this.baseNeg * clamped;
+    this.defaultPos = this.basePos * clamped;
+    return clamped;
   }
 
   /** 已观测帧数（只读）。 */
@@ -169,25 +188,36 @@ export class AdaptiveAngleNormalizer {
   }
 }
 
-/** 协议 §8.2：低头 ~20°、抬头 ~40°。 */
-export function createPitchNormalizer() {
-  return new AdaptiveAngleNormalizer(20, 40, 10);
+/** 协议 §8.2：低头 ~20°、抬头 ~40°。rangeScale = 角色量程偏好（可选，1 = 默认）。 */
+export function createPitchNormalizer(rangeScale = 1) {
+  return withScale(new AdaptiveAngleNormalizer(20, 40, 10), rangeScale);
 }
 /** 协议 §8.2：左右各 45°。 */
-export function createYawNormalizer() {
-  return new AdaptiveAngleNormalizer(45, 45, 15);
+export function createYawNormalizer(rangeScale = 1) {
+  return withScale(new AdaptiveAngleNormalizer(45, 45, 15), rangeScale);
 }
 /** 协议 §8.2：左右各 30°。 */
-export function createRollNormalizer() {
-  return new AdaptiveAngleNormalizer(30, 30, 10);
+export function createRollNormalizer(rangeScale = 1) {
+  return withScale(new AdaptiveAngleNormalizer(30, 30, 10), rangeScale);
+}
+
+/** 工厂内部：建好归一化器后套用量程偏好（scale=1 时与协议默认完全一致）。 */
+function withScale(normalizer, rangeScale) {
+  normalizer.setScale(rangeScale);
+  return normalizer;
 }
 
 /**
  * 三个归一化器（pitch / yaw / roll）。
+ * @param {number} [rangeScale=1] 角色量程偏好（0.5~2，1 = 协议默认量程，行为不变）
  * @returns {{pitch:AdaptiveAngleNormalizer,yaw:AdaptiveAngleNormalizer,roll:AdaptiveAngleNormalizer}}
  */
-export function createNormalizers() {
-  return { pitch: createPitchNormalizer(), yaw: createYawNormalizer(), roll: createRollNormalizer() };
+export function createNormalizers(rangeScale = 1) {
+  return {
+    pitch: createPitchNormalizer(rangeScale),
+    yaw: createYawNormalizer(rangeScale),
+    roll: createRollNormalizer(rangeScale),
+  };
 }
 
 /** 把 bs 补齐成 52 项有限数字，坏数据不抛异常（渲染路径不能崩）。 */
@@ -284,7 +314,7 @@ function emptyResult() {
  */
 export function createMapper(opts = {}) {
   const o = { ...DEFAULT_OPTIONS, ...opts };
-  const norms = createNormalizers();
+  const norms = createNormalizers(o.rangeScale);
 
   const mapper = {
     options: o,
@@ -304,6 +334,17 @@ export function createMapper(opts = {}) {
       norms.pitch.reset();
       norms.yaw.reset();
       norms.roll.reset();
+    },
+    /**
+     * 切换角色时套用该角色的量程偏好（profile.rangeScale，0.5~2，1 = 默认）。
+     * 只缩放默认量程，不动符号约定与自适应逻辑；随后 reset() 归一化窗口。
+     */
+    setRangeScale(scale) {
+      o.rangeScale = norms.pitch.setScale(scale);
+      norms.yaw.setScale(o.rangeScale);
+      norms.roll.setScale(o.rangeScale);
+      mapper.reset();
+      return o.rangeScale;
     },
     /**
      * @param {ArrayLike<number>} bs 52 项权重
