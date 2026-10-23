@@ -296,7 +296,9 @@ object VfcLog {
     }
 
     fun e(tag: String, t: Throwable) {
-        AndroidLog.e(tag, t)
+        // android.util.Log 没有 e(String, Throwable) 重载（w/wtf 有，e 没有），
+        // 用空消息 + Throwable 的三参重载等价实现。
+        AndroidLog.e(tag, "", t)
         append('E', tag, "", t)
     }
 
