@@ -35,10 +35,13 @@ Camera2 (YUV_420_888, 主/后/外接)
 app: UpperBodyPoseController                 ← 生命周期 / 开关 / 基线 / 统计
    │  ① FaceBox → FaceRoiHint（score < 0.3 或非法 → null）
    │  ② MediaPipeUpperBody.UpperBodyPoseDetector#pushFrame(frame, faceHint)
+   │     相机线程只把 Y/U/V 按 stride 拷进池化 DirectByteBuffer（0.15~0.4ms）→ 立即返回
    ▼
 :MediapipeUpperBody  UpperBodyPoseDetector   ← PoseLandmarker(LIVE_STREAM), GPU 优先、失败回退 CPU
-   │  ③ 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI → ARGB Bitmap（长边上限 320）
-   │     无脸框 / 脸太小 / ROI 太小 → 整帧 320p；ROI miss → 1s 整帧回退
+   │  ③ upper-body-worker 线程（YuvFrameRing：3 槽池化缓冲、**只保留最新帧**，慢了丢旧帧）：
+   │     脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI → ARGB Bitmap（长边 256/320 自适应）
+   │     无脸框 / 脸太小 / ROI 太小 → 整帧；ROI miss → 1s 整帧回退
+   │     输入长边：正常 256（优先帧率），质量下降 / 脸框变小 / ROI miss → 320（优先精度）
    │  ④ 33 点先回映整帧预览坐标 → 取 13 点 → One-Euro 平滑 → 相对基线 (roll/yaw)
    │     （upperBodyPostV1 协商成功时 ④ 只到「取 13 点」，平滑/基线在 PC，见 §3.7）
    ▼
@@ -69,6 +72,9 @@ UpperBodyPoseFrame (CommonData)
 ```kotlin
 package com.example.mediapipeupperbody
 
+/** 输入长边档位（顶层枚举）：PRECISION = 固定 320、FRAME_RATE = 固定 256、ADAPTIVE = 自适应（默认）。 */
+enum class InputSizeMode { PRECISION, FRAME_RATE, ADAPTIVE }
+
 class UpperBodyPoseDetector(context: Context) {
     enum class Backend { GPU, CPU }
     enum class ModelVariant { LITE, FULL }
@@ -84,10 +90,13 @@ class UpperBodyPoseDetector(context: Context) {
     fun stop()
     fun release()
     fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null)
-                                                       // 相机线程同步调用：ROI 裁切 + 转换，之后异步推理
+                                                       // 相机线程只拷贝平面入「只保留最新」环形缓冲；
+                                                       // ROI 裁切 + 转换 + detectAsync 在 upper-body-worker 线程
     fun resetBaseline()
     fun setMinConfidences(detection: Float, presence: Float, tracking: Float)
     fun setTargetFps(fps: Int)
+    var inputSizeMode: InputSizeMode            // A/B：PRECISION(320) / FRAME_RATE(256)；ADAPTIVE(默认)
+    fun isInputSizeBoosted(): Boolean          // 当前是否升档 320（调试 / A/B 统计）
     fun getStats(): Stats
 
     companion object {
@@ -117,12 +126,21 @@ class Yuv420Frame(
 
 行为要求：
 
-1. **输入图**：按 `rotationDegrees` 旋转、`mirrorHorizontal` 镜像，输出长边**上限 320**
-   （保持长宽比，只缩不放；ROI 本身小于 320 时不放大）
+1. **输入图**：按 `rotationDegrees` 旋转、`mirrorHorizontal` 镜像，输出长边**上限 256 / 320**
+   （保持长宽比，只缩不放；ROI 本身小于长边上限时不放大）
    的 ARGB_8888 Bitmap 喂给 `PoseLandmarker`。`faceHint` 有效时只采样「脸框 → 上半身 ROI」
    （`UpperBodyRoi.fromFace`：bodyW=faceW×4.5、bodyH=faceH×5.5，顶部留 0.35×脸高）；
-   faceHint 为空 / 非法 / 脸太小 / ROI <48px 时整帧 320p。返回的归一化坐标是 **ROI 局部**
+   faceHint 为空 / 非法 / 脸太小 / ROI <48px 时整帧。返回的归一化坐标是 **ROI 局部**
    坐标，必须先 `UpperBodyRoi.mapLocalToPreview` 回映到整帧预览坐标，再做 13 点提取。
+   **输入长边自适应**（`InputSizeMode.ADAPTIVE`，默认，状态机见 `InputSizePolicy`）：
+   正常跟踪用 256 保帧率（像素量是 320 的 64%）；关键点质量下降（13 点平均可见度 < 0.5）、
+   脸框变小（归一化面积 < 0.01，人变远）或 ROI miss 时**立刻**升 320 保精度；只有**连续 6 帧**
+   平均可见度 ≥ 0.7 才回落 256，中间带 [0.5, 0.7) 保持现状，避免 256/320 来回抖。
+   A/B 验证时用 `inputSizeMode = InputSizeMode.PRECISION`（320 优先精度组）或
+   `InputSizeMode.FRAME_RATE`（256 优先帧率组）钉死档位，对照
+   `isInputSizeBoosted()` / `getStats().avgLatencyMs` 观察帧率与关键点稳定性。
+   只改输入预处理尺寸、**不改模型**，三种档位的坐标回映与协议语义完全一致；
+   远距离、坐姿、快速转身三类场景的关键点稳定性仍需真机 A/B 验证后再定默认策略。
 2. **镜像**：只镜像像素，不改 MediaPipe 的左右语义（左手仍是 `LEFT_WRIST`）。
 3. **推理**：`LIVE_STREAM` + `detectAsync`，时间戳单调递增（`System.nanoTime()/1_000_000`，
    重复时 +1）；同一时刻只允许一个在飞的 `detectAsync`，来帧过快就丢弃（计入 `dropped`）。
@@ -141,7 +159,10 @@ class Yuv420Frame(
    ⚠️ **upperBodyPostV1 协商成功时本条整体跳过**（平滑 / 躯干角 / 基线迁到 PC，见 §3.7）；
    未协商时保持本条不变。
 7. **线程**：`pushFrame` 应在相机线程 / tap 回调里调用（ByteBuffer 只在回调内有效；内部
-   立即完成 ROI 采样与 Bitmap 构造）；`onResult` 在 MediaPipe 回调线程；内部状态用锁保护。
+   在返回前只把 Y/U/V 按 stride 拷进池化 DirectByteBuffer，典型 0.15~0.4ms）；ROI 采样、
+   Bitmap 构造与 detectAsync 提交都在模块内部的 `upper-body-worker` 线程做，队列
+   （`YuvFrameRing`，3 槽）**只保留最新帧**：上一帧没被消费就直接顶掉（计入 `dropped`），
+   绝不排队放大延迟；`onResult` 在 MediaPipe 回调线程；内部状态用锁保护。
    ROI 帧没跟踪到上半身时，接下来 **1000ms** 一律整帧再试（避免 ROI/整帧逐帧交替），
    ROI 帧成功会清掉残留窗口。
 8. **不许**在模块里引 `androidx.compose` / App 类 / MediapipeFaceLandmark（模块只依赖

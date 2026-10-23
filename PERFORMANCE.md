@@ -438,7 +438,7 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 
 - 相机线程：每 66 ms 多 1~4 ms 的 YUV→Bitmap 转换（约 6% 预算）；面捕 channel 仍然先喂。
 - 推理：15 fps Pose 推理与面捕的 face landmarker 并行；GPU 满载时才回退 CPU（帧率会掉到 5~10）。
-- 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 Bitmap（本轮起长边上限 320，约 300–400 KB，交给 GC）。
+- 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 Bitmap（本轮起长边上限 320，约 300–400 KB（256 档约 200–260 KB；256/320 自适应见 InputSizePolicy），交给 GC）。
 - 关掉时：tap 为 null，没有 Bitmap、没有额外推理，面捕路径与之前完全一致。
 
 ### 验证日志

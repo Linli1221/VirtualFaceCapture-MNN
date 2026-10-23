@@ -7,8 +7,9 @@ import java.nio.ByteBuffer
  *
  * **ByteBuffer 只在相机回调期间有效**，所以 app 侧必须在 `onYuvFrameForBodyWithHint`
  * （或旧 `onYuvFrameForBody`）回调里
- * 同步调用 [UpperBodyPoseDetector.pushFrame]；本模块会在 pushFrame 内立即把像素
- * 采样 / 旋转 / 缩放成 Bitmap，不会保留这些 ByteBuffer。
+ * 同步调用 [UpperBodyPoseDetector.pushFrame]；pushFrame 在返回前把 Y/U/V 按 stride
+ * 拷进池化 DirectByteBuffer（[YuvFrameRing]），不会保留这些 ByteBuffer —— ROI 采样 /
+ * 旋转 / 缩放成 Bitmap 在 `upper-body-worker` 线程做。
  *
  * 三个平面都允许带 row stride（相机常见：Y 行宽 > 图宽；UV 交错时
  * uvPixelStride = 2、uvRowStride = 图宽，平面模式时 uvPixelStride = 1）。
@@ -66,7 +67,10 @@ class Yuv420Frame(
     }
 
     companion object {
-        /** [targetSize] 的默认长边（256，只缩不放）。检测器实际用 320（见 UpperBodyPoseDetector）。 */
+        /**
+         * [targetSize] 的默认长边（256，只缩不放）。检测器实际按 [InputSizePolicy]
+         * 在 256 / 320 之间自适应选长边（见 [InputSizeMode]）。
+         */
         const val DEFAULT_MAX_LONG_SIDE = 256
     }
 }

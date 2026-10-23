@@ -6,6 +6,7 @@ import com.example.commondata.UpperBodyPoseFrame
 import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.YuvFrameData
 import com.example.mediapipeupperbody.FaceRoiHint
+import com.example.mediapipeupperbody.InputSizeMode
 import com.example.mediapipeupperbody.UpperBodyPoseDetector
 import com.example.mediapipeupperbody.Yuv420Frame
 import java.util.concurrent.atomic.AtomicLong
@@ -18,13 +19,17 @@ import java.util.concurrent.atomic.AtomicLong
  *  - 把相机线程上的 [YuvFrameData] 转成模块认识的 [Yuv420Frame]（**不拷贝像素**，
  *    ByteBuffer 直接透传，因为检测器要求在相机回调里同步转换，见 §3.2）；
  *  - **ROI 引导**：用同一帧的脸框（[MediaPipeFaceDetector.FaceBox]）生成 [FaceRoiHint]，
- *    检测器据此裁出上半身 ROI → 只缩放这块到 320p 再推理；没有可信脸框时回退整帧 320p；
+ *    检测器据此裁出上半身 ROI → 只缩放这块再推理；没有可信脸框时回退整帧；
+ *    输入长边 256/320 自适应（正常 256，质量下降 / 脸框变小 / ROI miss 升 320，
+ *    见 [UpperBodyPoseDetector.inputSizeMode]）；
  *  - 把结果的 [UpperBodyPoseFrame] 分发给 UI（预览骨架 / HUD）和网络（由 MainActivity 接线，
  *    本类**不依赖** tracking 包）。
  *
  * 线程模型：
  *  - [pushYuvFrame] 由**相机线程**同步调用，只做「判活 + 转对象 + 交给检测器」，不阻塞、不抛异常；
- *    ByteBuffer 只在相机回调期间有效，检测器在返回前就同步消费完（含 ROI 采样），不会跨线程持有；
+ *    ByteBuffer 只在相机回调期间有效，检测器在返回前只做一次平面拷贝（0.15~0.4ms）就入
+ *    「只保留最新」的环形缓冲，不会跨线程持有这些 ByteBuffer；ROI 采样 / YUV→Bitmap /
+ *    detectAsync 全部在检测器的 `upper-body-worker` 线程，不再占相机帧预算；
  *  - [onFrame] / [onOverlay] 在 MediaPipe 回调线程触发（§3.2 第 7 条），上层自己切线程 / 节流；
  *  - [initialize] / [start] / [stop] / [release] 内部有锁，主线程可以直接调；但 initialize
  *    要加载模型（几百毫秒），建议放到后台线程（MainActivity 就是这么做的）。
@@ -49,10 +54,10 @@ class UpperBodyPoseController(private val context: Context) {
         private const val FETCH_MODEL_HINT = "请运行 tools/fetch-pose-model.ps1"
 
         /**
-         * 脸框分数的下限：低于它就当「这一帧没有可信的脸」处理（整帧 320p）。
+         * 脸框分数的下限：低于它就当「这一帧没有可信的脸」处理（整帧推理）。
          *
          * 太小的框会把 ROI 带到画面边缘，反而让 MediaPipe 看不到完整的上半身；
-         * 整帧 320p 是安全兜底（关键点会小一点，但至少有结果）。
+         * 整帧是安全兜底（关键点会小一点，但至少有结果）。
          */
         private const val MIN_FACE_SCORE = 0.3f
     }
@@ -302,14 +307,27 @@ class UpperBodyPoseController(private val context: Context) {
         Log.i(TAG, "上半身输出模式: " + (if (enabled) "raw（原始点 + 原始躯干角，后处理在 PC）" else "M1 旧链（平滑 + 基线）"))
     }
 
+    /**
+     * 输入长边档位（A/B 与自适应策略，见 [UpperBodyPoseDetector.inputSizeMode]）。
+     *
+     * A/B：[InputSizeMode.PRECISION] = 固定 320（优先精度）、[InputSizeMode.FRAME_RATE] =
+     * 固定 256（优先帧率）；[InputSizeMode.ADAPTIVE]（默认）= 正常 256，质量下降 / 脸框变小 /
+     * ROI miss 时临时 320。只改输入预处理尺寸，不改模型。
+     */
+    fun setInputSizeMode(mode: InputSizeMode) {
+        detector.inputSizeMode = mode
+        Log.i(TAG, "上半身输入长边档位: $mode")
+    }
+
     // ========================================================================
     // 数据入口
     // ========================================================================
 
     /**
-     * 把相机线程上的 YUV 帧喂给检测器（**不带脸框**：整帧 320p 推理）。
+     * 把相机线程上的 YUV 帧喂给检测器（**不带脸框**：整帧推理）。
      *
-     * 保留旧签名给「没有脸框可用」的调用方：行为等价于改造前的整帧推理，只是长边从 256 变成 320。
+     * 保留旧签名给「没有脸框可用」的调用方：行为等价于改造前的整帧推理，
+     * 输入长边由 [UpperBodyPoseDetector.inputSizeMode] 决定（默认 256/320 自适应）。
      */
     fun pushYuvFrame(frame: YuvFrameData) {
         pushYuvFrame(frame, null)
@@ -319,9 +337,10 @@ class UpperBodyPoseController(private val context: Context) {
      * 把相机线程上的 YUV 帧 + 同一帧的脸框喂给检测器（**ROI 引导**）。
      *
      * **只能在 [com.facecapture.sdk.PipelineFaceTracker.onYuvFrameForBodyWithHint]
-     * （或旧 onYuvFrameForBody）回调里同步调用**：
-     * 检测器会在这里立刻按「脸框 → 上半身 ROI」裁切、旋转、镜像、缩放到长边上限 320
-     *（只缩不放）的 ARGB Bitmap（像素不能跨线程存活），之后异步推理。
+     * （或旧 onYuvFrameForBody）回调里同步调用**：像素不能跨线程存活，检测器必须在回调内
+     * 把 Y/U/V 按 stride 拷进池化 DirectByteBuffer（0.15~0.4ms）——之后按「脸框 → 上半身
+     * ROI」裁切、旋转、镜像、缩放到当前输入长边（256/320 自适应，只缩不放）的 ARGB Bitmap
+     * 都在 `upper-body-worker` 线程做（只消费最新帧，慢了丢旧帧），随后异步推理。
      * 本方法不抛异常，任何失败只记日志并计入统计。
      *
      * @param faceBox 面捕那一帧的脸框（旋转后、未镜像的归一化坐标，与 FaceBox 的既有约定一致）；
@@ -361,7 +380,7 @@ class UpperBodyPoseController(private val context: Context) {
     /**
      * [MediaPipeFaceDetector.FaceBox] → [FaceRoiHint]。
      *
-     * 分数过低（< [MIN_FACE_SCORE]）或坐标非法时返回 null：宁可整帧 320p 慢一点，
+     * 分数过低（< [MIN_FACE_SCORE]）或坐标非法时返回 null：宁可整帧慢一点，
      * 也不要让一个不可信的脸框把 ROI 带到画面外（那会让 MediaPipe 直接看不到上半身）。
      */
     private fun faceRoiHintOf(faceBox: MediaPipeFaceDetector.FaceBox?): FaceRoiHint? {

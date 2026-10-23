@@ -10,7 +10,7 @@ Camera2 YUV_420_888（app 侧 15fps 抽帧）+ 同一帧脸框
    ▼
 UpperBodyPoseDetector
    │  ① 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）；无脸框/太小 → 整帧
-   │  ② 只采样 ROI：旋转 + 镜像 + 缩放到长边上限 320（只缩不放）→ ARGB Bitmap（约 1~4ms）
+   │  ② 只采样 ROI：旋转 + 镜像 + 缩放到长边上限（256/320 自适应，只缩不放）→ ARGB Bitmap（约 1~4ms）
    │  ③ PoseLandmarker.detectAsync(mpImage, ts)   ← 单飞，忙时丢帧
    │  ④ MediaPipe 回调线程：33 点回映整帧 → 13 点 → One-Euro → 相对基线躯干角
    ▼
@@ -116,6 +116,7 @@ if (detector.isModelAvailable()) {
         )
     ) {
         detector.setTargetFps(15)          // 默认就是 15
+detector.inputSizeMode = InputSizeMode.ADAPTIVE   // A/B：PRECISION(固定320) / FRAME_RATE(固定256)
         detector.start()
     }
 }
@@ -164,6 +165,8 @@ class UpperBodyPoseDetector(context: Context) {
     fun resetBaseline()
     fun setMinConfidences(detection: Float, presence: Float, tracking: Float)
     fun setTargetFps(fps: Int)
+    var inputSizeMode: InputSizeMode              // PRECISION(320) / FRAME_RATE(256) / ADAPTIVE(默认)
+    fun isInputSizeBoosted(): Boolean            // 当前是否升档 320（调试 / A/B 统计）
     fun getStats(): Stats
     fun setBackend(backend: Backend): Boolean        // 契约外补充：运行时重建
 
@@ -296,7 +299,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 ## 7. 性能与已知限制
 
-- **默认参数**：长边上限 320（ROI 引导，只缩不放）、15fps、lite 模型；1080p 相机上转换约 1~4ms/帧。
+- **默认参数**：长边 256/320 自适应（InputSizeMode.ADAPTIVE：正常 256，质量下降 / 脸框变小 / ROI miss 升 320，恢复后回落；A/B 可钉 PRECISION = 固定 320 / FRAME_RATE = 固定 256；ROI 引导，只缩不放）、15fps、lite 模型；1080p 相机上转换约 1~4ms/帧。
   实际推理耗时用 `getStats().avgLatencyMs` 观察；中端机 GPU 通常 6~15ms。
 - 未放模型时功能自动降级（`isModelAvailable()=false`），不影响面捕主链路。
 - assets 模型默认按 asset 相对路径加载（`noCompress` 已配置）；只有该路径在当前

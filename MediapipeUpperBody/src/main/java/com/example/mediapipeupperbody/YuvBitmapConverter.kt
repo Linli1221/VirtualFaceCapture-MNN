@@ -7,7 +7,7 @@ import android.graphics.Bitmap
  *
  * 性能策略（docs/upper-body.md §2 ①）：
  *  - **不做整帧转换**：直接按输出像素反查源坐标（最近邻采样），输出长边上限 320 时
- *    一个 1080p 竖屏帧只要采样约 180×320 ≈ 5.8 万像素；带 ROI 时只采样 ROI
+ *    一个 1080p 竖屏帧只要采样约 180×320 ≈ 5.8 万像素（256 档再省 36%）；带 ROI 时只采样 ROI
  *    （典型 10 万像素上下），实测量级在 1~4ms；
  *  - **ROI 裁切**：传入 [RoiWindow] 时只采样窗口内的旋转后像素，输出仍是「预览方向」
  *    （镜像在 ROI 内部翻转）。roi = null / 全帧 / 非法时与旧版逐位一致；
@@ -15,7 +15,8 @@ import android.graphics.Bitmap
  *    回调返回，不能复用同一张 Bitmap）；
  *  - 旋转 / 镜像映射全部来自纯 Kotlin 的 [YuvGeometry]，方便单测。
  *
- * 线程：由 [UpperBodyPoseDetector.pushFrame] 在调用线程同步执行（相机线程）；
+ * 线程：由 [UpperBodyPoseDetector.processFrame] 在 `upper-body-worker` 线程执行
+ * （相机线程只把平面拷进 [YuvFrameRing]，不再做像素转换）；
  * [convert] 加了锁，多线程误调也不会踩到复用数组。
  */
 internal class YuvBitmapConverter {

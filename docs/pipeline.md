@@ -68,8 +68,8 @@ Camera2 ImageReader  (YUV_420_888 · 1280×720 · 60fps 目标)
             │  带同帧脸框（一级扩充 1.15×，TTL 500ms）；duplicate() 不拷像素
             ▼
         UpperBodyPoseDetector
-            │  ① 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI 到 320p
-            │     （同步；无脸框 / ROI 太小时整帧 320p）
+            │  ① 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI（长边 256/320 自适应）
+            │     （同步；无脸框 / ROI 太小时整帧；质量下降 / 脸框变小 / ROI miss 时升 320）
             │  ② PoseLandmarker.detectAsync（异步）
             │  ③ 33 点回映整帧 → 13 点 → One-Euro → 躯干角 → 减基线
             ▼
@@ -570,7 +570,7 @@ if (bodyTapWithHint != null || bodyTapLegacy != null) {
                 // 第二参数 = 最近脸框（一级扩充 1.15×），超过 500ms 没刷新则 null
                 bodyTapWithHint(yuvData, currentFaceBoxHint(nowMs))
             } else {
-                bodyTapLegacy?.invoke(yuvData)  // 旧接口，整帧 320p
+                bodyTapLegacy?.invoke(yuvData)  // 旧接口，整帧（长边 256/320 自适应）
             }
         } catch (t: Throwable) { ... }
     }
@@ -593,8 +593,9 @@ MediaPipe 需要 `Bitmap`，而 `Bitmap` 必须当场构造——**YUV 的 ByteB
 
 1. **脸框 → 上半身 ROI**（`UpperBodyRoi.fromFace`）：bodyW = faceW×4.5、bodyH = faceH×5.5，
    水平以脸中心为中心、顶部留 0.35×脸高；没有可信脸框 / 脸太小 / ROI <48px 时用整帧。
-2. **只采样 ROI**（最近邻反查源坐标）并缩放到**长边上限 320**（只缩不放）。整帧 720p→320p 也只采约
-   5.8 万像素；带 ROI 时输出 10 万像素上下，15fps 下约 1~4ms，仍在相机线程预算内。
+2. **只采样 ROI**（最近邻反查源坐标）并缩放到**当前输入长边**（256/320 自适应、只缩不放，
+   状态机见 `InputSizePolicy`）。整帧 720p→320p 也只采约 5.8 万像素（256 档再省 36%）；
+   带 ROI 时输出 10 万像素上下，15fps 下约 1~4ms，仍在相机线程预算内。
 
 结果点先在 ROI 局部坐标，**回映到整帧预览坐标之后**再做 13 点提取 / 躯干角 / 平滑，
 所以协议 `ub[]` 的语义与改造前完全一致。

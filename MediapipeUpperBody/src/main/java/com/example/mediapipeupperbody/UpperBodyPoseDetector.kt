@@ -23,10 +23,12 @@ import kotlin.math.max
  * 数据流（docs/upper-body.md §2 / §3.2）：
  * ```
  * 相机 YUV_420_888 + 同一帧的脸框
- *   → pushFrame(frame, faceHint)（相机线程）
- *   → UpperBodyRoi.fromFace：脸框 → 上半身 ROI（旋转后源像素）
- *   → 只裁 ROI + 旋转 + 镜像 + 采样缩放到长边上限 320（只缩不放）的 ARGB Bitmap
- *   → detectAsync()（异步，同一时刻最多一个在飞）
+ *   → pushFrame(frame, faceHint)（相机线程：只把 Y/U/V 按 stride 拷进池化
+ *     DirectByteBuffer，发布到「只保留最新」的 [YuvFrameRing]，立即返回）
+ *   → upper-body-worker 线程：取最新帧
+ *     → UpperBodyRoi.fromFace：脸框 → 上半身 ROI（旋转后源像素）
+ *     → 只裁 ROI + 旋转 + 镜像 + 采样缩放到当前输入长边（256 / 320 自适应，只缩不放）的 ARGB Bitmap
+ *     → detectAsync()（异步，同一时刻最多一个在飞）
  *   → MediaPipe 回调线程：33 点 → mapLocalToPreview 回映到整帧 → 13 点
  *     → One-Euro 平滑 → 相对基线躯干角（[rawOutput] = true 时跳过平滑 / 基线，产出原始点）
  *   → onResult(UpperBodyPoseFrame)
@@ -34,11 +36,17 @@ import kotlin.math.max
  *
  * ROI 引导的要点：
  *  - 整帧 256 换成了「ROI 裁切 → 320p」，同样长边下上半身占的像素多 4~5 倍；
+ *  - 输入长边自适应（[InputSizeMode.ADAPTIVE]）：正常跟踪用 256 保帧率，关键点质量下降 /
+ *    脸框变小 / ROI miss 时临时升 320 保精度，连续若干帧质量恢复再回落（[InputSizePolicy]）；
  *  - 协议 ub[] 的语义不变：结果点回映到**整帧预览坐标**后再做 13 点提取 / 躯干角 / 平滑，
  *    所以 ROI 随脸移动时坐标不会跳；
  *  - ROI 只在「这一帧确实要送去推理」时计算（限帧 / 单飞丢掉的帧不做几何运算）；
  *  - ROI 帧没跟踪到上半身时回退整帧 [ROI_FALLBACK_MS] 再试，避免脸框偏了以后每帧空转；
  *  - 没有脸框（旧调用 / 面捕丢失）时与改造前一样按整帧推理。
+ *
+ * 线程模型：相机回调里只做一次平面拷贝（典型 0.15~0.4ms）就返回；ROI 计算、
+ * YUV→Bitmap（1~4ms）与 detectAsync 提交全部在 `upper-body-worker` 线程
+ * （[YuvFrameRing] 只保留最新帧：慢了就丢旧帧，绝不排队放大延迟）。
  *
  * 使用方式：
  * ```
@@ -48,7 +56,7 @@ import kotlin.math.max
  * if (!detector.isModelAvailable() || !detector.initialize()) return  // 只关功能，不崩
  * detector.start()
  * // 相机回调里：
- * detector.pushFrame(yuv420Frame)               // 整帧 320p
+ * detector.pushFrame(yuv420Frame)               // 整帧（长边按 [inputSizeMode] 自适应）
  * detector.pushFrame(yuv420Frame, faceRoiHint)  // ROI 引导（推荐）
  * // 退出：
  * detector.release()
@@ -69,7 +77,7 @@ class UpperBodyPoseDetector(context: Context) {
      *
      * @param framesIn 进入 pushFrame 且检测器处于 ready+started 的帧数
      * @param framesOut 真正产出（含 tracking=false 的空帧）的回调次数
-     * @param dropped 因限帧 / 上一帧仍在推理 / 转换失败而被丢弃的帧数
+     * @param dropped 因限帧 / 上一帧仍在推理 / 转换失败 / 被更新的帧顶掉而被丢弃的帧数
      * @param avgLatencyMs detectAsync 提交到结果回调的指数滑动平均耗时
      */
     data class Stats(
@@ -95,6 +103,21 @@ class UpperBodyPoseDetector(context: Context) {
     private val stateLock = Any()
     private val pipelineLock = Any()
     private val converter = YuvBitmapConverter()
+
+    /** 相机帧环形缓冲：只保留最新帧。相机线程只拷贝入队，upper-body-worker 线程消费。 */
+    private val frameRing = YuvFrameRing { stats.markDropped() }
+
+    /** 保护 workerThread 的创建 / 销毁。 */
+    private val workerLock = Any()
+
+    @Volatile
+    private var workerThread: Thread? = null
+
+    /** worker 线程的循环条件（false = 退出）。 */
+    @Volatile
+    private var workerRunning = false
+
+    private val inputSizePolicy = InputSizePolicy()
     private val inFlight = AtomicBoolean(false)
     private val stats = StatsCounter()
     private val smoother = UpperBodySmoother()
@@ -144,7 +167,7 @@ class UpperBodyPoseDetector(context: Context) {
      * 本帧提交时用的 ROI / 镜像 / 整帧尺寸。
      *
      * 单飞（[inFlight]）保证同一时刻只有一个在飞，所以这三组值一定属于「当前那一帧」；
-     * 回调线程在放行单飞标记**之前**取局部快照，之后相机线程才会覆盖它们。
+     * 回调线程在放行单飞标记**之前**取局部快照，之后 upper-body-worker 线程才会覆盖它们。
      */
     @Volatile
     private var pendingRoi: RoiWindow? = null
@@ -162,13 +185,17 @@ class UpperBodyPoseDetector(context: Context) {
     @Volatile
     private var fallbackUntilMs: Long = 0L
 
-    /** 首次 ROI 命中只打一条日志（相机线程写）。 */
+    /** 首次 ROI 命中只打一条日志（worker 线程写）。 */
     @Volatile
     private var roiHitLogged: Boolean = false
 
     /** 首次 ROI 回退只打一条日志（回调线程写）。 */
     @Volatile
     private var roiFallbackLogged: Boolean = false
+
+    /** 输入长边升降档只在切换时打一条日志（worker 线程 / MediaPipe 回调线程都可能触发）。 */
+    @Volatile
+    private var inputSizeBoostedLogged: Boolean = false
 
     /** 保活：MediaPipe 异步推理期间 Bitmap 必须一直可达。 */
     @Volatile
@@ -293,6 +320,7 @@ class UpperBodyPoseDetector(context: Context) {
         }
         pendingFrameTimestampMs = 0L
         pendingSubmitNanos = 0L
+        inputSizePolicy.reset()
         postErrors(messages)
         return success
     }
@@ -306,6 +334,10 @@ class UpperBodyPoseDetector(context: Context) {
         lastSubmitMs = 0L
         // 每次 start 都是新的采集会话：清掉上一轮可能残留的 ROI 回退窗口。
         fallbackUntilMs = 0L
+        inputSizePolicy.reset()
+        // release() 会关掉环形缓冲与 worker，这里重开（并确保 worker 活着）
+        frameRing.reset()
+        ensureWorker()
         started = true
     }
 
@@ -313,6 +345,8 @@ class UpperBodyPoseDetector(context: Context) {
     fun stop() {
         started = false
         lastSubmitMs = 0L
+        // 已入队但还没消费的帧直接丢掉：stop 之后不再产出结果
+        frameRing.drain()
     }
 
     /** 关闭 landmarker 并释放资源；之后可再次 [initialize] 复用本对象。 */
@@ -333,6 +367,9 @@ class UpperBodyPoseDetector(context: Context) {
         fallbackUntilMs = 0L
         roiHitLogged = false
         roiFallbackLogged = false
+        inputSizePolicy.reset()
+        inputSizeBoostedLogged = false
+        shutdownWorker()
         runCatching { old?.close() }
         synchronized(pipelineLock) {
             smoother.reset()
@@ -410,28 +447,81 @@ class UpperBodyPoseDetector(context: Context) {
         lastSubmitMs = 0L
     }
 
+    /**
+     * 输入长边档位（A/B 与自适应策略，见 [InputSizeMode]）。
+     *
+     *  - [InputSizeMode.PRECISION]：固定 320 —— 优先精度（A/B 的「320」组）；
+     *  - [InputSizeMode.FRAME_RATE]：固定 256 —— 优先帧率（A/B 的「256」组）；
+     *  - [InputSizeMode.ADAPTIVE]（默认）：正常跟踪用 256，关键点质量下降 / 脸框变小 /
+     *    ROI miss 时临时升 320，连续若干帧质量恢复再回落。
+     *
+     * 只改输入预处理尺寸，**不改模型**；协议输出 / 坐标语义三种档位完全一致。
+     * 切换档位会清空升降档状态（不继承上一档的连击）。
+     */
+    var inputSizeMode: InputSizeMode
+        get() = inputSizePolicy.mode
+        set(value) {
+            inputSizePolicy.mode = value
+            inputSizeBoostedLogged = false
+        }
+
+    /** 当前是否升档到 [InputSizePolicy.boostLongSide]（调试 / A/B 统计用）。 */
+    fun isInputSizeBoosted(): Boolean = inputSizePolicy.isBoosted()
+
     // ------------------------------ 输入 ------------------------------
 
     /**
-     * 提交一帧相机 YUV（**相机线程同步调用**）。
+     * 提交一帧相机 YUV（**相机线程调用**；只拷贝 + 入队，立即返回）。
      *
      * @param frame 相机 YUV 帧（ByteBuffer 只在相机回调期间有效）
      * @param faceHint 同一帧上的脸框（旋转后、未镜像的归一化坐标）。null / 非法 / 脸太小 → 整帧；
-     *   有效时按「脸框 → 上半身 ROI」裁切后再缩放到长边上限 320（只缩不放，见 [UpperBodyRoi]）。
+     *   有效时按「脸框 → 上半身 ROI」裁切后再缩放到当前输入长边（256 / 320 自适应，
+     *   只缩不放，见 [UpperBodyRoi] / [InputSizeMode]）。
      *
-     * 本方法立即完成像素转换（ROI 引导后只采样上半身区域，约 1~4ms），随后才异步推理；
-     * 转换只读 `ByteBuffer.get(index)`，**不依赖 position**，也不会在返回后保留
-     * ByteBuffer 引用 —— 调用返回后 [Yuv420Frame] 里的 ByteBuffer 可以安全失效。
+     * 本方法只把 Y/U/V 按 stride 拷进池化 DirectByteBuffer（[YuvFrameRing]，典型 0.15~0.4ms）
+     * 并发布为「最新帧」，**不做** ROI / 缩放 / Bitmap —— 那些在 `upper-body-worker` 线程做
+     * （见 [processFrame]）。拷贝只读 `ByteBuffer.get(index)`，**不依赖 position**，返回后
+     * 不保留 ByteBuffer 引用 —— 调用返回后 [Yuv420Frame] 里的 ByteBuffer 可以安全失效。
      *
-     * 以下情况直接丢弃（计入 `dropped`）且不抛异常（丢帧时连 ROI 都不算）：
+     * 队列**只保留最新帧**：上一帧还没被 worker 消费时直接被顶掉（计入 `dropped`），
+     * 绝不排队放大端到端延迟。
+     *
+     * 以下情况直接丢弃（计入 `dropped`）且不抛异常：
      *  - 未 initialize / 未 start；
-     *  - 距离上一帧不足 `1000/targetFps` 毫秒；
-     *  - 上一次 detectAsync 还没回调（单飞）。
+     *  - 队列已关闭（release / 停机）、帧非法或无槽可用。
+     *  worker 侧还会丢掉：距离上一帧不足 `1000/targetFps` 毫秒、上一次 detectAsync
+     *  还没回调（单飞）的帧（丢帧时连 ROI 都不算）。
      */
     fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null) {
         if (!ready || !started) return
 
         stats.markInput()
+        if (!ensureWorker()) {
+            stats.markDropped()
+            return
+        }
+        val accepted = try {
+            frameRing.submit(frame, faceHint)
+        } catch (t: Throwable) {
+            Log.e(TAG, "上半身帧拷贝/入队失败", t)
+            postErrorThrottled("上半身帧入队失败：" + (t.message ?: t.javaClass.simpleName))
+            false
+        }
+        if (!accepted) stats.markDropped()
+    }
+
+    /**
+     * `upper-body-worker` 线程：对「最新一帧」做限帧 / ROI / 转换 / detectAsync。
+     *
+     * 就是改造前 [pushFrame] 的同步主体整体搬到 worker 线程：限帧、单飞、ROI 计算、
+     * 输入长边自适应、YUV→Bitmap（约 1~4ms）不再占用 Camera2 的 16.7ms 帧预算。
+     *
+     * @param captureTimestampMs 相机回调时刻（[UpperBodyPoseFrame.timestampMs] 用它，
+     *   比 worker 的处理时刻更接近真实采集时刻）
+     */
+    private fun processFrame(frame: Yuv420Frame, faceHint: FaceRoiHint?, captureTimestampMs: Long) {
+        if (!ready || !started) return
+
         val nowMs = System.nanoTime() / 1_000_000L
         val fps = targetFps.coerceIn(1, 60)
         val minIntervalMs = max(1L, 1000L / fps)
@@ -452,8 +542,9 @@ class UpperBodyPoseDetector(context: Context) {
         // ROI 只在「这一帧确实要送去推理」之后才算：被限帧 / 单飞丢掉的帧不做任何几何运算。
         val rotatedWidth = frame.rotatedWidth
         val rotatedHeight = frame.rotatedHeight
+        val fallbackActive = nowMs < fallbackUntilMs
         // 回退窗口内一律整帧：上一帧的 ROI 结果不可信，先让 MediaPipe 看全景。
-        val hint = if (nowMs < fallbackUntilMs) null else faceHint
+        val hint = if (fallbackActive) null else faceHint
         val roi = UpperBodyRoi.fromFace(hint, rotatedWidth, rotatedHeight)
         val usingRoi = !roi.isFullFrame(rotatedWidth, rotatedHeight)
         if (usingRoi && !roiHitLogged) {
@@ -465,8 +556,17 @@ class UpperBodyPoseDetector(context: Context) {
             )
         }
 
+        // 输入长边：正常 256 保帧率；脸框变小 / ROI 回退 / 近期质量差 → 320 保精度。
+        val faceAreaFraction = if (faceHint != null && faceHint.isValid) {
+            faceHint.width * faceHint.height
+        } else {
+            0f
+        }
+        val longSide = inputSizePolicy.selectLongSide(faceAreaFraction, fallbackActive)
+        logInputSizeTransition()
+
         val bitmap: Bitmap? = try {
-            converter.convert(frame, TARGET_LONG_SIDE, roi)
+            converter.convert(frame, longSide, roi)
         } catch (t: Throwable) {
             Log.e(TAG, "YUV → Bitmap 转换失败", t)
             postErrorThrottled("上半身 YUV 转换失败：${t.message ?: t.javaClass.simpleName}")
@@ -486,7 +586,7 @@ class UpperBodyPoseDetector(context: Context) {
         }
 
         val timestamp = nextDetectTimestamp()
-        pendingFrameTimestampMs = System.currentTimeMillis()
+        pendingFrameTimestampMs = if (captureTimestampMs > 0L) captureTimestampMs else System.currentTimeMillis()
         pendingSubmitNanos = System.nanoTime()
         // 单飞保证：同一时刻只有一个在飞，所以这一组参数一定属于本帧；
         // 回调线程放行单飞标记之前会把它们取成局部快照。
@@ -508,12 +608,73 @@ class UpperBodyPoseDetector(context: Context) {
         }
     }
 
+    // ------------------------------ 工作线程 ------------------------------
+
+    /**
+     * 确保 `upper-body-worker` 线程活着（pushFrame 在相机线程上调用，只在冷启动时进锁）。
+     */
+    private fun ensureWorker(): Boolean {
+        if (workerThread?.isAlive == true) return true
+        synchronized(workerLock) {
+            val current = workerThread
+            if (current != null && current.isAlive) return true
+            return try {
+                workerRunning = true
+                val thread = Thread({ workerLoop() }, WORKER_THREAD_NAME)
+                thread.isDaemon = true
+                thread.start()
+                workerThread = thread
+                Log.i(TAG, "上半身工作线程已启动")
+                true
+            } catch (t: Throwable) {
+                workerRunning = false
+                Log.e(TAG, "启动上半身工作线程失败", t)
+                false
+            }
+        }
+    }
+
+    /** 停掉 worker 线程并关闭环形缓冲（release 用）；之后再次 start() 会自动重建。 */
+    private fun shutdownWorker() {
+        val thread: Thread?
+        synchronized(workerLock) {
+            workerRunning = false
+            thread = workerThread
+            workerThread = null
+        }
+        frameRing.close()
+        if (thread != null && thread.isAlive) {
+            try {
+                thread.join(WORKER_JOIN_TIMEOUT_MS)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+    }
+
+    /** `upper-body-worker` 线程主体：只消费「最新帧」，空闲时挂在环形缓冲上等。 */
+    private fun workerLoop() {
+        while (workerRunning) {
+            val slot = frameRing.takeLatest(WORKER_IDLE_WAIT_MS) ?: continue
+            try {
+                val frame = slot.frame
+                if (frame != null && workerRunning) {
+                    processFrame(frame, slot.faceHint, slot.captureTimestampMs)
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "上半身工作线程处理帧失败", t)
+            } finally {
+                frameRing.release(slot)
+            }
+        }
+    }
+
     // ------------------------------ MediaPipe 回调 ------------------------------
 
     /** 在 MediaPipe 回调线程执行。 */
     private fun onPoseResult(resultGeneration: Int, result: PoseLandmarkerResult) {
         // 旧实例（initialize / setBackend 重建前）的迟到回调：不要动新实例的单飞状态，
-        // 否则会让相机线程以为空闲，进而对同一个 landmarker 并发 detectAsync。
+        // 否则会让 upper-body-worker 线程以为空闲，进而对同一个 landmarker 并发 detectAsync。
         if (resultGeneration != generation) return
 
         // 单飞保证这一组值属于同一个提交。**先取局部快照，再放行单飞标记**：
@@ -614,6 +775,9 @@ class UpperBodyPoseDetector(context: Context) {
 
         val points = rawPoints
         if (points == null || !UpperBodyGeometry.isTracking(points)) {
+            // 没跟踪到是质量最差的反馈：立刻升档，下一帧多喂一点像素
+            inputSizePolicy.onFrameResult(tracked = false, quality = 0f)
+            logInputSizeTransition()
             markRoiMiss(roi, frameWidth, frameHeight)
             synchronized(pipelineLock) {
                 smoother.reset()
@@ -655,14 +819,37 @@ class UpperBodyPoseDetector(context: Context) {
             }
         }
 
+        val quality = UpperBodyGeometry.quality(points)
+        inputSizePolicy.onFrameResult(tracked = true, quality = quality)
+        logInputSizeTransition()
+
         return UpperBodyPoseFrame(
             points = smoothed,
             torso = if (frameTorso.isValid) frameTorso else TorsoAngles.ZERO,
             tracking = true,
-            quality = UpperBodyGeometry.quality(points),
+            quality = quality,
             timestampMs = frameTimestampMs,
             rawMode = useRaw,
         )
+    }
+
+    /**
+     * 输入长边档位切换时打一条日志（只在自适应模式打；固定档位是显式 A/B 选择，不刷屏）。
+     */
+    private fun logInputSizeTransition() {
+        if (inputSizePolicy.mode != InputSizeMode.ADAPTIVE) return
+        val boosted = inputSizePolicy.isBoosted()
+        if (boosted == inputSizeBoostedLogged) return
+        inputSizeBoostedLogged = boosted
+        if (boosted) {
+            Log.i(
+                TAG,
+                "输入长边升档 → ${inputSizePolicy.boostLongSide}" +
+                    "（关键点质量下降 / 脸框变小 / ROI miss）",
+            )
+        } else {
+            Log.i(TAG, "输入长边回落 → ${inputSizePolicy.normalLongSide}（连续若干帧质量恢复）")
+        }
     }
 
     /**
@@ -690,8 +877,8 @@ class UpperBodyPoseDetector(context: Context) {
     /**
      * Live-stream 时间戳：单调递增的毫秒。
      *
-     * 用 CAS 而不是 synchronized(stateLock)：pushFrame 在相机线程调用，不能因为主线程
-     * 正在 initialize / setBackend 而阻塞掉面捕帧。
+     * 用 CAS 而不是 synchronized(stateLock)：processFrame 在 upper-body-worker 线程调用，
+     * 不能因为主线程正在 initialize / setBackend 而阻塞掉这一路推理。
      */
     private fun nextDetectTimestamp(): Long {
         while (true) {
@@ -970,13 +1157,12 @@ class UpperBodyPoseDetector(context: Context) {
         private const val CACHE_MODEL_SUBDIR = "upperbody_models"
 
         /**
-         * 送进 PoseLandmarker 的 Bitmap 长边（改造后固定 320）。
+         * 送进 PoseLandmarker 的 Bitmap 长边由 [InputSizePolicy] 逐帧选定（256 / 320 自适应，
+         * 见 [InputSizeMode]），不再是一个固定常量。
          *
-         * 不再用 [Yuv420Frame.DEFAULT_MAX_LONG_SIDE]（256）：那个常量只是帧对象的默认值，
-         * 保留 256 是为了不改变 [Yuv420Frame.targetSize] 的既有语义；本检测器自己用 320，
-         * 配合 ROI 裁切后上半身占的有效像素反而更多（见 docs/upper-body.md §2 的流程图）。
+         * 仍不用 [Yuv420Frame.DEFAULT_MAX_LONG_SIDE]（256）：那个常量只是帧对象的默认值，
+         * 保留 256 是为了不改变 [Yuv420Frame.targetSize] 的既有语义。
          */
-        private const val TARGET_LONG_SIDE = 320
 
         /** ROI 帧没跟踪到上半身时，改用整帧推理的时长（ms）。 */
         private const val ROI_FALLBACK_MS = 1_000L
@@ -984,6 +1170,16 @@ class UpperBodyPoseDetector(context: Context) {
         private const val DEFAULT_TARGET_FPS = 15
         private const val CALIBRATION_FRAMES = TorsoBaseline.DEFAULT_CALIBRATION_FRAMES
         private const val DEFAULT_MIN_CONFIDENCE = 0.5f
+
+        /** 工作线程名（ROI / YUV→Bitmap / detectAsync 的执行线程）。 */
+        private const val WORKER_THREAD_NAME = "upper-body-worker"
+
+        /** worker 空闲时在环形缓冲上等一帧的时长（ms）；只影响停机响应速度。 */
+        private const val WORKER_IDLE_WAIT_MS = 100L
+
+        /** release() 停 worker 时的 join 上限（ms）；超时不再等，避免卡住调用方。 */
+        private const val WORKER_JOIN_TIMEOUT_MS = 500L
+
         private const val ERROR_THROTTLE_MS = 2_000L
         private const val MAX_PIPELINE_GAP_MS = 500L
     }
