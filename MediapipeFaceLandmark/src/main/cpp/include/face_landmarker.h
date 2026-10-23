@@ -9,7 +9,6 @@
 #ifndef MEDIAPIPE_FACE_LANDMARKER_H
 #define MEDIAPIPE_FACE_LANDMARKER_H
 
-#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -151,15 +150,6 @@ public:
     
     [[nodiscard]] std::string lastError() const { return last_error_; }
 
-    /**
-     * @brief 当前 session **真实**跑在 Vulkan 上吗？
-     *
-     * 由 loadModel() 在 createSession 之后用 MNN getSessionInfo(BACKENDS) 探测，
-     * 而不是「请求了什么」。设备上装不到 Vulkan 后端时 createSession(VULKAN)
-     * 会静默退到 CPU（backupType 默认 CPU），所以必须看这个值。
-     */
-    [[nodiscard]] bool isVulkanActive() const { return vulkan_active_; }
-
 private:
     // Transform face detection rect to landmarker input rect
     static void transformFaceRect(const FaceDetection& detection,
@@ -178,24 +168,6 @@ private:
                                 int img_width, int img_height, int img_rotation,
                                 float center_x, float center_y, float width, float height,
                                 float face_rotation, MNN::Tensor* dest);
-
-    // Build the destination-pixel -> source-pixel matrix used by the YUV
-    // preprocess path. Shared by the whole-frame and ROI-only paths so the two
-    // can never drift apart. \p srcWidth/\p srcHeight receive the (unrotated)
-    // source buffer dimensions implied by \p img_rotation.
-    MNN::CV::Matrix buildYuvTransform(int img_width, int img_height, int img_rotation,
-                                      float center_x, float center_y,
-                                      float width, float height, float face_rotation,
-                                      int& srcWidth, int& srcHeight) const;
-
-    // Run the cached ImageProcess with an explicit dst->src matrix. \p img_width
-    // and \p img_height are the dimensions of the YUV data actually passed to
-    // convert() (the whole frame or a packed face ROI).
-    void preprocessImageFromYuvWithMatrix(const uint8_t* yuvData,
-                                          MNN::CV::ImageFormat yuvFormat,
-                                          int img_width, int img_height,
-                                          const MNN::CV::Matrix& trans,
-                                          MNN::Tensor* dest);
 
     // Decode model outputs to landmarks
     void decodeLandmarks(const float* landmarks_tensor,
@@ -223,13 +195,6 @@ private:
     int image_process_format_ = -1;
     // Repacked YUV buffer reused across frames (resize instead of re-allocate).
     std::vector<uint8_t> yuv_buffer_;
-    // Repacked face-ROI YUV buffer (only the landmark crop, typically 0.1-0.3 MB
-    // instead of the full 1.38 MB frame). Reused across frames.
-    std::vector<uint8_t> yuv_roi_buffer_;
-    // Per-instance first-use logging guards (atomic: detectFromYuv is called
-    // from several landmark worker threads, one per engine slot).
-    std::atomic<bool> yuv_roi_logged_{false};
-    std::atomic<bool> yuv_fallback_logged_{false};
     // Host output tensors reused across frames.
     std::unique_ptr<MNN::Tensor> landmarks_output_host_;
     std::unique_ptr<MNN::Tensor> flag_output_host_;
@@ -238,9 +203,6 @@ private:
     int input_h_ = 192;
     int input_w_ = 192;
     int input_c_ = 3;
-
-    // createSession 之后探测到的真实后端（true = 确实跑在 Vulkan 上）。
-    bool vulkan_active_ = false;
 
     // Number of landmarks (468 mesh + 10 iris)
     static constexpr int kNumLandmarks = 478;

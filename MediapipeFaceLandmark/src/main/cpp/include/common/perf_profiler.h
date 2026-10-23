@@ -84,16 +84,6 @@ struct PerfStats {
 
 /**
  * @brief Face Detection performance profiler
- *
- * pack / upload / readback 是第三轮新增的三段独立耗时（都与 Total 同级观察）：
- * - pack    : YUV 重排 / ROI 打包（memcpy），发生在 PERF_START(preprocess) 之前，
- *             所以它**不在** Preprocess 里；
- * - upload  : host tensor -> 设备输入（copyFromHostTensor），计时区间落在
- *             Preprocess 内部（Preprocess = convert + upload）；
- * - readback: 设备输出 -> host（copyToHostTensor，含一次 GPU 同步等待），
- *             计时区间落在 Postprocess 内部。
- * 因此 Preprocess / Postprocess 的含义与改动前完全一致，可直接和旧日志对比；
- * 这三个新项只是把它们的内部构成拆开看。
  */
 class DetectionPerfProfiler {
 public:
@@ -102,25 +92,16 @@ public:
     PerfStats inference;
     PerfStats postprocess;
     PerfStats coord_transform;
-    PerfStats pack;
-    PerfStats upload;
-    PerfStats readback;
     int frame_count = 0;
     
     void log() const {
         FACE_LOGI("=== Face Detection Perf (avg of %d frames) ===", frame_count);
         FACE_LOGI("  Total:      %.2f ms (min=%.2f, max=%.2f)", 
                   total.avg(), total.min_ms, total.max_ms);
-        FACE_LOGI("  Pack(YUV):  %.2f ms (%.1f%%)", 
-                  pack.avg(), 100.0 * pack.avg() / total.avg());
         FACE_LOGI("  Preprocess: %.2f ms (%.1f%%)", 
                   preprocess.avg(), 100.0 * preprocess.avg() / total.avg());
-        FACE_LOGI("  Upload:     %.2f ms (%.1f%%)", 
-                  upload.avg(), 100.0 * upload.avg() / total.avg());
         FACE_LOGI("  Inference:  %.2f ms (%.1f%%)", 
                   inference.avg(), 100.0 * inference.avg() / total.avg());
-        FACE_LOGI("  Readback:   %.2f ms (%.1f%%)", 
-                  readback.avg(), 100.0 * readback.avg() / total.avg());
         FACE_LOGI("  Postproc:   %.2f ms (%.1f%%)", 
                   postprocess.avg(), 100.0 * postprocess.avg() / total.avg());
         FACE_LOGI("  CoordTrans: %.2f ms (%.1f%%)", 
@@ -133,9 +114,6 @@ public:
         inference.reset();
         postprocess.reset();
         coord_transform.reset();
-        pack.reset();
-        upload.reset();
-        readback.reset();
         frame_count = 0;
     }
     
@@ -149,9 +127,6 @@ public:
 
 /**
  * @brief Face Landmark performance profiler
- *
- * 同 DetectionPerfProfiler：pack 在 Preprocess 之前（不计入 Preprocess），
- * upload 在 Preprocess 之内，readback 在 Postprocess 之内。
  */
 class LandmarkPerfProfiler {
 public:
@@ -160,25 +135,16 @@ public:
     PerfStats inference;
     PerfStats postprocess;
     PerfStats smoothing;
-    PerfStats pack;
-    PerfStats upload;
-    PerfStats readback;
     int frame_count = 0;
     
     void log() const {
         FACE_LOGI("=== Face Landmarks Perf (avg of %d frames) ===", frame_count);
         FACE_LOGI("  Total:      %.2f ms (min=%.2f, max=%.2f)", 
                   total.avg(), total.min_ms, total.max_ms);
-        FACE_LOGI("  Pack(YUV):  %.2f ms (%.1f%%)", 
-                  pack.avg(), 100.0 * pack.avg() / total.avg());
         FACE_LOGI("  Preprocess: %.2f ms (%.1f%%)", 
                   preprocess.avg(), 100.0 * preprocess.avg() / total.avg());
-        FACE_LOGI("  Upload:     %.2f ms (%.1f%%)", 
-                  upload.avg(), 100.0 * upload.avg() / total.avg());
         FACE_LOGI("  Inference:  %.2f ms (%.1f%%)", 
                   inference.avg(), 100.0 * inference.avg() / total.avg());
-        FACE_LOGI("  Readback:   %.2f ms (%.1f%%)", 
-                  readback.avg(), 100.0 * readback.avg() / total.avg());
         FACE_LOGI("  Postproc:   %.2f ms (%.1f%%)", 
                   postprocess.avg(), 100.0 * postprocess.avg() / total.avg());
         FACE_LOGI("  Smoothing:  %.2f ms (%.1f%%)", 
@@ -191,9 +157,6 @@ public:
         inference.reset();
         postprocess.reset();
         smoothing.reset();
-        pack.reset();
-        upload.reset();
-        readback.reset();
         frame_count = 0;
     }
     
