@@ -14,7 +14,7 @@
 - 采集什么：MediaPipe Pose（BlazePose）33 点里挑出的 **13 个上半身点**
   （鼻子 / 双眼 / 双耳 / 双肩 / 双肘 / 双腕 / 双胯），归一化坐标 + 相对深度 + 可见度；
 - 谁算：**手机端**，用 **官方 MediaPipe Tasks（`com.google.mediapipe:tasks-vision`）的
-  `PoseLandmarker`（LIVE_STREAM 模式）**在相机同一路 YUV 帧上抽帧推理（默认 15 fps，可调）；
+  `PoseLandmarker`（LIVE_STREAM 模式）**在相机同一路 YUV 帧上抽帧推理（默认 30 fps，可调）；
 - 怎么传：沿用 VFC Tracking Protocol v1，在 `track` 报文里**新增可选字段** `ub` / `ubOk` /
   `ubT` / `body`（纯增量，不升 `version`，老客户端会按协议 §3 「未知字段忽略」直接跳过）；
 - 谁用：Windows 客户端把 13 点换算成**上半身运动骨骼**（脊柱 → 锁骨 → 上臂 → 前臂），
@@ -30,7 +30,7 @@
 ```
 Camera2 (YUV_420_888, 主/后/外接)
    │  facecapture-sdk PipelineFaceTracker#onYuvFrameForBodyWithHint
-   │  （抽帧 tap，默认 66ms = 15fps；附带最近脸框，一级扩充 1.15×，TTL 500ms）
+   │  （抽帧 tap，默认 33ms = 30fps；附带最近脸框，一级扩充 1.15×，TTL 500ms）
    ▼
 app: UpperBodyPoseController                 ← 生命周期 / 开关 / 基线 / 统计
    │  ① FaceBox → FaceRoiHint（score < 0.3 或非法 → null）
@@ -184,7 +184,7 @@ var onYuvFrameForBody: ((YuvFrameData) -> Unit)? = null
 /** 新 tap：帧 + 最近脸框（旋转后归一化、已一级扩充 1.15×；可能为 null）。优先于旧 tap。 */
 var onYuvFrameForBodyWithHint: ((YuvFrameData, MediaPipeFaceDetector.FaceBox?) -> Unit)? = null
 
-var bodyTapIntervalMs: Long = 66L   // 0 = 每帧都回调
+var bodyTapIntervalMs: Long = 33L   // 0 = 每帧都回调
 ```
 
 - 实现方式：在 `camera2Manager.setYuvFrameCallback { ... }` 里，喂完面捕的 channel 之后，
@@ -201,7 +201,7 @@ var bodyTapIntervalMs: Long = 66L   // 0 = 每帧都回调
 ```kotlin
 // TrackingOutputManager
 fun setUpperBodyEnabled(enabled: Boolean)      // 影响 hello.upperBody 与 track 是否带 ub
-fun submitUpperBody(frame: UpperBodyPoseFrame) // ~15fps 调用；内部只存「最新快照」
+fun submitUpperBody(frame: UpperBodyPoseFrame) // ~30fps 调用；内部只存「最新快照」
 
 // TrackingServer（内部）
 fun setUpperBodyEnabled(enabled: Boolean)
@@ -274,7 +274,7 @@ PC，手机只保留「推理 → 抽 13 点 → isTracking」。
 
 | 步骤 | 手机（新） | PC（新，`mapping.js`） |
 |---|---|---|
-| YUV→Bitmap、ROI、detectAsync、15fps 限帧、单飞、generation | ✅ 保留（不变） | — |
+| YUV→Bitmap、ROI、detectAsync、30fps 限帧、单飞、generation | ✅ 保留（不变） | — |
 | 33 点 → 13 点（extract）、isTracking（>0.5 至少 7 点） | ✅ 保留（不变） | — |
 | One-Euro 平滑 13 点 xyz | ❌ 原始模式跳过 | ✅ `UpperBodyPostProcessor` |
 | 躯干角（roll / yaw） | 算原始角（发 `ubRawBody`，对拍用） | ✅ `computeTorsoAngles`（对平滑点） |

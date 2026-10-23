@@ -407,7 +407,7 @@ class CameraPreviewView @JvmOverloads constructor(
     }
 
     /**
-     * 更新上半身骨架（约 15fps，从 MediaPipe 回调线程调用）。
+     * 更新上半身骨架（目标约 30fps，从 MediaPipe 回调线程调用）。
      *
      * 传 null 表示关闭 / 已停止，下一帧 onDraw 就不会再画骨架。
      *

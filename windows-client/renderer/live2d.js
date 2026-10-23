@@ -38,7 +38,7 @@ const MAX_TARGET_FPS = 240;
 
 /** 插值开启时的轻量平滑时间常数：只压输入噪声，不制造额外拖尾。 */
 const INTERP_SMOOTH_TAU_MS = 10;
-/** 上半身参数的一阶低通时间常数（协议 §8.5 建议 0.15~0.25 s；Pose 只有 ~15 fps）。 */
+/** 上半身参数的一阶低通时间常数（协议 §8.5 建议 0.15~0.25 s；Pose 帧率 15~30 fps）。 */
 const BODY_SMOOTH_TAU_MS = 160;
 
 /** 单帧 dt 上限：切后台回来 / 卡顿一帧时不要一步跳到目标。 */
@@ -119,7 +119,7 @@ export class Live2DStage {
     this.availableParams = [];
     /** 上半身派生参数（mapBody 的结果）：与头部参数分开存，每帧在头部之后叠加写入。 */
     this.bodyParams = Object.create(null);
-    /** 躯干 X 的低通状态（与头部参数分开，避免半身 15fps 的跳变直接叠到头部插值上）。 */
+    /** 躯干 X 的低通状态（与头部参数分开，避免半身 15~30fps 的跳变直接叠到头部插值上）。 */
     this.currentTorsoX = null;
     /** 当前模型对 BODY_PARAM_IDS 的支持情况 { id: boolean }（调试面板 / 降级说明用）。 */
     this.bodySupport = Object.create(null);
@@ -532,7 +532,7 @@ export class Live2DStage {
     }
 
     // 上半身：在头部参数之后叠加（ParamBodyAngleX 相加后 clamp，其余写可选参数）。
-    // Pose 只有 ~15 fps，按 0.15~0.2 s 一阶低通再写（协议 §8.5 建议），
+    // Pose 帧率 15~30 fps，按 0.15~0.2 s 一阶低通再写（协议 §8.5 建议），
     // 与头部参数的时间轴插值互不影响；immediate（截图 / 单步）直接落位。
     // M4 总开关打开时改走 filter.js 的 body 组（更稳的那组参数），**替换**而不是叠加 160ms 低通；
     // 躯干 X 是独立滤波状态（key="torsoX"），与头部驱动的 ParamBodyAngleX 互不干扰。

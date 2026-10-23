@@ -476,12 +476,12 @@ class PipelineFaceTracker(private val context: Context) {
 
     /**
      * 上半身 tap（[onYuvFrameForBody] / [onYuvFrameForBodyWithHint]）的抽帧间隔（毫秒）：
-     * 默认 66ms ≈ 15fps，**0 = 每帧都回调**。
+     * 默认 33ms ≈ 30fps，**0 = 每帧都回调**。
      *
      * 运行中改这个值即可生效（相机线程下一帧就会看到新值），无需重启管线。
      */
     @Volatile
-    var bodyTapIntervalMs: Long = 66L
+    var bodyTapIntervalMs: Long = 33L
 
     /** 上一次调用上半身 tap 的时间戳（相机线程读写、start() 时归零）。 */
     @Volatile
@@ -1054,7 +1054,7 @@ class PipelineFaceTracker(private val context: Context) {
     /**
      * 相机线程：取当前可用的脸框提示。
      *
-     * 只在挂了 [onYuvFrameForBodyWithHint] 且到了抽帧间隔时才调用（≈66ms 一次）；
+     * 只在挂了 [onYuvFrameForBodyWithHint] 且到了抽帧间隔时才调用（≈33ms 一次）；
      * 锁内只有两次字段读取，与检测 / 关键点阶段抢锁的时间可以忽略。
      *
      * @return 一级扩充后的脸框；无脸框或提示超过 [FACE_BOX_HINT_TTL_MS] 时为 null。

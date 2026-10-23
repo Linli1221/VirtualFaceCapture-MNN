@@ -45,8 +45,8 @@ class UpperBodyPoseController(private val context: Context) {
     companion object {
         private const val TAG = "UpperBodyPose"
 
-        /** 相机 YUV 抽帧间隔：66ms ≈ 15fps（与 faceTracker.bodyTapIntervalMs 默认值一致）。 */
-        const val TAP_INTERVAL_MS = 66L
+        /** 相机 YUV 抽帧间隔：33ms ≈ 30fps（与 faceTracker.bodyTapIntervalMs 默认值一致）。 */
+        const val TAP_INTERVAL_MS = 33L
 
         /** Lite 模型文件名（与 UpperBodyPoseDetector.MODEL_LITE 一致，这里只用于中文提示）。 */
         const val MODEL_LITE = "pose_landmarker_lite.task"
@@ -105,7 +105,7 @@ class UpperBodyPoseController(private val context: Context) {
     var outputFps: Float = 0f
         private set
 
-    /** 每帧结果（约 15fps，在 MediaPipe 回调线程触发）。 */
+    /** 每帧结果（目标约 30fps，在 MediaPipe 回调线程触发；实际帧率受推理耗时限制）。 */
     var onFrame: ((UpperBodyPoseFrame) -> Unit)? = null
 
     /** 预览叠加层：正常帧 / 停止时 null（用于清空骨架）。 */

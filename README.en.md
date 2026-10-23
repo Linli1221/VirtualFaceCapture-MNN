@@ -335,7 +335,7 @@ landmarker (official `com.google.mediapipe:tasks-vision` `PoseLandmarker`, LIVE_
 wrists / hips) plus **baseline-relative torso angles**, so the avatar can lean, turn and raise arms:
 
 - **Off by default** — no extra cost on the camera thread and no MediaPipe Tasks runtime loaded.
-  When enabled it taps one frame every 66 ms (~15 fps), GPU first with automatic CPU fallback.
+  When enabled it taps one frame every 33 ms (~30 fps, upper bound — the actual rate follows inference time), GPU first with automatic CPU fallback.
 - **Face-guided ROI**: the latest face box drives an upper-body crop scaled to 320p before
   inference (falls back to the full frame when the box is stale/too small); landmarks are mapped
   back to full-frame coordinates, so the `ub[]` protocol semantics are unchanged.
@@ -544,7 +544,7 @@ To reuse the wire format, just copy `docs/tracking-protocol.md` — it was writt
   geometry, saving an entire inference pass.
 - **Publishable AAR**: `:facecapture-sdk` is wired for `maven-publish`.
 - **Optional upper body**: `:MediapipeUpperBody` runs the official MediaPipe Tasks
-  `PoseLandmarker` at 15 fps on the same YUV frames and adds only 13 points + torso angles to the
+  `PoseLandmarker` at up to 30 fps on the same YUV frames and adds only 13 points + torso angles to the
   existing protocol; off by default, degrades gracefully without the model, fully decoupled from the
   face pipeline.
 - **Multi-camera (incl. physical ultra-wide)**: enumerate and switch front / back / external

@@ -74,7 +74,7 @@ class TorsoBaseline(private val calibrationFrames: Int = DEFAULT_CALIBRATION_FRA
         get() = if (calibrationFrames > 0) calibrationFrames else 1
 
     companion object {
-        /** 默认校准帧数：~10 个有效帧（15fps 下约 0.7 秒）。 */
+        /** 默认校准帧数：~10 个有效帧（30fps 下约 0.33 秒）。 */
         const val DEFAULT_CALIBRATION_FRAMES = 10
     }
 }

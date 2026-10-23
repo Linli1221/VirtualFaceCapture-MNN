@@ -141,7 +141,7 @@ internal class InputSizePolicy(
         /** 高于它才计入「恢复连击」的平均可见度。 */
         const val DEFAULT_EXIT_QUALITY = 0.7f
 
-        /** 连续多少帧质量好才从 320 回落 256（15fps 下约 0.4s）。 */
+        /** 连续多少帧质量好才从 320 回落 256（30fps 下约 0.2s）。 */
         const val DEFAULT_EXIT_FRAMES = 6
 
         /** 脸框归一化面积（宽×高）低于它算「人变远」（≈ 脸宽高都小于帧的 1/10）。 */

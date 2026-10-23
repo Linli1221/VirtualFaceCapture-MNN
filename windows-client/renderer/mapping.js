@@ -1175,8 +1175,8 @@ export const BODY_POST_DEFAULTS = Object.freeze({
   torsoBeta: TORSO_ONE_EURO_DEFAULTS.beta,
   torsoDerivativeCutoff: TORSO_ONE_EURO_DEFAULTS.derivativeCutoff,
   calibrationFrames: BODY_BASELINE_CALIBRATION_FRAMES,
-  /** 首帧（平滑器重置后）的 dt：1 / 15fps（Kotlin 用 targetFps=15）。 */
-  defaultDtSeconds: 1 / 15,
+  /** 首帧（平滑器重置后）的 dt：1 / 30fps（Kotlin 用 targetFps=30）。 */
+  defaultDtSeconds: 1 / 30,
   /** 相邻帧 dt 的上限（与 Kotlin MAX_PIPELINE_GAP_MS 一致）。 */
   maxPipelineGapMs: 500,
 });
@@ -1398,7 +1398,7 @@ export class TorsoBaseline {
  * 上半身后处理管线（原始点 → 平滑点 + 相对躯干角）。
  *
  * 与 Kotlin UpperBodyPoseDetector.buildFrame 的平滑段逐行等价：
- *   dt 规则：无锚点 → defaultDtSeconds（1/15s）；否则 clamp(t−lastT, 1, maxPipelineGapMs)/1000；
+ *   dt 规则：无锚点 → defaultDtSeconds（1/30s）；否则 clamp(t−lastT, 1, maxPipelineGapMs)/1000；
  *   tracking 丢失（isTracking 不满足）→ 平滑器全重置 + dt 锚点清零，**基线不动**；
  *   坏点（x=y=z=v=0）透传不参与平滑，避免坏帧把该点拖向原点。
  */

@@ -30,7 +30,7 @@ PC 只做「映射 + 渲染」。** 两端之间除了这份 JSON 没有任何�
 | 通道 | 数据源 | 产出 | 频率 | 是否默认开 |
 |---|---|---|---|---|
 | **脸部** | MNN + `.mnn` 模型（自研 C++ 推理） | ARKit-52 BlendShape + 头部姿态 `pitch/yaw/roll` | 受推理限制，约 60 fps | ✅ 开 |
-| **上半身** | 官方 MediaPipe Tasks `PoseLandmarker` | 13 个上半身关键点 + 相对躯干角 `[roll, yaw]` | 15 fps（抽帧） | ❌ 关 |
+| **上半身** | 官方 MediaPipe Tasks `PoseLandmarker` | 13 个上半身关键点 + 相对躯干角 `[roll, yaw]` | 30 fps（抽帧，上限目标） | ❌ 关 |
 
 两条通道**完全解耦**：上半身关掉时相机线程零额外开销，也不加载 MediaPipe Tasks 运行时；
 面捕的「不依赖 MediaPipe 运行时」这个设计没有被破坏（`upper-body.md` §1）。
@@ -64,7 +64,7 @@ Camera2 ImageReader  (YUV_420_888 · 1280×720 · 60fps 目标)
    │                                        ▼
    │                                   fc-face-output ──► 5 个回调
    │
-   └──► onYuvFrameForBodyWithHint  (抽帧 tap · 66ms = 15fps)
+   └──► onYuvFrameForBodyWithHint  (抽帧 tap · 33ms = 30fps)
             │  带同帧脸框（一级扩充 1.15×，TTL 500ms）；duplicate() 不拷像素
             ▼
         UpperBodyPoseDetector
@@ -580,7 +580,7 @@ if (bodyTapWithHint != null || bodyTapLegacy != null) {
 四个细节：
 
 1. **面捕两条通道先喂完**，保证面捕优先级；
-2. 脸框只在 66ms 的 tap 时刻取一次，锁内只有两次字段读；
+2. 脸框只在 33ms 的 tap 时刻取一次，锁内只有两次字段读；
 3. `try/catch(Throwable)` 是必需的——**相机线程一旦被抛出去，面捕也会跟着停**；
 4. 关闭时两个 tap 都置 null，相机回调里只多一次判空（`MainActivity.kt`）。
 
@@ -602,7 +602,7 @@ MediaPipe 需要 `Bitmap`，而 **YUV 的 ByteBuffer 在相机回调返回后就
    水平以脸中心为中心、顶部留 0.35×脸高；没有可信脸框 / 脸太小 / ROI <48px 时用整帧。
 2. **只采样 ROI**（最近邻反查源坐标）并缩放到**当前输入长边**（256/320 自适应、只缩不放，
    状态机见 `InputSizePolicy`）。整帧 720p→320p 也只采约 5.8 万像素（256 档再省 36%）；
-   带 ROI 时输出 10 万像素上下，15fps 下约 1~4ms —— 这一段在 `upper-body-worker` 线程，
+   带 ROI 时输出 10 万像素上下，每帧约 1~4ms（30fps 下约占 3%~12% 帧预算）—— 这一段在 `upper-body-worker` 线程，
    不再占用相机线程的 16.7ms 帧预算。
 
 结果点先在 ROI 局部坐标，**回映到整帧预览坐标之后**再做 13 点提取 / 躯干角 / 平滑，
@@ -612,7 +612,7 @@ MediaPipe 需要 `Bitmap`，而 **YUV 的 ByteBuffer 在相机回调返回后就
 
 ```kotlin
 // UpperBodyPoseDetector.processFrame（upper-body-worker 线程；pushFrame 只拷贝入队）
-if (nowMs - lastSubmit < 1000/targetFps) { dropped++; return }   // 15fps 门限
+if (nowMs - lastSubmit < 1000/targetFps) { dropped++; return }   // 30fps 门限
 if (!inFlight.compareAndSet(false, true)) { dropped++; return }  // 上一帧没回调就丢
 ```
 
@@ -929,7 +929,7 @@ YUV 预处理、命令录制、结果回读）。
 | 0.5 s 播放缓冲 vs 低延迟 | 缓冲 | +500 ms；可关 |
 | 检测 10 Hz vs 每帧 | 节流 | 脸快速移动时框可能滞后（靠重检兜底） |
 | 头姿 tau 0.3 s vs 跟手 | 稳 | 快速甩头时角度略滞后 |
-| 上半身 15 fps vs 60 fps | 15 fps | 手臂动作有明显延迟感（PC 侧 160 ms 低通再加一点） |
+| 上半身 30 fps vs 60 fps | 30 fps | 手臂动作的延迟感比 15 fps 时明显减轻，但仍存在（PC 侧 160 ms 低通再加一点） |
 | MediaPipe Pose vs 自研 | 官方 Tasks | 引入 MediaPipe 运行时，但**只在开上半身时加载** |
 
 ### 12.3 闲置能力

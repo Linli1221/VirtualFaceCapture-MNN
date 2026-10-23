@@ -5,7 +5,7 @@
 设计/协议契约见 [docs/upper-body.md](../docs/upper-body.md)（§2 / §3.1 / §3.2 / §6）。
 
 ```
-Camera2 YUV_420_888（app 侧 15fps 抽帧）+ 同一帧脸框
+Camera2 YUV_420_888（app 侧 30fps 抽帧）+ 同一帧脸框
    │  pushFrame(Yuv420Frame, faceHint)   ← 相机线程：只把 Y/U/V 按 stride 拷进池化
    ▼                                       DirectByteBuffer（0.15~0.4ms）→ 立即返回
 UpperBodyPoseDetector
@@ -116,7 +116,7 @@ if (detector.isModelAvailable()) {
             variant = UpperBodyPoseDetector.ModelVariant.LITE,
         )
     ) {
-        detector.setTargetFps(15)          // 默认就是 15
+        detector.setTargetFps(30)          // 默认就是 30
         detector.inputSizeMode = InputSizeMode.ADAPTIVE   // A/B：PRECISION(320) / FRAME_RATE(256)
         detector.start()
     }
@@ -211,7 +211,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 - 时间戳 = `System.nanoTime()/1_000_000`（单调），重复时 +1；
 - 同一时刻最多一个未完成的 `detectAsync`；来帧过快直接丢弃并计入 `dropped`；
-- 默认限帧 15fps（`setTargetFps(1..60)`）；相机侧 66ms tap 与默认值对齐。
+- 默认限帧 30fps（`setTargetFps(1..60)`）；相机侧 33ms tap 与默认值对齐。30fps 是**上限目标**，实际产出帧率由推理耗时与单飞丢帧决定。
 
 ### 4.3 13 点 / tracking / quality
 
@@ -307,7 +307,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 ## 7. 性能与已知限制
 
-- **默认参数**：长边 256/320 自适应（InputSizeMode.ADAPTIVE：正常 256，质量下降 / 脸框变小 / ROI miss 升 320，恢复后回落；A/B 可钉 PRECISION = 固定 320 / FRAME_RATE = 固定 256；ROI 引导，只缩不放）、15fps、lite 模型；1080p 相机上转换约 1~4ms/帧。
+- **默认参数**：长边 256/320 自适应（InputSizeMode.ADAPTIVE：正常 256，质量下降 / 脸框变小 / ROI miss 升 320，恢复后回落；A/B 可钉 PRECISION = 固定 320 / FRAME_RATE = 固定 256；ROI 引导，只缩不放）、30fps（默认上限目标）、lite 模型；1080p 相机上转换约 1~4ms/帧。
   实际推理耗时用 `getStats().avgLatencyMs` 观察；中端机 GPU 通常 6~15ms。
 - 未放模型时功能自动降级（`isModelAvailable()=false`），不影响面捕主链路。
 - assets 模型默认按 asset 相对路径加载（`noCompress` 已配置）；只有该路径在当前

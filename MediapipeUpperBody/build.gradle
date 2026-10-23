@@ -2,7 +2,7 @@
 // -----------------------------------------------------------------------------
 // 上半身关键点采集（官方 MediaPipe Tasks PoseLandmarker，LIVE_STREAM 模式）。
 //
-// 输入：相机 YUV_420_888（app 侧按 15fps 抽帧后包装成 Yuv420Frame）
+// 输入：相机 YUV_420_888（app 侧按 30fps 抽帧后包装成 Yuv420Frame）
 // 输出：CommonData.UpperBodyPoseFrame（13 个上半身点 + 相对基线躯干角）
 //
 // 依赖边界（docs/upper-body.md §3.2）：只依赖 :CommonData + androidx.core +

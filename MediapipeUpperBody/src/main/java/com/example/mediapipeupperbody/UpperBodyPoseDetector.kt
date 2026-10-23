@@ -1169,7 +1169,7 @@ class UpperBodyPoseDetector(context: Context) {
         /** ROI 帧没跟踪到上半身时，改用整帧推理的时长（ms）。 */
         private const val ROI_FALLBACK_MS = 1_000L
 
-        private const val DEFAULT_TARGET_FPS = 15
+        private const val DEFAULT_TARGET_FPS = 30
         private const val CALIBRATION_FRAMES = TorsoBaseline.DEFAULT_CALIBRATION_FRAMES
         private const val DEFAULT_MIN_CONFIDENCE = 0.5f
 

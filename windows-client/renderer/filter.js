@@ -104,7 +104,7 @@ export const FILTER_GROUP_DEFAULTS = Object.freeze({
     attackMs: 60,
     releaseMs: 260,
   }),
-  /** 上半身：更稳（Pose 只有 ~15 fps，慢速要压得住）。 */
+  /** 上半身：更稳（Pose 帧率 15~30 fps，慢速要压得住）。 */
   body: Object.freeze({
     slowTauMs: 260,
     fastTauMs: 30,
@@ -267,7 +267,7 @@ export class VelocityAdaptiveFilter {
     }
 
     // 归一化速度（满量程/秒）：微分按「目标两次变化之间的间隔」计算——
-    // 目标在输入帧之间被 hold 住时（上半身 ~15 fps / 不插值），用渲染 dt 会把速度算成尖峰。
+    // 目标在输入帧之间被 hold 住时（上半身 15~30 fps / 不插值），用渲染 dt 会把速度算成尖峰。
     this._sinceChangeMs += dt;
     let deriv = 0;
     if (g !== this._prevGoal) {

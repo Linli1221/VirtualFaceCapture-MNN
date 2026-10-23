@@ -81,7 +81,7 @@ private data class DebugSnapshot(
     // ---- 上半身（可选功能，默认关）----
     /** 中文状态：关 / 缺少模型 / 启动中 / 运行中 / 出错。 */
     val bodyState: String = "关",
-    /** 实际产出的 body 帧率（≈15fps 目标）。 */
+    /** 实际产出的 body 帧率（≈30fps 目标）。 */
     val bodyFps: Float = 0f,
     /** 可见度 ≥ 0.5 的关键点个数，满分 13。 */
     val bodyPoints: Int = 0,
@@ -116,7 +116,7 @@ private class DebugSnapshotBatcher(
     private var blendShapes: ARKitBlendShapes? = null
     private var headPose: HeadPoseData = HeadPoseData()
 
-    // 上半身（约 15fps 回调）：同样只在 10Hz 的发布节奏里写进快照
+    // 上半身（目标约 30fps 回调）：同样只在 10Hz 的发布节奏里写进快照
     private var bodyState: String = "关"
     private var bodyFps: Float = 0f
     private var bodyPoints: Int = 0
@@ -145,7 +145,7 @@ private class DebugSnapshotBatcher(
     }
 
     /**
-     * 上半身结果（约 15fps，在 MediaPipe 回调线程触发）。
+     * 上半身结果（目标约 30fps，在 MediaPipe 回调线程触发）。
      *
      * [frame] 为 null 表示功能已关闭 / 已停止，HUD 要显示成空状态。
      * 和面捕的其它字段一起走同一个 10Hz 节流，绝不每帧写 Compose state。
@@ -248,7 +248,7 @@ class MainActivity : ComponentActivity() {
      * 只挂带提示的新回调，并把旧的 [PipelineFaceTracker.onYuvFrameForBody]
      * 置 null：两者同时挂上时 SDK 只会调新的，这里显式清掉避免语义歧义。
      *
-     * @param on true = 按 66ms（≈15fps）抽帧；false = 两个 tap 都置 null，
+     * @param on true = 按 33ms（≈30fps）抽帧；false = 两个 tap 都置 null，
      *           面捕热路径零额外开销。
      */
     private fun attachBodyTap(on: Boolean) {
@@ -580,7 +580,7 @@ fun FaceCaptureScreen(
             isCalibrating = calibrating
         }
 
-        // 上半身：每帧（~15fps，MediaPipe 回调线程）刷新预览骨架；
+        // 上半身：每帧（目标 ~30fps，MediaPipe 回调线程）刷新预览骨架；
         // HUD 数值走合批器（≤10Hz 写 Compose state），不逐帧重组。
         upperBody.onOverlay = { frame ->
             cameraPreviewView?.updateUpperBody(frame)
@@ -1616,7 +1616,7 @@ fun ControlPanel(
             }
 
             // 上半身关键点（MediaPipe Pose）：与面捕完全解耦的可选功能，默认关。
-            // 打开后才挂相机 YUV 抽头（66ms ≈ 15fps）并加载 pose_landmarker_lite.task。
+            // 打开后才挂相机 YUV 抽头（33ms ≈ 30fps）并加载 pose_landmarker_lite.task。
             Button(
                 onClick = onToggleUpperBody,
                 enabled = !upperBodyBusy,
