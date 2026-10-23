@@ -765,12 +765,25 @@ fun FaceCaptureScreen(
                     container.previewView.drawKeyPoints = drawLandmarks
                     container.previewView.drawDetectionBox = drawDetectionBox
                     container.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+                    // 摆正角实时取（转屏不重建 Activity，换相机时推的值会陈旧）
+                    container.contentRotationDegreesProvider = { faceTracker.previewRotationDegrees }
+                    // 视图可能在相机已启动后（重新）创建：先把几何补齐再挂 Surface，
+                    // 保证 Surface 进会话时 buffer 尺寸已钉在采集帧尺寸上。
+                    faceTracker.previewFrameSize?.let { size ->
+                        container.setFrameSize(size.width, size.height)
+                    }
+                    container.contentRotationDegrees = faceTracker.previewRotationDegrees
                     container.onPreviewPath = { surface, bitmapFrames ->
                         faceTracker.setCameraPreviewSurface(surface)
                         faceTracker.setCameraPreviewFramesEnabled(bitmapFrames)
                     }
                     container.refreshPreviewPath()
                 }
+            },
+            update = { container ->
+                // 转屏（含 180° 翻转：宽高不变、onSizeChanged 不触发）后强制重算一次
+                // 变换矩阵；值没变时容器内部会直接短路，代价可忽略。
+                container.contentRotationDegrees = faceTracker.previewRotationDegrees
             },
             modifier = Modifier.fillMaxSize()
         )

@@ -262,7 +262,25 @@ class CameraPreviewView @JvmOverloads constructor(
     var drawKeyPoints = true
     var drawIris = true
     var mirrorHorizontal = true
+
+    /**
+     * 直出 Surface 模式下叠加层的几何来源：采集帧尺寸（未旋转）+ 摆正角。
+     *
+     * 直出时相机画面在 TextureView 里（本 View 没有位图），叠加层必须按同一套
+     * 「旋转摆正 → fit-center」几何自己算显示框，才能和底图重合。位图模式
+     * （回退路径）下这些值不参与绘制，显示框仍取位图的实际尺寸。
+     * 由 [CameraPreviewSurfaceContainer] 随几何同步推送（[setSourceFrame]）。
+     */
+    private var sourceFrameWidth = 0
+    private var sourceFrameHeight = 0
     var rotationDegrees = 0f
+
+    /** 宿主同步直出预览几何（采集帧尺寸未旋转 + 顺时针摆正角）。 */
+    fun setSourceFrame(width: Int, height: Int, rotationDegrees: Int) {
+        sourceFrameWidth = width
+        sourceFrameHeight = height
+        this.rotationDegrees = rotationDegrees.toFloat()
+    }
 
     /** 上半身骨架叠加开关（关闭时 onDraw 里连读引用都省掉）。 */
     var drawUpperBody = true
@@ -467,6 +485,11 @@ class CameraPreviewView @JvmOverloads constructor(
         } finally {
             uiDrawing = false
         }
+        // 直出 Surface 模式：底图在 TextureView 里，drawBitmapFrame 没有位图会直接
+        // 返回——叠加层仍要按同一套 fit-center 几何画出来（两种底图都成立）。
+        if (displayBitmap.get() == null) {
+            drawSurfaceOverlay(canvas)
+        }
     }
     
     private fun drawBitmapFrame(canvas: Canvas) {
@@ -524,6 +547,58 @@ class CameraPreviewView @JvmOverloads constructor(
                 drawUpperBodySkeleton(canvas, upperBodyFrame, dstRect)
             }
         }
+    }
+
+    /**
+     * 直出 Surface 模式的叠加层：本 View 不画底图，只按「旋转摆正 → fit-center」
+     * 算显示框后画关键点 / 检测框 / 姿态文本 / 上半身骨架。
+     *
+     * 显示框必须与 [CameraPreviewSurfaceContainer.updateTransform] 完全一致，
+     * 叠加层才压在 TextureView 画面的同一位置。
+     */
+    private fun drawSurfaceOverlay(canvas: Canvas) {
+        val frameW = sourceFrameWidth
+        val frameH = sourceFrameHeight
+        if (frameW <= 0 || frameH <= 0) return
+        val rotated = rotationDegrees % 180f != 0f
+        val contentW = if (rotated) frameH else frameW
+        val contentH = if (rotated) frameW else frameH
+        fitContentRect(width.toFloat(), height.toFloat(), contentW.toFloat(), contentH.toFloat())
+
+        visualizationDataRef.get()?.let { data ->
+            drawFaceVisualization(canvas, data, dstRect)
+            drawPoseInfo(canvas, data.headPose)
+        }
+        if (drawUpperBody) {
+            val upperBodyFrame = upperBodyFrameRef.get()
+            if (upperBodyFrame != null && upperBodyFrame.tracking) {
+                drawUpperBodySkeleton(canvas, upperBodyFrame, dstRect)
+            }
+        }
+    }
+
+    /** 与 CameraPreviewSurfaceContainer.updateTransform 相同的 fit-center 显示框。 */
+    private fun fitContentRect(
+        viewWidth: Float,
+        viewHeight: Float,
+        contentWidth: Float,
+        contentHeight: Float,
+    ) {
+        val viewAspect = viewWidth / viewHeight
+        val contentAspect = contentWidth / contentHeight
+        val scale: Float
+        val dx: Float
+        val dy: Float
+        if (contentAspect > viewAspect) {
+            scale = viewWidth / contentWidth
+            dx = 0f
+            dy = (viewHeight - contentHeight * scale) / 2
+        } else {
+            scale = viewHeight / contentHeight
+            dx = (viewWidth - contentWidth * scale) / 2
+            dy = 0f
+        }
+        dstRect.set(dx, dy, dx + contentWidth * scale, dy + contentHeight * scale)
     }
 
     /**
