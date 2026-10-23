@@ -110,7 +110,8 @@ class Yuv420Frame(
    → `context.filesDir/models/<name>`（方便 `adb push` 免重新打包）。创建 landmarker 时按
    「asset 相对路径 → `cacheDir/upperbody_models/` 绝对路径（首次从 assets 复制）→ filesDir
    绝对路径」逐个候选尝试，全部失败才算该后端不可用 —— 这样不依赖 tasks-vision 版本对绝对
-   路径 / 压缩 asset 的支持；模块 `build.gradle` 里同时有 `androidResources { noCompress += "task" }`。
+   路径 / 压缩 asset 的支持；`androidResources { noCompress += "task" }` 必须同时写进 **app 模块**
+   （library 模块里的同名设置不会传递到最终 APK，CI 会断言 APK 内该 entry 为 `ZIP_STORED`）。
    都没有时 `isModelAvailable() = false`、`initialize()` 返回 false 并回调 `onError`，
    App 侧只关功能、不崩。
 5. **GPU → CPU 回退**：GPU delegate 创建失败时自动用 CPU 重建，并回调一次 `onError`（仅提示）。

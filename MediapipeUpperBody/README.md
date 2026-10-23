@@ -82,8 +82,10 @@ adb shell "run-as com.example.virtualfacecapture sh -c 'cat /data/local/tmp/pose
 
 - assets 来源：a → b → c；filesDir 来源：c → a → b；
 - 每个候选失败都会记录一条中文提示并继续下一个；全部失败才算该 backend 不可用；
-- 模块 `build.gradle` 设置了 `androidResources.noCompress += "task"`，正常打包时
-  a 就能命中；b / c 是版本兼容兜底；
+- **noCompress 必须写在 app 模块**：library 里的 `androidResources.noCompress` 不会传递到
+  最终 APK（CI 实测过，APK 里仍是 DEFLATED，MediaPipe 读不到）。本仓库在
+  `app/build.gradle` 与模块 `build.gradle` 各写了一份，CI 还会断言 APK 内该 entry 是
+  `ZIP_STORED`；a 命中后 b / c 只是版本兼容 / adb push 的兜底；
 - 都没有模型时：`isModelAvailable() == false`、`initialize()` 返回 `false` 并回调一次
   `onError`，**不抛异常**，app 只需关掉上半身功能。
 
