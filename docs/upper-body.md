@@ -141,6 +141,13 @@ class Yuv420Frame(
    `isInputSizeBoosted()` / `getStats().avgLatencyMs` 观察帧率与关键点稳定性。
    只改输入预处理尺寸、**不改模型**，三种档位的坐标回映与协议语义完全一致；
    远距离、坐姿、快速转身三类场景的关键点稳定性仍需真机 A/B 验证后再定默认策略。
+   转换内核（`YuvBitmapConverter` / `YuvSampleIndex`）：输出行列 → 源像素的采样映射按
+   「源尺寸 + ROI 尺寸 + rotation + mirror + 输出尺寸」缓存坐标表（`YuvSampleCache`），
+   Y/U/V 平面行索引与 UV 索引摊平成 `rowY/colY/rowUv/colUv` 四张小表（每帧
+   O(输出行+输出列)，几何 / 原点 / stride 未变时免算复用），内层循环只剩数组寻址 +
+   YUV→ARGB；与旧逐像素 `sourceX()/sourceY()` 路径的**逐位等价**由 `YuvSampleIndexTest`
+   对拍保证。Bitmap 仍每帧新建（MediaPipe 异步持有当前 Bitmap，不能简单复用同一张；
+   要做池化只能是**带生命周期确认的 2~3 张环形池**）；JNI / NEON 内核是后续方向。
 2. **镜像**：只镜像像素，不改 MediaPipe 的左右语义（左手仍是 `LEFT_WRIST`）。
 3. **推理**：`LIVE_STREAM` + `detectAsync`，时间戳单调递增（`System.nanoTime()/1_000_000`，
    重复时 +1）；同一时刻只允许一个在飞的 `detectAsync`，来帧过快就丢弃（计入 `dropped`）。
