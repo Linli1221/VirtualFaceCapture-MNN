@@ -234,6 +234,11 @@ The optional upper body feature needs a MediaPipe Pose model; fetch it into
 pwsh -File tools/fetch-pose-model.ps1   # Windows
 ```
 
+> **CI-built APKs already contain the model**: GitHub Actions downloads the lite model and
+> packages it into the APK before building (adds ~5.5 MB; the log shows
+> `Fetch upper-body pose model` / `Verify pose model packaged`). APKs downloaded from Actions
+> work out of the box — only a **local build** needs the script above.
+
 ---
 
 ## 🎮 Controls

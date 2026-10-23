@@ -230,6 +230,10 @@ npm run mock     # 不用手机：启动一个假手机端（ws://127.0.0.1:8765
 pwsh -File tools/fetch-pose-model.ps1   # Windows
 ```
 
+> **CI 构建的安装包自带模型**：GitHub Actions 在打包前会自动下载 lite 模型并打进 APK
+> （体积 +5.5 MB，构建日志里有 `Fetch upper-body pose model` / `Verify pose model packaged`
+> 两步校验）；从 Actions 下载的 APK 开箱可用，只有**本机构建**才需要先跑上面的脚本。
+
 ---
 
 ## 🎮 操作指南

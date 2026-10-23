@@ -97,6 +97,19 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      # 上半身模型（约 5.5 MB）不进 Git（.gitignore 排除 *.task），CI 在构建前下载进 assets。
+      # 不下载的话 APK 里就没有 pose_landmarker_lite.task，手机上会提示「未找到模型」。
+      - name: Fetch upper-body pose model
+        run: |
+          set -euo pipefail
+          mkdir -p MediapipeUpperBody/src/main/assets
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+            -o MediapipeUpperBody/src/main/assets/pose_landmarker_lite.task \
+            https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task
+          bytes=$(wc -c < MediapipeUpperBody/src/main/assets/pose_landmarker_lite.task)
+          echo "pose model downloaded: $bytes bytes"
+          test "$bytes" -gt 1000000
+
       # Release 签名：把 keystore 以 base64 存进仓库 Secret（RELEASE_KEYSTORE_BASE64），
       # 这里解码成临时文件再交给 Gradle（RELEASE_STORE_FILE）。
       # debug 变体也会用这把 key（见 app/build.gradle），所以两个 job 都要准备。
@@ -141,6 +154,21 @@ jobs:
             cp "${{ matrix.aar }}" "dist/facecapture-sdk-${short_sha}.aar"
           fi
           ls -lh dist
+
+      # 兜底校验：模型确实打进了 APK，而且是不压缩的 Stored（对应 library 的 noCompress）。
+      # 少了这一步，线上又会退回「未找到 pose_landmarker_lite.task」。
+      - name: Verify pose model packaged
+        run: |
+          set -euo pipefail
+          python3 - "${{ matrix.apk }}" <<'PY'
+          import sys, zipfile
+          apk = sys.argv[1]
+          with zipfile.ZipFile(apk) as z:
+              info = z.getinfo("assets/pose_landmarker_lite.task")
+              print(f"OK {apk}: {info.filename} {info.file_size} bytes compress_type={info.compress_type}")
+              assert info.file_size > 1_000_000, "model too small"
+              assert info.compress_type == zipfile.ZIP_STORED, "task 必须以 Stored 方式打包"
+          PY
 
       # 把签名证书指纹打到构建日志 / Summary：能直接看出这次用的是正式 key 还是 debug key，
       # 以及多次构建之间签名有没有变。
