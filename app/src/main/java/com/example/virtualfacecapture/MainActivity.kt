@@ -48,6 +48,7 @@ import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.MnnBackend
 import com.example.mediapipefacelandmark.YuvFrameData
 import com.example.virtualfacecapture.tracking.TrackingOutputManager
+import com.example.virtualfacecapture.tracking.TrackingProtocol
 import com.example.virtualfacecapture.ui.theme.VirtualFaceCaptureTheme
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
@@ -1756,18 +1757,42 @@ fun TrackingOutputDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
-                    // 0.5s 发送帧缓冲：先攒满再匀速发，用来吸收推理耗时 / Wi-Fi 抖动
+                    // 生效发送缓冲：协商 / 回落之后的真实值（配置 0 且所有 PC 都声明
+                    // jitterBufferV1 时才是 0；有老客户端时自动回落 500 ms，见协议 §7.1）
                     Text(
-                        text = if (manager.frameBufferMs > 0L) {
-                            "帧缓冲: %d ms（先攒满再匀速发送，端到端延迟 +%.1f s）".format(
-                                manager.frameBufferMs,
-                                manager.frameBufferMs / 1000f,
+                        text = if (manager.effectiveBufferMs.value > 0L) {
+                            "生效发送缓冲: %d ms（先攒满再匀速发送，端到端延迟 +%.1f s）".format(
+                                manager.effectiveBufferMs.value,
+                                manager.effectiveBufferMs.value / 1000f,
                             )
                         } else {
-                            "帧缓冲: 已关闭（最低延迟，帧间隔直接跟随推理耗时）"
+                            "生效发送缓冲: 0 ms（旁路，算完即发；PC 侧 jitterBufferV1 吸收抖动）"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                // 发送模式（send.bufferMs，持久化）：500 ms 保守匀速 / 0 ms 低延迟。
+                // 低延迟只有所有已连接 PC 都声明 jitterBufferV1 时才真正生效，否则回落 500 ms。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = if (manager.sendBufferMs.value == 0L) {
+                            "发送模式: 低延迟（0 ms，算完即发，需 PC 支持 jitterBufferV1）"
+                        } else {
+                            "发送模式: 保守（" + manager.sendBufferMs.value + " ms，匀速发送）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = manager.sendBufferMs.value == 0L,
+                        onCheckedChange = { checked ->
+                            manager.setSendBufferMs(
+                                if (checked) 0L else TrackingProtocol.FRAME_BUFFER_MS
+                            )
+                        }
                     )
                 }
 
@@ -1843,9 +1868,11 @@ fun TrackingOutputDialog(
                 )
 
                 Text(
-                    text = "帧缓冲：追踪帧先攒够 " + manager.frameBufferMs +
-                        " ms 再按生产节奏匀速发给电脑，用来抹平推理耗时 / Wi-Fi 突发带来的帧间隔抖动；" +
-                        "代价是端到端延迟固定多这么多。把 TrackingProtocol.FRAME_BUFFER_MS 改成 0 即可关闭。",
+                    text = "发送缓冲（send.bufferMs）：保守模式（500 ms）下追踪帧先攒够再按生产节奏匀速发给电脑，" +
+                        "抹平推理耗时 / Wi-Fi 突发带来的帧间隔抖动，代价是端到端延迟固定 +0.5 s；" +
+                        "低延迟模式（0 ms）下算完即发，帧间隔抖动由 PC 侧自适应抖动缓冲（jitterBufferV1）吸收。" +
+                        "只有当前所有已连接客户端都声明支持 jitterBufferV1 时低延迟才真正生效，" +
+                        "否则自动回落 500 ms 保守模式（协商与回落规则见 docs/tracking-protocol.md §7.1）。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

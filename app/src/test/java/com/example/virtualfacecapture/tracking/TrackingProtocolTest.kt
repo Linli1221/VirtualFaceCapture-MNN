@@ -21,6 +21,8 @@ import org.junit.Test
  *  3. hello / status / calib / pong / ack / bye 的 JSON 合法性
  *  4. 客户端上行 ping / command / 畸形 JSON 的分类（必须是 PING / RECALIBRATE / IGNORED，且不抛异常）
  *  5. 上半身增量字段（hello.upperBody、track.ubOk/ub/ubT/body）的开关、边界与数值清洗
+ *  6. 客户端 hello 协商（§4.5）：CLIENT_HELLO 归类与 features 解析（宽容、纯函数）
+ *  7. send.bufferMs 配置归一化与生效缓冲回落规则（§7.1 的纯函数）
  */
 class TrackingProtocolTest {
 
@@ -586,5 +588,126 @@ class TrackingProtocolTest {
     fun trackWithUpperBodyFitsOnePointTwoKilobytes() {
         val bytes = buildTrackWithUpperBody(sampleUpperBody(), true).toByteArray(Charsets.UTF_8)
         assertTrue("开启上半身后单帧应 < 1.2KB，实际 " + bytes.size, bytes.size < 1229)
+    }
+
+    // ------------------------------------------- 客户端 hello 协商（§4.5）
+
+    @Test
+    fun clientHelloIsClassifiedAsClientHello() {
+        val message = """{"type":"hello","protocol":"vfc-tracker","version":1,"features":["jitterBufferV1"],"t":1730000000000}"""
+        assertEquals(
+            TrackingProtocol.ClientMessage.CLIENT_HELLO,
+            TrackingProtocol.classifyClientMessage(message),
+        )
+    }
+
+    @Test
+    fun clientHelloFeaturesParseJitterBufferV1() {
+        val message = """{"type":"hello","protocol":"vfc-tracker","version":1,"features":["jitterBufferV1"],"t":1730000000000}"""
+        val features = TrackingProtocol.parseClientFeatures(message)
+        assertEquals(setOf(TrackingProtocol.FEATURE_JITTER_BUFFER_V1), features)
+    }
+
+    @Test
+    fun clientHelloFeaturesKeepUnknownNamesAndDeduplicate() {
+        // 未知能力名原样保留（调用方只认自己认识的）、去重但保持出现顺序
+        val message = """{"type":"hello","features":["jitterBufferV1","foo","jitterBufferV1","bar"]}"""
+        val features = TrackingProtocol.parseClientFeatures(message)
+        assertEquals(listOf("jitterBufferV1", "foo", "bar"), features.toList())
+    }
+
+    @Test
+    fun clientHelloWithoutFeaturesYieldsEmptySet() {
+        // 老客户端不发 hello / 不带 features 都必须完全兼容
+        assertEquals(emptySet<String>(), TrackingProtocol.parseClientFeatures("""{"type":"hello"}"""))
+        assertEquals(
+            emptySet<String>(),
+            TrackingProtocol.parseClientFeatures("""{"type":"hello","features":[]}"""),
+        )
+        // features 不是数组（畸形）→ 空集合
+        assertEquals(
+            emptySet<String>(),
+            TrackingProtocol.parseClientFeatures("""{"type":"hello","features":"jitterBufferV1"}"""),
+        )
+    }
+
+    @Test
+    fun clientHelloFeaturesTolerateMalformedJson() {
+        // 非字符串元素跳过；引号未闭合就截断返回已解析部分；绝不能抛异常
+        assertEquals(
+            setOf(TrackingProtocol.FEATURE_JITTER_BUFFER_V1),
+            TrackingProtocol.parseClientFeatures("""{"features":[1,"jitterBufferV1",true,null]}"""),
+        )
+        assertEquals(
+            setOf("a"),
+            TrackingProtocol.parseClientFeatures("""{"features":["a","b"""),   // 未闭合
+        )
+        assertEquals(
+            emptySet<String>(),
+            TrackingProtocol.parseClientFeatures("""{"features":[}"""),
+        )
+        assertEquals(
+            emptySet<String>(),
+            TrackingProtocol.parseClientFeatures("not json at all"),
+        )
+    }
+
+    @Test
+    fun unknownClientTypesRemainIgnored() {
+        // hello 归类是纯增量：其它未知 type 的忽略行为不许变
+        for (message in listOf(
+            """{"type":"hello2","features":["jitterBufferV1"]}""",
+            """{"type":"HELLO","features":["jitterBufferV1"]}""",
+            """{"features":["jitterBufferV1"]}""",
+        )) {
+            assertEquals(
+                "未知 type 必须继续忽略: " + message,
+                TrackingProtocol.ClientMessage.IGNORED,
+                TrackingProtocol.classifyClientMessage(message),
+            )
+        }
+    }
+
+    // --------------------------------- send.bufferMs 配置与生效缓冲规则（§7.1）
+
+    @Test
+    fun normalizeSendBufferMsAcceptsOnlyZeroOrHundredToTwoThousand() {
+        // 合法值原样返回
+        assertEquals(0L, TrackingProtocol.normalizeSendBufferMs(0L))
+        assertEquals(100L, TrackingProtocol.normalizeSendBufferMs(100L))
+        assertEquals(500L, TrackingProtocol.normalizeSendBufferMs(500L))
+        assertEquals(2000L, TrackingProtocol.normalizeSendBufferMs(2000L))
+        // 其它值一律回落保守 500
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.normalizeSendBufferMs(1L))
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.normalizeSendBufferMs(99L))
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.normalizeSendBufferMs(-1L))
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.normalizeSendBufferMs(2001L))
+        assertEquals(
+            TrackingProtocol.FRAME_BUFFER_MS,
+            TrackingProtocol.normalizeSendBufferMs(Long.MAX_VALUE),
+        )
+    }
+
+    @Test
+    fun effectiveBufferAlwaysFollowsPositiveConfig() {
+        // 配置 > 0：不管客户端协商结果如何都等于配置值（第一步验证模式，手机保留 500 ms）
+        assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(500L, 0, 0))
+        assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(500L, 2, 2))
+        assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(500L, 1, 0))
+        assertEquals(2000L, TrackingProtocol.resolveEffectiveBufferMs(2000L, 1, 0))
+        // 非法配置先归一化成 500，仍走「配置 > 0 恒生效」
+        assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(300L, 1, 0))
+    }
+
+    @Test
+    fun effectiveBufferZeroRequiresEveryClientToDeclareJitterBufferV1() {
+        // 全部声明 jitterBufferV1（含「无客户端」这一无所谓的情形）→ 才允许真正旁路
+        assertEquals(0L, TrackingProtocol.resolveEffectiveBufferMs(0L, 0, 0))
+        assertEquals(0L, TrackingProtocol.resolveEffectiveBufferMs(0L, 2, 2))
+        assertEquals(0L, TrackingProtocol.resolveEffectiveBufferMs(0L, 1, 1))
+        // 有一个没声明（含老 PC、还没发 hello 的新连接）→ 回落 FRAME_BUFFER_MS
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 2, 1))
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 1, 0))
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 4, 3))
     }
 }

@@ -52,9 +52,39 @@ object TrackingProtocol {
      * PC 端的 Live2D 看起来就是一卡一卡。固定 0.5 s 的缓冲能把输出帧间隔抹平，
      * 代价是端到端延迟固定多 0.5 s（协议 §7.1 / §9）。
      *
-     * 设为 0 即关闭缓冲，退化为「算完就发」的最低延迟模式。
+     * 这个常量现在是 `send.bufferMs` 配置的**默认值与坏值回落值**（见
+     * [normalizeSendBufferMs]）；用户可以把配置改成 0（算完即发，但需 PC 声明
+     * [FEATURE_JITTER_BUFFER_V1]，见 [resolveEffectiveBufferMs]）或
+     * [SEND_BUFFER_MIN_MS] ~ [SEND_BUFFER_MAX_MS] 之间的值。
      */
     const val FRAME_BUFFER_MS = 500L
+
+    /**
+     * 手机端发送缓冲配置 `send.bufferMs` 的合法区间（毫秒）。
+     *
+     * 合法值只有 0（关闭缓冲，算完即发）或 [SEND_BUFFER_MIN_MS] ~ [SEND_BUFFER_MAX_MS]；
+     * 其它任何值（负数、1~99、超过上限、SharedPreferences 里被写坏的值）一律回落
+     * [FRAME_BUFFER_MS]，保证「坏配置 = 保守模式」而不是「坏配置 = 悄悄变成低延迟」。
+     */
+    const val SEND_BUFFER_MIN_MS = 100L
+    const val SEND_BUFFER_MAX_MS = 2000L
+
+    /**
+     * 客户端能力标记：PC 侧实现了自适应抖动缓冲（jitterBufferV1）。
+     *
+     * 只有当**所有**已连接客户端都在 hello.features 里声明了它，手机才被允许把
+     * `send.bufferMs` 配成 0（延迟责任移交给 PC，见 §7.1 与 docs/jitter-buffer.md）。
+     */
+    const val FEATURE_JITTER_BUFFER_V1 = "jitterBufferV1"
+
+    /**
+     * 客户端能力标记：PC 侧实现了上半身后处理（One-Euro / 躯干角 / TorsoBaseline，任务 M2）。
+     *
+     * PC 在 hello.features 里声明它（或在顶层带 `"upperBodyPostV1":true` 布尔兜底）后，
+     * 手机才被允许把该连接标记为「已协商」，track 里才可能出现 `ubRaw` / `ubRawBody`
+     * 与「未平滑、未减基线」语义的 `body`（见 [buildTrack]）。
+     */
+    const val FEATURE_UPPER_BODY_POST_V1 = "upperBodyPostV1"
 
     /** 唯一的 command 名，等价于 UI 上的 Reset Baseline。 */
     const val COMMAND_RECALIBRATE = "recalibrate"
@@ -196,6 +226,8 @@ object TrackingProtocol {
      *
      * @param upperBody 手机端上半身采集是否启用；true 时追加可选字段 `"upperBody":true`，
      *   关闭时不出现该字段（老客户端忽略未知字段）。
+     * @param upperBodyPostV1 能力声明（任务 M2）：手机端上半身启用且后处理可迁 PC 时传 true，
+     *   追加可选字段 `"upperBodyPostV1":true`；默认 false 时不出现该字段，报文与 M1 逐字节一致。
      */
     fun buildHello(
         device: String,
@@ -203,6 +235,7 @@ object TrackingProtocol {
         decimation: Int = DEFAULT_DECIMATION,
         targetFps: Int = 60,
         upperBody: Boolean = false,
+        upperBodyPostV1: Boolean = false,
         timestampMs: Long = System.currentTimeMillis(),
     ): String {
         val builder = StringBuilder(160)
@@ -215,6 +248,8 @@ object TrackingProtocol {
         builder.jsonLong("targetFps", targetFps.coerceIn(1, 240).toLong())
         // §4.1 可选字段：只在手机端开启上半身采集时下发 true；关闭时字段不出现（保持报文精简）。
         if (upperBody) builder.jsonBool("upperBody", true)
+        // 任务 M2 可选能力声明：默认不发，老客户端/老链路的报文逐字节不变。
+        if (upperBodyPostV1) builder.jsonBool("upperBodyPostV1", true)
         builder.jsonLong("t", timestampMs)
         builder.append('}')
         return builder.toString()
@@ -227,6 +262,20 @@ object TrackingProtocol {
      * @param upperBody 可选上半身帧；null = 未开启，报文里**不出现** ubOk / ub / ubT / body。
      * @param upperBodyOk 本帧上半身结果是否可用；false 时仍发 ubOk:false、ub 与 body 全 0
      *   （结构稳定，客户端据 ubOk 回默认姿态）。
+     * @param upperBodyPostV1 本连接（广播场景下 = 全体客户端聚合）是否已协商 upperBodyPostV1
+     *   （任务 M2）。默认 false：输出与改动前**逐字节一致**。
+     *
+     * **ubRaw 语义（任务 M2，`raw` 判定 = `upperBodyPostV1 && upperBody.rawMode`）**：
+     *  - `raw` 判定为真时在 `body` 之后追加 `"ubRaw":true` 与 `"ubRawBody":[roll,yaw]`；
+     *    `ubRaw:true` 声明本帧 `ub` 是**未做 One-Euro、未减基线的原始点**
+     *    （x/y 已镜像、z 仍为相对深度）。
+     *  - 此时 `body` = **原始躯干角（未平滑、未减基线）**，与 `ubRawBody` 同值同义
+     *    （`ubRawBody` 是显式命名的别名，供客户端按名取角；两者一致，若不一致以 `ubRawBody` 为准）。
+     *  - `ubRaw` 缺省（false）时 `body` 语义与 M1 **完全一致** = 平滑 + 基线后的相对躯干角。
+     *    不存在「字段名没变但语义变了」：语义由 `ubRaw` 显式声明，两种模式各自写清。
+     *  - `ubOk` / `ub` / `ubT` / `body` 的全有或全无规则不变（`ubOk=false` 时 ub 52 个 0、
+     *    body 全 0 占位、结构稳定）；`ubOk=false` 时 `ubRaw` / `ubRawBody` 在 raw 判定为真时
+     *    **照样出现**（`ubRawBody` 为 [0,0]），保持逐帧语义一致。
      */
     fun buildTrack(
         seq: Long,
@@ -239,6 +288,7 @@ object TrackingProtocol {
         calibrating: Boolean,
         upperBody: UpperBodyPoseFrame? = null,
         upperBodyOk: Boolean = upperBody != null && upperBody.isUsable(),
+        upperBodyPostV1: Boolean = false,
     ): String {
         // 开启上半身时多 52 个数，预留大一点的容量，避免 StringBuilder 中途扩容
         val builder = StringBuilder(if (upperBody != null) 1024 else 640)
@@ -266,6 +316,8 @@ object TrackingProtocol {
         // ubOk=false 时仍保持结构稳定：ub = 52 个 0、body = [0,0]，客户端据 ubOk 回默认姿态。
         if (upperBody != null) {
             val ok = upperBodyOk && upperBody.tracking
+            // 任务 M2 raw 判定：已协商 + 本帧是原始输出。ubOk=false 时照样出现（值 [0,0]）。
+            val raw = upperBodyPostV1 && upperBody.rawMode
             builder.jsonBool("ubOk", ok)
             builder.jsonKey("ub").append('[')
             if (ok) {
@@ -284,6 +336,15 @@ object TrackingProtocol {
             builder.append(',')
             appendDecimal4(builder, if (ok) sanitized(upperBody.torso.yaw, -180f, 180f) else 0f)
             builder.append(']')
+            // 任务 M2：raw 帧显式声明语义。body 与 ubRawBody 同值同义（不一致时以 ubRawBody 为准）。
+            if (raw) {
+                builder.jsonBool("ubRaw", true)
+                builder.jsonKey("ubRawBody").append('[')
+                appendDecimal4(builder, if (ok) sanitized(upperBody.torso.roll, -180f, 180f) else 0f)
+                builder.append(',')
+                appendDecimal4(builder, if (ok) sanitized(upperBody.torso.yaw, -180f, 180f) else 0f)
+                builder.append(']')
+            }
         }
         builder.append('}')
         return builder.toString()
@@ -303,6 +364,7 @@ object TrackingProtocol {
         calibrating: Boolean,
         upperBody: UpperBodyPoseFrame? = null,
         upperBodyOk: Boolean = upperBody != null && upperBody.isUsable(),
+        upperBodyPostV1: Boolean = false,
     ): String = buildTrack(
         seq = seq,
         timestampMs = timestampMs,
@@ -314,6 +376,7 @@ object TrackingProtocol {
         calibrating = calibrating,
         upperBody = upperBody,
         upperBodyOk = upperBodyOk,
+        upperBodyPostV1 = upperBodyPostV1,
     )
 
     /** §4.3 calib：进入 / 离开校准窗口各一次。 */
@@ -376,23 +439,67 @@ object TrackingProtocol {
         return builder.toString()
     }
 
+    // ------------------------------------------------- 发送缓冲配置（send.bufferMs）
+
+    /**
+     * 归一化 `send.bufferMs` 配置值：合法值 0 或 [SEND_BUFFER_MIN_MS]..[SEND_BUFFER_MAX_MS] 原样返回，
+     * 其它任何值（负数、1~99、超过上限）一律回落 [FRAME_BUFFER_MS]。
+     *
+     * SharedPreferences 里可能存着被旧版本 / 用户写坏的值，读出来必须先过这里再用。
+     */
+    fun normalizeSendBufferMs(rawMs: Long): Long =
+        if (rawMs == 0L || rawMs in SEND_BUFFER_MIN_MS..SEND_BUFFER_MAX_MS) rawMs else FRAME_BUFFER_MS
+
+    /**
+     * 生效缓冲时长（协议 §7.1）：决定是否旁路 [TrackingFrameBuffer] 的纯规则。
+     *
+     *  - 配置 > 0 → 恒等于配置值（保守模式：手机自己保留发送帧缓冲）；
+     *  - 配置 == 0 → 仅当**当前所有已连接客户端**都声明了 [FEATURE_JITTER_BUFFER_V1] 才为 0
+     *    （延迟责任移交 PC 侧自适应抖动缓冲）；只要有一个客户端没声明（含老 PC、
+     *    还没来得及发 hello 的新连接），就回落 [FRAME_BUFFER_MS]；
+     *  - 无客户端时无所谓（本来就不发帧），按「全部满足」处理返回 0。
+     *
+     * @param clientCount 当前已连接的 WS 客户端数。
+     * @param jitterCapableClients 其中声明了 [FEATURE_JITTER_BUFFER_V1] 的数量。
+     */
+    fun resolveEffectiveBufferMs(
+        configuredMs: Long,
+        clientCount: Int,
+        jitterCapableClients: Int,
+    ): Long {
+        val configured = normalizeSendBufferMs(configuredMs)
+        if (configured > 0L) return configured
+        if (clientCount <= 0) return 0L
+        return if (jitterCapableClients >= clientCount) 0L else FRAME_BUFFER_MS
+    }
+
     // ------------------------------------------------------------- 消息解析
 
     /**
      * 解析顶层字段 name 的字符串值（只处理我们需要的 type / name 这类扁平字段）。
      *
-     * 手写扫描而不是上 JSON 库：客户端上行只有 ping / command，量极小，
+     * 手写扫描而不是上 JSON 库：客户端上行只有 ping / command / hello，量极小，
      * 但服务端不应该为此引入反射式解析器。未知结构一律返回 null（协议要求忽略）。
      */
     fun parseStringField(message: String, name: String): String? {
         val start = findValueStart(message, name) ?: return null
         if (start >= message.length || message[start] != QUOTE) return null
+        return readQuotedString(message, start)?.first
+    }
+
+    /**
+     * 从下标 [startQuote]（必须指向引号）读一个 JSON 字符串，返回「内容 + 结束下标（右引号后一位）」。
+     *
+     * 引号未闭合 / 转义非法时返回 null（与「未知结构一律忽略」一致，绝不抛异常）。
+     * [parseStringField] 与 [parseClientFeatures] 共用这段转义处理，保证两处行为一致。
+     */
+    private fun readQuotedString(message: String, startQuote: Int): Pair<String, Int>? {
         val builder = StringBuilder(16)
-        var index = start + 1
+        var index = startQuote + 1
         while (index < message.length) {
             val ch = message[index]
             when {
-                ch == QUOTE -> return builder.toString()
+                ch == QUOTE -> return builder.toString() to (index + 1)
                 ch.code == BACKSLASH_CODE -> {
                     index++
                     if (index >= message.length) return null
@@ -437,16 +544,100 @@ object TrackingProtocol {
         return if (negative) -value else value
     }
 
+    /**
+     * 解析顶层字段 name 的布尔值，不存在或不是 `true` / `false` 字面量时返回 null。
+     *
+     * 与 [parseLongField] 一样是手写扫描（上行报文量极小，不引入 JSON 库）：
+     * 字段值必须完整是 `true` / `false`（后面紧跟字母 / 数字 / 下划线的不算，如 `truex`），
+     * 其它一律返回 null（字符串 `"true"`、数字 1、`null`、畸形输入都不认）。
+     */
+    fun parseBoolField(message: String, name: String): Boolean? {
+        val start = findValueStart(message, name) ?: return null
+        return when {
+            matchesLiteral(message, start, "true") -> true
+            matchesLiteral(message, start, "false") -> false
+            else -> null
+        }
+    }
+
+    /** [start] 起是否完整匹配 [literal]（后面不允许紧跟标识符字符），用于 [parseBoolField]。 */
+    private fun matchesLiteral(message: String, start: Int, literal: String): Boolean {
+        val end = start + literal.length
+        if (end > message.length) return false
+        for (offset in literal.indices) {
+            if (message[start + offset] != literal[offset]) return false
+        }
+        if (end < message.length) {
+            val next = message[end]
+            if (next.isLetterOrDigit() || next == '_') return false
+        }
+        return true
+    }
+
     /** 形如 type 字段为 ping 的消息返回 "ping"；不是合法对象 / 没有 type 时返回 null。 */
     fun parseType(message: String): String? = parseStringField(message, "type")
 
-    /** 客户端上行消息的分类结果（协议 §3 / §4.4）。 */
+    /**
+     * 解析客户端 hello 里的 `features` 字符串数组（协议 §4.5），返回能力标记集合。
+     *
+     * 纯函数、不依赖 Android API，可在 JVM 单测里直接验证。宽容解析（协议要求
+     * 「未知字段必须忽略」，这里绝不抛异常）：
+     *
+     *  - `features` 字段缺失 / 不是数组 → 空集合（老客户端不发也完全兼容）；
+     *  - 数组里的非字符串元素、畸形转义直接跳过 / 截断，返回已解析出的部分；
+     *  - 未知的能力名**原样保留**（调用方只认自己认识的，其余忽略）；
+     *  - 去重但保持出现顺序（LinkedHashSet，日志可读性好）。
+     */
+    fun parseClientFeatures(message: String): Set<String> {
+        val start = findValueStart(message, "features") ?: return emptySet()
+        if (start >= message.length || message[start] != '[') return emptySet()
+        val features = LinkedHashSet<String>()
+        var index = start + 1
+        while (index < message.length) {
+            when (val ch = message[index]) {
+                ']' -> return features
+                ',' -> index++
+                '[' -> return features   // 数组里不允许再嵌数组：截断，返回已解析部分
+                else -> if (ch.isWhitespace()) {
+                    index++
+                } else if (ch == QUOTE) {
+                    val parsed = readQuotedString(message, index) ?: return features
+                    features.add(parsed.first)
+                    index = parsed.second
+                } else {
+                    // 非字符串元素（数字 / true / null …）：按协议忽略，跳到下一个逗号或数组尾
+                    val end = indexOfAnyChar(message, index, ',', ']')
+                    index = if (end < 0) return features else end
+                }
+            }
+        }
+        return features
+    }
+
+    /** 找 [chars] 中任意字符在 [from] 之后第一次出现的下标；都没有就返回 -1。 */
+    private fun indexOfAnyChar(message: String, from: Int, vararg chars: Char): Int {
+        for (index in from until message.length) {
+            if (message[index] in chars) return index
+        }
+        return -1
+    }
+
+    /** 客户端上行消息的分类结果（协议 §3 / §4.4 / §4.5）。 */
     enum class ClientMessage {
         /** 心跳：回 pong（原样回带 t）。 */
         PING,
 
         /** command:recalibrate：触发重置基线并回 ack。 */
         RECALIBRATE,
+
+        /**
+         * 客户端能力声明 hello（§4.5）：记录 [parseClientFeatures] 解析出的 feature 集合，
+         * 并按 §7.1 重算生效发送缓冲（纯增量，老客户端不发也完全兼容）。
+         * 任务 M2：`features` 含 [FEATURE_UPPER_BODY_POST_V1] 或顶层布尔
+         * `"upperBodyPostV1":true`（[parseBoolField] 兜底）任一命中时，该连接标记为
+         * 「已协商 upperBodyPostV1」，track 才可能携带 `ubRaw` / `ubRawBody`。
+         */
+        CLIENT_HELLO,
 
         /** 未知 type / 未知 command / 畸形 JSON：静默忽略（向前兼容，不抛异常）。 */
         IGNORED,
@@ -466,6 +657,7 @@ object TrackingProtocol {
             } else {
                 ClientMessage.IGNORED
             }
+            "hello" -> ClientMessage.CLIENT_HELLO
             else -> ClientMessage.IGNORED
         }
     }

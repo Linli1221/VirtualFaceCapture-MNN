@@ -21,9 +21,11 @@ import kotlin.math.roundToInt
  *
  * 与旧的 WebOutputManager（编码 + 推 WebP 帧）的区别：
  *  - 没有任何图像编码 / GL 抓帧，手机端零编码开销；
- *  - 一帧只做一次 JSON 序列化（不做图像），慢客户端只会丢帧；
- *  - 发送前先过 **0.5 s 发送帧缓冲**（[TrackingProtocol.FRAME_BUFFER_MS]），
- *    把推理耗时抖动 / Wi-Fi 突发抹平成均匀的帧间隔，代价是端到端延迟 +0.5 s。
+ *  - 一帧只做一次 JSON 序列化（不做图像），慢客户端只会丢最旧的 track；
+ *  - 发送缓冲是**双模式**的（协议 §7.1，配置 key `send.bufferMs`）：
+ *    500 ms 保守模式 = 先攒满再匀速放行，把推理耗时抖动 / Wi-Fi 突发抹平成均匀帧间隔，
+ *    代价是端到端延迟 +0.5 s；0 ms 低延迟模式 = 算完即发，抖动缓冲责任移交 PC 侧
+ *    （需 PC 声明 jitterBufferV1，见 docs/jitter-buffer.md），协商不通过时自动回落保守模式。
  *
  * UI 直接读这里的 Compose State 即可。
  */
@@ -35,10 +37,28 @@ class TrackingOutputManager(
     companion object {
         private const val TAG = "TrackingOutputManager"
         const val PORT = TrackingProtocol.PORT
+
+        /** 发送缓冲配置的 SharedPreferences key（协议 §7.1 的 `send.bufferMs`）。 */
+        const val PREF_SEND_BUFFER_MS = "send.bufferMs"
+
+        /** 与相机选择共用的应用 prefs 文件（MainActivity 的 CAMERA_PREFS_NAME）。 */
+        private const val PREFS_NAME = "face_capture_prefs"
     }
 
-    /** 手机端发送帧缓冲时长（毫秒），供 UI 展示；0 表示未启用缓冲。 */
-    val frameBufferMs: Long = TrackingProtocol.FRAME_BUFFER_MS
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /**
+     * 发送缓冲配置 `send.bufferMs`（毫秒）：500 = 保守匀速；0 = 低延迟（算完即发，
+     * 需 PC 支持 jitterBufferV1）。UI 持久化走 [setSendBufferMs]。
+     */
+    val sendBufferMs = mutableStateOf(
+        TrackingProtocol.normalizeSendBufferMs(
+            prefs.getLong(PREF_SEND_BUFFER_MS, TrackingProtocol.FRAME_BUFFER_MS)
+        )
+    )
+
+    /** 当前**生效**发送缓冲（0 = 旁路模式）：协商 / 回落之后的真实值，运行中由 stats 轮询刷新。 */
+    val effectiveBufferMs = mutableStateOf(sendBufferMs.value)
 
     // ---- UI 状态 ----------------------------------------------------------
 
@@ -95,6 +115,8 @@ class TrackingOutputManager(
             clientCount.value = current?.clientCount ?: 0
             outputFps.value = current?.sentFps ?: 0f
             latestSeq.value = current?.latestSeq ?: 0L
+            // 生效缓冲会随 hello 协商 / 客户端进出在 0 与非 0 之间变，UI 显示真实值
+            effectiveBufferMs.value = current?.effectiveBufferMs ?: sendBufferMs.value
             mainHandler.postDelayed(this, 500L)
         }
     }
@@ -110,7 +132,7 @@ class TrackingOutputManager(
             deviceName = deviceName,
             appName = appName,
             onRecalibrate = onRecalibrate,
-            frameBufferMs = frameBufferMs,
+            frameBufferMs = sendBufferMs.value,
         )
         newServer.trackingActive = trackingFlag
         newServer.setUpperBodyEnabled(upperBodyFlag)
@@ -127,6 +149,7 @@ class TrackingOutputManager(
         clientCount.value = 0
         outputFps.value = 0f
         latestSeq.value = 0L
+        effectiveBufferMs.value = newServer.effectiveBufferMs
 
         mainHandler.post(statsRunnable)
         keepScreenOn(true)
@@ -181,6 +204,22 @@ class TrackingOutputManager(
     fun setUpperBodyEnabled(enabled: Boolean) {
         upperBodyFlag = enabled
         server?.setUpperBodyEnabled(enabled)
+    }
+
+    /**
+     * 修改发送缓冲配置 `send.bufferMs`（协议 §7.1）：立即持久化到 SharedPreferences，
+     * 运行中的服务立即生效（[TrackingServer.setSendBufferMs]），下次启动沿用。
+     *
+     * 传入非法值时由 [TrackingProtocol.normalizeSendBufferMs] 归一化（坏值 = 回落 500）；
+     * UI 只提供 0（低延迟）/ 500（保守）两档，配置本身允许 100~2000（直接改 prefs 即可）。
+     */
+    fun setSendBufferMs(valueMs: Long) {
+        val normalized = TrackingProtocol.normalizeSendBufferMs(valueMs)
+        sendBufferMs.value = normalized
+        prefs.edit().putLong(PREF_SEND_BUFFER_MS, normalized).apply()
+        server?.setSendBufferMs(normalized)
+        effectiveBufferMs.value = server?.effectiveBufferMs ?: normalized
+        Log.i(TAG, "send.bufferMs 已设为 " + normalized + " ms")
     }
 
     /**

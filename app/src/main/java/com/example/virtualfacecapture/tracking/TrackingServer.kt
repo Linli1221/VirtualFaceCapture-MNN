@@ -19,7 +19,6 @@ import java.net.SocketTimeoutException
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,17 +38,33 @@ import kotlin.concurrent.withLock
  *    WS  /ws          -> 追踪数据长连接（协议 §4）
  *    GET /favicon.ico -> 204
  *
- * 数据流：面捕管线的每帧结果由 [submitTrack] 推进来 → 手写 JSON → 进**发送帧缓冲**
- * （默认 0.5 s，见 [TrackingFrameBuffer]）→ 缓冲线程按生产节奏匀速放行 → 每个客户端
- * 各自一个「最新一帧」槽位（覆盖式写入）。网络慢的客户端只会丢帧，绝不会拖慢推理线程。
- * 控制类消息（hello / calib / pong / ack / bye）走独立小队列，不会被数据帧冲掉。
+ * 数据流：面捕管线的每帧结果由 [submitTrack] 推进来 → 手写 JSON →（生效缓冲 > 0 时）进
+ * **发送帧缓冲**（[TrackingFrameBuffer]，攒够再按生产节奏匀速放行；生效缓冲 == 0 时
+ * **旁路**缓冲、算完即发）→ 每个客户端一个**有限 FIFO 发送队列**（[TrackingSendQueue]，
+ * track 与 control 同队严格保序）。网络慢的客户端只会丢最旧的 track，绝不会拖慢推理线程。
+ *
+ * 发送缓冲是**双模式**的（协议 §7.1）：`send.bufferMs` 配置 > 0 时手机自己保留固定延迟
+ * （保守模式，起播预缓冲 + 匀速放行）；配置 == 0 时只有**当前所有已连接客户端**都在
+ * hello.features 里声明了 `jitterBufferV1` 才真正旁路（延迟责任移交 PC 侧自适应抖动缓冲，
+ * 见 docs/jitter-buffer.md），否则回落 [TrackingProtocol.FRAME_BUFFER_MS]。规则的纯函数实现在
+ * [TrackingProtocol.resolveEffectiveBufferMs]，当前生效值见 [effectiveBufferMs]。
  */
 class TrackingServer(
     private val port: Int = TrackingProtocol.PORT,
     private val deviceName: String,
     private val appName: String,
     private val onRecalibrate: () -> Unit = {},
-    /** 发送帧缓冲时长（毫秒）；0 = 关闭缓冲，算完就发。见 [TrackingProtocol.FRAME_BUFFER_MS]。 */
+    /**
+     * 「全局 upperBodyPostV1 协商」结果变化时的通知回调（任务 M2，照 [onRecalibrate] 的
+     * 接线模式）：true = 全体客户端都声明了 upperBodyPostV1，上层把检测器切到原始输出
+     * （One-Euro / 躯干角 / 基线迁 PC）；false = 回到 M1 的手机端后处理链。
+     */
+    private val onUpperBodyPostV1: (Boolean) -> Unit = {},
+    /**
+     * 发送缓冲配置 `send.bufferMs`（毫秒）：0 = 算完即发（能否真正旁路还要看客户端协商），
+     * 100~2000 = 保守模式的固定缓冲时长；非法值回落 [TrackingProtocol.FRAME_BUFFER_MS]。
+     * 运行时可用 [setSendBufferMs] 修改（立即生效）。
+     */
     private val frameBufferMs: Long = TrackingProtocol.FRAME_BUFFER_MS,
 ) {
 
@@ -150,13 +165,39 @@ class TrackingServer(
     /** 最近一个统计窗口内真正广播出去的帧数。 */
     private val framesInWindow = AtomicInteger(0)
 
+    /** `send.bufferMs` 配置值（已过 [TrackingProtocol.normalizeSendBufferMs] 归一化）。 */
+    @Volatile
+    private var configuredBufferMs: Long = TrackingProtocol.normalizeSendBufferMs(frameBufferMs)
+
     /**
-     * 发送帧缓冲：先攒 [frameBufferMs] 再匀速放行（协议 §7.1）。
+     * 当前**生效**发送缓冲（毫秒）：0 = 旁路 [frameBuffer]（算完即发），> 0 = 缓冲时长。
+     *
+     * 规则见 [TrackingProtocol.resolveEffectiveBufferMs]；在客户端连入 / 断开 / hello 协商 /
+     * 配置变化时由 [recomputeEffectiveBuffer] 重算。
+     */
+    @Volatile
+    private var activeBufferMs: Long =
+        TrackingProtocol.resolveEffectiveBufferMs(configuredBufferMs, 0, 0)
+
+    /** 只读：当前生效发送缓冲（0 = 旁路模式）。UI / 日志用。 */
+    val effectiveBufferMs: Long
+        get() = activeBufferMs
+
+    /**
+     * 发送帧缓冲：生效缓冲 > 0 时先攒 [activeBufferMs] 再匀速放行（协议 §7.1），
+     * 生效缓冲 == 0 时 [dispatch] 根本不入队（旁路），这个实例只是闲置。
      *
      * 内部不是线程安全的，[frameBuffer] 的每一次访问都要在 [frameBufferLock] 里；
      * 入队 / 停止后 signal [frameBufferCondition]，让 [playoutThread] 立刻重算到期时间。
+     *
+     * 实例的 bufferMs 取「配置值；配置为 0 时取回落值 [TrackingProtocol.FRAME_BUFFER_MS]」——
+     * 因此「配置 0 + 客户端不支持」的回落路径用的就是这个 500 ms 实例。[setSendBufferMs]
+     * 改配置时在锁内整体换新实例（旧实例连同没放行完的帧直接丢弃）。
      */
-    private val frameBuffer = TrackingFrameBuffer(frameBufferMs)
+    @Volatile
+    private var frameBuffer = TrackingFrameBuffer(
+        if (configuredBufferMs > 0L) configuredBufferMs else TrackingProtocol.FRAME_BUFFER_MS,
+    )
     private val frameBufferLock = ReentrantLock()
     private val frameBufferCondition = frameBufferLock.newCondition()
 
@@ -188,6 +229,20 @@ class TrackingServer(
 
     /** 已启用上半身但还没收到任何帧时的占位帧（tracking=false、ubT=0、坐标全 0）。 */
     private val emptyUpperBodyFrame = UpperBodyPoseFrame.empty(0L)
+
+    /** 同上的 raw 模式占位帧（rawMode=true）：协商生效期间逐帧语义一致，ubRaw 不来回跳。 */
+    private val emptyRawUpperBodyFrame = UpperBodyPoseFrame.empty(0L).copy(rawMode = true)
+
+    /**
+     * 全局 upperBodyPostV1 协商结果（任务 M2）：所有已连接客户端都协商了才为 true。
+     *
+     * track 报文是全客户端广播同一条（[dispatch] / 帧缓冲），无法逐客户端出两种语义，
+     * 所以 raw 模式按「全体一致」聚合；混合客户端时全体回退旧链，每个客户端收到的语义
+     * 与其协商一致（`ubRaw` 不出现即旧语义）。由 [recomputeUpperBodyPostV1] 在客户端
+     * 连入 / 断开 / hello 协商到达时重算。
+     */
+    @Volatile
+    private var upperBodyPostV1Active: Boolean = false
 
     /** @return 是否成功监听；失败原因见 [lastError]。 */
     fun start(): Boolean {
@@ -229,13 +284,13 @@ class TrackingServer(
             it.isDaemon = true
             it.start()
         }
-        // 缓冲关闭时不需要放行线程：dispatch() 直接广播
-        if (frameBufferMs > 0L) {
-            val playoutId = playoutGeneration.incrementAndGet()
-            playoutThread = Thread({ playoutLoop(playoutId) }, "tracking-playout").also {
-                it.isDaemon = true
-                it.start()
-            }
+        // 放行线程始终启动：生效缓冲会在客户端协商时于 0 与非 0 之间来回切换，
+        // 「按需启停线程」反而要在切换点处理竞态；空转代价可忽略（队列为空时最多每
+        // 50 ms 醒来一次就继续睡），换来切换只需改一个标志位、stop() 照常干净退出。
+        val playoutId = playoutGeneration.incrementAndGet()
+        playoutThread = Thread({ playoutLoop(playoutId) }, "tracking-playout").also {
+            it.isDaemon = true
+            it.start()
         }
 
         Log.i(TAG, "追踪服务已启动: http://0.0.0.0:" + port + TrackingProtocol.PATH_INFO)
@@ -298,6 +353,99 @@ class TrackingServer(
         if (upperBodyOn == enabled) return
         upperBodyOn = enabled
         if (!enabled) upperBodySnapshot = null
+    }
+
+    /**
+     * 运行时修改 `send.bufferMs` 配置（立即生效，不需要重启服务）。
+     *
+     * 行为约定（可预期）：
+     *  - 非法值先过 [TrackingProtocol.normalizeSendBufferMs] 归一化（坏值 = 回落保守 500 ms）；
+     *  - 缓冲实例在锁内整体替换，**旧缓冲里没放行完的帧直接丢弃**（等价于 clear() 重新预缓冲），
+     *    切换瞬间客户端可能少收几帧 —— PC 按 `seq` 丢旧帧，无感知；
+     *  - 帧序号 `seq` **不重置**（只在 [start] 重置，协议 §7.5）；
+     *  - 改完按 [TrackingProtocol.resolveEffectiveBufferMs] 重算生效值（配置 > 0 恒生效，
+     *    配置 0 还要过客户端 hello 协商这一关）。
+     */
+    fun setSendBufferMs(valueMs: Long) {
+        val normalized = TrackingProtocol.normalizeSendBufferMs(valueMs)
+        if (normalized == configuredBufferMs) return
+        configuredBufferMs = normalized
+        frameBufferLock.withLock {
+            frameBuffer = TrackingFrameBuffer(
+                if (normalized > 0L) normalized else TrackingProtocol.FRAME_BUFFER_MS,
+            )
+            frameBufferCondition.signalAll()
+        }
+        Log.i(TAG, "send.bufferMs 已改为 " + normalized + " ms")
+        recomputeEffectiveBuffer()
+    }
+
+    /**
+     * 重算生效发送缓冲（协议 §7.1）：客户端连入 / 断开 / 收到 hello / 配置变化时调用。
+     *
+     *  - 配置 > 0：生效值恒等于配置值（第一步验证模式：手机仍保留 500 ms 就是这么配的）；
+     *  - 配置 == 0：只有当前**所有**已连接客户端都声明了 jitterBufferV1 才真正旁路（生效 0），
+     *    有一个没声明（含老 PC、刚连上还没来得及发 hello 的新连接）就回落
+     *    [TrackingProtocol.FRAME_BUFFER_MS]，并在日志里说明原因；
+     *  - 无客户端时无所谓（本来就不发帧），按「全部满足」处理。
+     *
+     * 生效值变化时一律 [TrackingFrameBuffer.clear] 清空缓冲重新预缓冲：
+     * 从 0 切回 500 是必须的（不能把旁路时代的意义不明的节奏状态带进预缓冲）；
+     * 从 500 切到 0 同样清掉 —— 缓冲里没放行完的旧帧留着会晚于新的旁路帧到达造成顺序反转。
+     * `seq` **不重置**（只在 [start] 重置）。
+     */
+    private fun recomputeEffectiveBuffer() {
+        val clients = wsClients.size
+        val capable = wsClients.count {
+            it.clientFeatures.contains(TrackingProtocol.FEATURE_JITTER_BUFFER_V1)
+        }
+        val effective = TrackingProtocol.resolveEffectiveBufferMs(configuredBufferMs, clients, capable)
+        if (effective == activeBufferMs) return
+        val previous = activeBufferMs
+        activeBufferMs = effective
+        frameBufferLock.withLock {
+            frameBuffer.clear()
+            frameBufferCondition.signalAll()
+        }
+        when {
+            effective == 0L -> Log.i(
+                TAG,
+                "生效发送缓冲: " + previous + " -> 0 ms（旁路，算完即发；" +
+                    clients + " 个客户端全部声明 jitterBufferV1）",
+            )
+
+            configuredBufferMs > 0L -> Log.i(
+                TAG,
+                "生效发送缓冲: " + previous + " -> " + effective + " ms（配置 send.bufferMs）",
+            )
+
+            else -> Log.w(
+                TAG,
+                "生效发送缓冲: " + previous + " -> " + effective +
+                    " ms（配置 send.bufferMs=0，但有客户端未声明 jitterBufferV1（含未协商的老客户端），" +
+                    "回落保守模式缓冲）",
+            )
+        }
+    }
+
+    /**
+     * 重算全局 upperBodyPostV1 协商结果（任务 M2）：客户端连入 / 断开 / 收到 hello 时调用。
+     *
+     * 聚合规则见 [upperBodyPostV1Active]：`wsClients.isNotEmpty() && 全部 upperBodyPostV1`。
+     * 值变化时通过 [onUpperBodyPostV1] 通知上层切换检测器的原始输出（照 [onRecalibrate]
+     * 的接线模式）；回调在调用线程直接触发（协议线程），上层自己决定要不要切线程。
+     */
+    private fun recomputeUpperBodyPostV1() {
+        val active = wsClients.isNotEmpty() && wsClients.all { it.upperBodyPostV1 }
+        if (active == upperBodyPostV1Active) return
+        upperBodyPostV1Active = active
+        Log.i(
+            TAG,
+            "上半身后处理协商: upperBodyPostV1=" + active +
+                "（" + wsClients.count { it.upperBodyPostV1 } + "/" + wsClients.size +
+                " 个客户端已协商；混合客户端时全体回退 M1 旧链）",
+        )
+        onUpperBodyPostV1(active)
     }
 
     /**
@@ -372,14 +520,16 @@ class TrackingServer(
     /**
      * 把一条已序列化的报文投给发送链路（协议 §7.1）。
      *
-     * [frameBufferMs] > 0 时先入帧缓冲，由 [playoutThread] 攒够延迟后匀速放行；
-     * 为 0 时退化成「算完就发」，和旧行为完全一致（`control` 决定走哪个槽位）。
+     * [activeBufferMs] > 0 时先入帧缓冲（calib 与 track 同队，顺序天然保持），由
+     * [playoutThread] 攒够延迟后匀速放行；为 0（旁路模式）时直接投进每个客户端的
+     * [TrackingSendQueue] —— 该队列 track / control 同队严格保序，突发时只丢最旧的 track，
+     * 因此不需要「槽位」也不会出现 calib / track 错配。
      *
-     * @param control true = calib 这类控制消息；关闭缓冲时走 [TrackingWsConnection.offerControl]，
-     *   保证不会被紧随其后的 track 帧覆盖。
+     * @param control true = calib 这类控制消息；走 [TrackingWsConnection.offerControl]，
+     *   溢出时保证不会被 track 挤掉。
      */
     private fun dispatch(message: String, control: Boolean = false) {
-        if (frameBufferMs <= 0L) {
+        if (activeBufferMs <= 0L) {
             for (client in wsClients) {
                 if (control) client.offerControl(message) else client.offerTrack(message)
             }
@@ -401,7 +551,7 @@ class TrackingServer(
      * 入队 / 停止会 signal 把它叫醒。
      */
     private fun playoutLoop(playoutId: Int) {
-        Log.i(TAG, "发送帧缓冲已启用: " + frameBufferMs + " ms")
+        Log.i(TAG, "帧缓冲放行线程已启动（配置 send.bufferMs=" + configuredBufferMs + " ms）")
         // 旧线程（上一轮 start 起的）看到的代次已经不同，必须立刻退出，不能抢新会话的帧
         while (running && playoutGeneration.get() == playoutId) {
             var message: String? = null
@@ -430,8 +580,13 @@ class TrackingServer(
             if (interrupted) break
             val frame = message ?: continue
 
-            // 每个客户端只有一个「最新一帧」槽位：这里赶上网络慢的客户端时也是覆盖式丢帧
-            for (client in wsClients) client.offerTrack(frame)
+            // 从缓冲放行的既有 track 也有 calib（control）：按 JSON 的 type 分流到对应投递口，
+            // 让每个客户端的 [TrackingSendQueue] 知道哪条可丢（track）、哪条绝不丢（control）。
+            // 非 "track" 一律按 control 保护处理（缓冲里只会有 track / calib，未知类型宁可不丢）。
+            val control = TrackingProtocol.parseType(frame) != "track"
+            for (client in wsClients) {
+                if (control) client.offerControl(frame) else client.offerTrack(frame)
+            }
             // 缓冲里混着极少数 calib（每次会话最多 2 条），一并在 sentFps 里计数，影响可忽略
             framesInWindow.incrementAndGet()
         }
@@ -605,6 +760,8 @@ class TrackingServer(
 
                 override fun onClosed() {
                     wsClients.remove(connection)
+                    // 客户端集合变了（可能影响 jitterBufferV1 协商结果），重算生效发送缓冲
+                    recomputeEffectiveBuffer()
                     // 最后一个客户端也走了：清掉缓冲里还没放行的帧，
                     // 否则下一个客户端一连上会先收到 0.5 s 之前的老表情。
                     if (wsClients.isEmpty()) {
@@ -616,6 +773,9 @@ class TrackingServer(
         )
 
         wsClients.add(connection)
+        // 新连接还没发 hello，feature 集合为空 —— 配置为 0 时生效缓冲会先回落保守模式，
+        // 收到 hello（下面 handleClientMessage 的 CLIENT_HELLO 分支）协商通过后再切回 0。
+        recomputeEffectiveBuffer()
         connection.start()
 
         // §4.1：连接建立后立即发 hello
@@ -634,7 +794,7 @@ class TrackingServer(
         return true
     }
 
-    /** 客户端上行：只认 ping 与 command（协议 §3 / §4.4），其余一律忽略。 */
+    /** 客户端上行：只认 ping / command / hello（协议 §3 / §4.4 / §4.5），其余一律忽略。 */
     private fun handleClientMessage(connection: TrackingWsConnection, text: String) {
         when (TrackingProtocol.classifyClientMessage(text)) {
             TrackingProtocol.ClientMessage.PING -> {
@@ -649,6 +809,15 @@ class TrackingServer(
                 connection.offerControl(
                     TrackingProtocol.buildAck(TrackingProtocol.COMMAND_RECALIBRATE)
                 )
+            }
+
+            TrackingProtocol.ClientMessage.CLIENT_HELLO -> {
+                // 能力协商（协议 §4.5）：记录该连接声明的 feature 集合，重算生效发送缓冲。
+                // 老客户端不发 hello，集合保持为空 —— 配置 send.bufferMs=0 时自动回落保守模式。
+                val features = TrackingProtocol.parseClientFeatures(text)
+                connection.clientFeatures = features
+                Log.i(TAG, "客户端 hello 协商: features=" + features.sorted().joinToString(",", "[", "]"))
+                recomputeEffectiveBuffer()
             }
 
             TrackingProtocol.ClientMessage.IGNORED -> Unit
@@ -825,8 +994,11 @@ setInterval(refresh, 1000);
  *
  * 线程模型：
  *  - reader 线程：解析客户端帧，回应 ping/close，文本消息交给 [Listener]
- *  - writer 线程：控制消息按队列顺序发；track 帧只保留**最新一帧**（覆盖式），
- *    网络跟不上就直接丢旧帧，保证低延迟、不堆积（协议 §7.1）
+ *  - writer 线程：从 per-client 有限 FIFO（[TrackingSendQueue]）按**投递顺序**发。
+ *    track 与 control（hello / calib / pong / ack / bye）同队严格保序，杜绝 calib / track
+ *    错配；队列有硬上限（8 track + 32 control），网络跟不上时丢最旧的 track（保最新帧）、
+ *    绝不丢 control。[offerTrack] / [offerControl] 非阻塞、不碰网络 IO ——
+ *    慢客户端永远不拖慢推理线程（协议 §7.1）。
  */
 internal class TrackingWsConnection(
     private val socket: Socket,
@@ -856,25 +1028,33 @@ internal class TrackingWsConnection(
         /** 客户端上行的最大帧，防止异常数据把内存打爆。 */
         private const val MAX_INCOMING_FRAME = 64 * 1024
 
-        /** 控制消息队列上限。 */
-        private const val MAX_PENDING_CONTROL = 32
-
         private val EMPTY_PAYLOAD = ByteArray(0)
     }
 
-    /** 控制消息（hello / calib / pong / ack / bye）按序排队，不能被数据帧冲掉。 */
-    private val controlQueue = LinkedBlockingQueue<String>(MAX_PENDING_CONTROL)
+    /**
+     * per-client 有限 FIFO 发送队列：track 与 control（hello / calib / pong / ack / bye）
+     * 同队严格保序；溢出丢最旧的 track、绝不丢 control。容量与丢弃策略见 [TrackingSendQueue]。
+     */
+    private val sendQueue = TrackingSendQueue()
 
-    /** 数据帧只有 1 个槽位：覆盖式写入，读走即空。 */
-    private val pendingTrack = AtomicReference<String?>(null)
+    /**
+     * 该连接通过客户端 hello（协议 §4.5）声明的能力集合；没发过 hello 的老客户端恒为空集。
+     *
+     * reader 线程（hello 到达时）写入、[TrackingServer.recomputeEffectiveBuffer] 等处读取，
+     * 用 @Volatile 保证可见性。
+     *
+     * 注意：属性 setter 的 JVM 名就是 setClientFeatures —— 不要再定义同名方法，
+     * 否则 Kotlin 会报 Platform declaration clash（参考 [TrackingServer] 里 upperBodyOn 的注释）。
+     */
+    @Volatile
+    var clientFeatures: Set<String> = emptySet()
 
     /**
      * writer 线程的唤醒信号。
      *
-     * 之前 writer 空闲时 `controlQueue.poll(20ms)`，而 [offerTrack] 只写一个
-     * [AtomicReference] 不会唤醒它 —— 结果每帧最多要等 20ms 才被发出去，
-     * **发送帧率被硬性钉在 ~50fps**，还额外带来 0~20ms 的延迟。面捕要 60fps，
-     * 这里必须让投递立刻唤醒 writer。
+     * 之前 writer 空闲时阻塞 poll(20ms)，而 [offerTrack] 只写一个覆盖槽位、不会唤醒它 ——
+     * 结果每帧最多要等 20ms 才被发出去，**发送帧率被硬性钉在 ~50fps**，还额外带来
+     * 0~20ms 的延迟。面捕要 60fps，这里必须让投递立刻唤醒 writer。
      *
      * 许可数限制在 2 以内，避免帧率高于发送能力时许可无限累积、导致空转。
      */
@@ -904,22 +1084,24 @@ internal class TrackingWsConnection(
         readerThread.start()
     }
 
-    /** 投递一帧追踪 JSON；上一帧还没发出去就直接覆盖（保最新帧）。 */
+    /**
+     * 投递一帧追踪 JSON 进 per-client FIFO（[TrackingSendQueue]）。
+     *
+     * 不再是「单槽覆盖」：track 与 control 同队严格保序，突发时最多排
+     * [TrackingSendQueue.MAX_TRACK] 条，溢出丢最旧的 track（保最新帧）。非阻塞、
+     * 不碰网络 IO，慢客户端拖不住推理线程。
+     */
     fun offerTrack(message: String) {
         if (closed) return
-        pendingTrack.set(message)
+        sendQueue.offer(message, control = false)
         // 关键：立刻叫醒 writer。否则它还在 20ms 的 await 里，发送帧率会掉到 ~50fps。
         signalWriter()
     }
 
-    /** 投递控制消息（不会被覆盖）。 */
+    /** 投递控制消息（hello / calib / pong / ack / bye）：与 track 同队保序，溢出时绝不被 track 挤掉。 */
     fun offerControl(message: String) {
         if (closed) return
-        if (!controlQueue.offer(message)) {
-            // 队列满：挤掉最旧的一条，保证 bye / ack 这类关键消息仍有发送机会
-            controlQueue.poll()
-            controlQueue.offer(message)
-        }
+        sendQueue.offer(message, control = true)
         signalWriter()
     }
 
@@ -966,13 +1148,11 @@ internal class TrackingWsConnection(
     private fun writeLoop() {
         try {
             while (!closed) {
-                if (closeRequested.get() && controlQueue.isEmpty() && pendingTrack.get() == null) break
+                // requestClose 后等 FIFO 冲刷干净（bye 就排在里面）再退出
+                if (closeRequested.get() && sendQueue.isEmpty) break
 
-                val control = controlQueue.poll()
-                if (control != null) {
-                    sendFrame(OP_TEXT, control.toByteArray(Charsets.UTF_8))
-                    continue
-                }
+                // WebSocket 协议层 ping/pong 是带外控制帧，与应用消息没有顺序关系，
+                // 优先服务掉（防止 FIFO 积压时把保活拖住）。
                 if (pendingPing.getAndSet(false)) {
                     sendFrame(OP_PING, EMPTY_PAYLOAD)
                     continue
@@ -982,9 +1162,11 @@ internal class TrackingWsConnection(
                     sendFrame(OP_PONG, pong)
                     continue
                 }
-                val track = pendingTrack.getAndSet(null)
-                if (track != null) {
-                    sendFrame(OP_TEXT, track.toByteArray(Charsets.UTF_8))
+                // 应用消息（track 与 hello / calib / pong / ack / bye）：同一个 FIFO 严格按
+                // 投递顺序发送，杜绝 calib / track 错配；溢出丢弃已经在 offer 时按策略完成。
+                val message = sendQueue.poll()
+                if (message != null) {
+                    sendFrame(OP_TEXT, message.toByteArray(Charsets.UTF_8))
                     continue
                 }
 
@@ -1124,10 +1306,9 @@ internal class TrackingWsConnection(
         }
         if (!firstTime) return
 
-        pendingTrack.set(null)
-        controlQueue.clear()
         pendingPong.set(null)
         pendingPing.set(false)
+        sendQueue.clear()
         // 让 writer 立刻从 20ms 兜底等待里醒来退出，而不是等超时。
         signalWriter()
         try {
