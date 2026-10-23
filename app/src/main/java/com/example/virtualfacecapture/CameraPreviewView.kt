@@ -50,12 +50,12 @@ class CameraPreviewView @JvmOverloads constructor(
     /** 回收旧 Bitmap 统一走主线程，避免和 UI 线程正在进行的绘制撞车。 */
     private val mainHandler = Handler(Looper.getMainLooper())
     
-    // 预览位图是 BGRA_8888（ARGB_8888 在小端设备上的内存布局）。
-    // 相机线程把整块 BGRA 直接 copyPixelsFromBuffer 进位图，不再需要
-    // IntArray 打包 / ByteArray 中转 / setPixels（旧实现 720p 单帧 6~11 ms）。
-    // 下面两个标记只用于「同一种错误只打一条日志」，避免相机线程被日志刷屏。
+    // 预览帧契约与 master 一致：Camera2Manager 回调输出 RGB（w*h*3 字节）。
+    // 相机线程把它转成 ARGB IntArray 后 setPixels 进位图（master 的写法）。
+    // pixelBuffer 跨帧复用，尺寸不变时零分配。
+    // frameFormatErrorLogged 只用于「同一种错误只打一条日志」，避免相机线程被日志刷屏。
     private var frameFormatErrorLogged = false
-    private var frameCopyErrorLogged = false
+    private var pixelBuffer: IntArray? = null
 
     // ---- postInvalidate 节流（≤ 30 Hz）--------------------------------------
     // 相机帧 30 fps 与叠加数据 60 fps 会各自 postInvalidate，同一帧被标脏两次；
@@ -303,32 +303,47 @@ class CameraPreviewView @JvmOverloads constructor(
     }
     
     /**
-     * 更新相机预览位图（**BGRA_8888**，即 ARGB_8888 在小端设备上的内存布局）。
+     * 更新相机预览位图（RGB 输入，与 master 的 Camera2Manager 输出契约一致）。
      *
-     * 只在相机线程调用。旋转 / 1/2 降采样 / YUV→BGRA 全部由 native 在 Camera2Manager
-     * 里一次做完，这里只做一次整块 [Bitmap.copyPixelsFromBuffer]：没有 ByteArray 中转、
-     * 没有 IntArray 逐像素打包、没有 setPixels（旧实现 720p 单帧 6~11 ms）。
+     * 只在相机线程调用。旋转 / YUV→RGB 在 Camera2Manager 里完成，这里做一次
+     * RGB→ARGB 转换后 [Bitmap.setPixels] 写入位图。
      *
      * 并发契约不变：相机线程只写「没在展示」的那块位图，写完原子发布；UI 线程只读
      * 发布出去的那块。uiDrawing 期间相机线程最多丢一帧，绝不覆写同一块。
      *
-     * @param bgraBuffer 直接缓冲区，容量必须 ≥ width*height*4（B,G,R,A 顺序，A=255）
+     * @param rgbBuffer 直接缓冲区，容量必须 ≥ width*height*3（R,G,B 顺序）
      */
-    fun updateCameraFrame(bgraBuffer: ByteBuffer, width: Int, height: Int) {
+    fun updateCameraFrame(rgbBuffer: ByteBuffer, width: Int, height: Int) {
         if (width <= 0 || height <= 0) return
-        val byteCount = width * height * 4
+        val pixelCount = width * height
         // 防御：容量和尺寸对不上就丢这一帧，绝不越界读
-        if (bgraBuffer.capacity() < byteCount) {
+        if (rgbBuffer.capacity() < pixelCount * 3) {
             if (!frameFormatErrorLogged) {
                 frameFormatErrorLogged = true
                 Log.w(
                     TAG,
-                    "updateCameraFrame expects BGRA (w*h*4=" + byteCount +
-                        "), got capacity " + bgraBuffer.capacity() + ", dropping preview frames",
+                    "updateCameraFrame expects RGB (w*h*3=" + pixelCount * 3 +
+                        "), got capacity " + rgbBuffer.capacity() + ", dropping preview frames",
                 )
             }
             return
         }
+
+        // RGB → ARGB（写的是相机线程私有数组，不需要加锁；尺寸不变时零分配）
+        val cached = pixelBuffer
+        val pixels = if (cached != null && cached.size == pixelCount) {
+            cached
+        } else {
+            IntArray(pixelCount).also { pixelBuffer = it }
+        }
+        rgbBuffer.rewind()
+        for (i in pixels.indices) {
+            val r = rgbBuffer.get().toInt() and 0xFF
+            val g = rgbBuffer.get().toInt() and 0xFF
+            val b = rgbBuffer.get().toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        rgbBuffer.rewind()
 
         // UI 正在绘制：这一帧直接丢掉，保证下面要写的那块位图一定没人在读
         if (uiDrawing) return
@@ -357,19 +372,7 @@ class CameraPreviewView @JvmOverloads constructor(
             val buffer = reusable
                 ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-            try {
-                // copyPixelsFromBuffer 要求「剩余字节 ≥ byteCount」且按行紧排；
-                // 生产端每帧都会 position(0) + limit(w*h*4)。
-                bgraBuffer.rewind()
-                buffer.copyPixelsFromBuffer(bgraBuffer)
-            } catch (t: RuntimeException) {
-                // 缓冲状态异常（被其它路径改过 position）：丢帧，不能把相机线程抛死
-                if (!frameCopyErrorLogged) {
-                    frameCopyErrorLogged = true
-                    Log.w(TAG, "copyPixelsFromBuffer failed: " + t.message)
-                }
-                return
-            }
+            buffer.setPixels(pixels, 0, width, 0, 0, width, height)
 
             // 原子发布：UI 下一次 onDraw 拿到的就是刚写完的那块
             val previous = displayBitmap.getAndSet(buffer)
