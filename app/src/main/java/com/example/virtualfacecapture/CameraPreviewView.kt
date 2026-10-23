@@ -30,7 +30,7 @@ class CameraPreviewView @JvmOverloads constructor(
     
     // ---- 双缓冲：不再每帧 Bitmap.copy() --------------------------------------
     // 相机线程只写「当前没在展示」的那一块 Bitmap，写完再原子发布；UI 线程只读发布出去
-    // 的那一块。每帧只有一次 setPixels，不再有整帧 ARGB_8888 拷贝（720p ≈ 3.7MB/帧）。
+    // 的那一块。每帧只有一次 setPixels，不再有整帧 ARGB_8888 拷贝（480x480 ≈ 900KB/帧）。
     private val displayBitmap = AtomicReference<Bitmap?>(null)
 
     // 后台缓冲（相机线程写，UI 线程不读），始终不等于 displayBitmap
@@ -81,7 +81,7 @@ class CameraPreviewView @JvmOverloads constructor(
     private val detectionBoxRect = RectF()
     private val poseBackgroundRect = RectF()
     private val meshPath = Path()
-    
+
     private val bitmapPaint = Paint().apply {
         isFilterBitmap = true
         isAntiAlias = true
@@ -329,13 +329,14 @@ class CameraPreviewView @JvmOverloads constructor(
             return
         }
 
-        // RGB → ARGB（写的是相机线程私有数组，不需要加锁；尺寸不变时零分配）
+        // Reuse pixel buffer（尺寸不变时零分配）
         val cached = pixelBuffer
         val pixels = if (cached != null && cached.size == pixelCount) {
             cached
         } else {
             IntArray(pixelCount).also { pixelBuffer = it }
         }
+        // RGB → ARGB（写的是相机线程私有数组，不需要加锁）
         rgbBuffer.rewind()
         for (i in pixels.indices) {
             val r = rgbBuffer.get().toInt() and 0xFF
@@ -449,6 +450,7 @@ class CameraPreviewView @JvmOverloads constructor(
             frameHeight = 0
         }
         visualizationDataRef.set(null)
+        pixelBuffer = null
         upperBodyFrameRef.set(null)
         // 强制下一次绘制：清空后画面上不该再留任何东西
         lastInvalidateNs.set(0L)
