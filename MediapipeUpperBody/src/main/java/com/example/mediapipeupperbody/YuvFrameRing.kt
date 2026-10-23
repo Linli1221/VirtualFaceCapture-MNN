@@ -58,7 +58,8 @@ internal class YuvFrameRing(
         internal var inUse: Boolean = false
     }
 
-    private val lock = Any()
+    /** 监视器锁：用 java.lang.Object（kotlin.Any 不暴露 wait / notifyAll）。 */
+    private val lock = java.lang.Object()
     private val free = java.util.ArrayDeque<Slot>()
 
     /** 最新一帧未消费帧；null = 没有帧在等。 */
