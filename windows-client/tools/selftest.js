@@ -36,13 +36,22 @@ import {
 import { Live2DStage, toModelRange } from "../renderer/live2d.js";
 import { buildUpperBody } from "./mock-body.js";
 import {
+  AdaptivePoseOffset,
+  OffsetRamp,
   PoseOffsetCollector,
   applyPoseOffset,
   decodePoseOffset,
+  decodePoseProfileStore,
   encodePoseOffset,
+  encodePoseProfileStore,
   formatPoseOffset,
+  getProfileFor,
   isNeutralOffset,
+  offsetToProfile,
+  profileToOffset,
   sanitizePoseOffset,
+  sanitizePoseProfile,
+  setProfileFor,
 } from "../renderer/calibrate.js";
 import { ParamTimeline } from "../renderer/interp.js";
 import { discoverModels, startServer } from "../server.js";
@@ -283,6 +292,181 @@ await test("校准后零姿态映射到 ParamAngle 0（本地偏移抵消固定�
   near(result.params.ParamBodyAngleX, 0, 1e-12);
 });
 
+console.log("[selftest] calibrate.js · 角色 profile / 平滑重置 / 缓慢自适应（M3）");
+
+await test("叠加公式：最终角度 = track.pose + pcOffset，只加不减（不重复减手机基线）", () => {
+  // track.pose 已是「手机减过基线」的值；PC 端只叠加一次
+  const pose = [2, 8, -3];
+  const offset = { pitch: -2, yaw: -8, roll: 3 };
+  assert.deepEqual(applyPoseOffset(pose, offset), [0, 0, 0]);
+  assert.deepEqual(applyPoseOffset(pose, { pitch: 1, yaw: 1, roll: 1 }), [3, 9, -2]);
+  // 符号约定不动：pitch 上正下负 / yaw 本人左转为正 / roll 本人左倾为正，
+  // offset 只是同轴相加，不引入任何反号
+  assert.deepEqual(applyPoseOffset([10, 0, 0], { pitch: 0.5 }), [10.5, 0, 0]);
+});
+
+await test("角色 profile：不同角色各存各的 offset，切换后按角色取回", () => {
+  let store = decodePoseProfileStore(null);
+  assert.deepEqual(getProfileFor(store, "ATRI"), {
+    pitchOffset: 0,
+    yawOffset: 0,
+    rollOffset: 0,
+    rangeScale: 1,
+    filter: sanitizeFilterProfile(null),
+  });
+  store = setProfileFor(store, "ATRI", { pitch: -2, yaw: -8, roll: 3 });
+  store = setProfileFor(store, "Yuuka", { pitchOffset: 5, yawOffset: 1, rollOffset: -1, rangeScale: 1.5 });
+  // 换角色 = 换 profile：各用各的偏移（大小写不敏感，与 findModel 一致）
+  assert.deepEqual(profileToOffset(getProfileFor(store, "atri")), { pitch: -2, yaw: -8, roll: 3 });
+  const yuuka = getProfileFor(store, "Yuuka");
+  assert.deepEqual(profileToOffset(yuuka), { pitch: 5, yaw: 1, roll: -1 });
+  assert.equal(yuuka.rangeScale, 1.5, "量程偏好应随角色保存");
+  // 序列化往返 + 坏数据容忍（坏配置不能让客户端起不来）
+  const round = decodePoseProfileStore(encodePoseProfileStore(store));
+  assert.deepEqual(profileToOffset(getProfileFor(round, "ATRI")), { pitch: -2, yaw: -8, roll: 3 });
+  assert.deepEqual(decodePoseProfileStore("{ 坏 JSON").profiles, {});
+  assert.equal(decodePoseProfileStore(null).version, 1);
+  assert.deepEqual(getProfileFor(round, "没存过的角色"), {
+    pitchOffset: 0,
+    yawOffset: 0,
+    rollOffset: 0,
+    rangeScale: 1,
+    filter: sanitizeFilterProfile(null),
+  });
+});
+
+await test("角色 profile：迁移——无 profile 的角色用旧全局偏移播种，老 key 照常可读", () => {
+  const legacy = decodePoseOffset(JSON.stringify({ pitch: 1.5, yaw: -6, roll: 2 }));
+  const seeded = sanitizePoseProfile({ ...legacy, rangeScale: 1 });
+  assert.deepEqual(profileToOffset(seeded), { pitch: 1.5, yaw: -6, roll: 2 });
+  assert.equal(seeded.rangeScale, 1);
+  // 老客户端只认 vfc.poseOffset：这个 key 的读写语义保持不变
+  assert.deepEqual(decodePoseOffset(encodePoseOffset(legacy)), { pitch: 1.5, yaw: -6, roll: 2 });
+});
+
+await test("OffsetRamp：手动重置限速平滑、不瞬移、不超调", () => {
+  const ramp = new OffsetRamp({ maxSlewDegPerSec: 25 });
+  ramp.setTarget({ pitch: 10, yaw: -8, roll: 4 }, { snap: true });
+  assert.deepEqual(ramp.snapshot(), { pitch: 10, yaw: -8, roll: 4 });
+  ramp.setTarget({ pitch: 0, yaw: 0, roll: 0 }); // 手动重置
+  const first = ramp.sample(16); // 一帧（60fps）
+  // 一帧最多 25°/s × 0.016s = 0.4°：绝不可能一步跳回 0
+  assert.ok(Math.abs(first.pitch - 10) <= 0.4 + 1e-9, "重置第一帧就跳变了");
+  assert.ok(first.pitch > 9, "重置第一帧应基本停在原处");
+  // 持续推进：单调趋近 0 且不越过目标（无超调 → 不跳变）
+  let prev = first.pitch;
+  for (let i = 0; i < 300; i++) {
+    const cur = ramp.sample(16).pitch;
+    assert.ok(cur <= prev + 1e-9, "应单调趋近目标");
+    assert.ok(cur >= -1e-9, "不应越过目标");
+    prev = cur;
+  }
+  assert.ok(ramp.settled);
+  assert.deepEqual(ramp.snapshot(), { pitch: 0, yaw: 0, roll: 0 });
+});
+
+await test("缓慢自适应：默认关闭，任何帧都不改 offset（默认行为与现在一致）", () => {
+  const adaptive = new AdaptivePoseOffset();
+  const offset = { pitch: 1, yaw: -2, roll: 0.5 };
+  for (let i = 0; i < 40; i++) {
+    const out = adaptive.update({ face: true, pose: [5, 5, 5], bs: makeBs() }, offset);
+    assert.equal(out.changed, false);
+    assert.equal(out.reason, "disabled");
+    assert.deepEqual(out.offset, sanitizePoseOffset(offset));
+  }
+});
+
+await test("缓慢自适应：说话 / 眨眼不污染 offset（表情门只看 bs 变化量，不反推特征）", () => {
+  const adaptive = new AdaptivePoseOffset({ quietFrames: 5 });
+  adaptive.enabled = true;
+  let current = { pitch: 0, yaw: 0, roll: 0 };
+  // 头不动但表情活跃：jawOpen / eyeBlink 每帧来回跳 = 说话 + 眨眼
+  for (let i = 0; i < 60; i++) {
+    const bs = makeBs({
+      jawOpen: i % 2 ? 0.6 : 0.05,
+      eyeBlinkLeft: i % 3 ? 0.9 : 0,
+      eyeBlinkRight: i % 3 ? 0.9 : 0,
+      mouthSmileLeft: i % 2 ? 0.4 : 0.1,
+    });
+    const out = adaptive.update({ face: true, pose: [6, 4, -2], bs }, current);
+    assert.equal(out.changed, false, "表情活跃时不该更新 offset");
+    current = out.offset;
+  }
+  assert.deepEqual(current, { pitch: 0, yaw: 0, roll: 0 });
+  assert.ok(adaptive.stats.skippedExpression > 0);
+  // 安静下来（表情不动、头不动）才开始极慢更新：offset −= 最终角度 × rate
+  const quietBs = makeBs();
+  let maxStep = 0;
+  let prev = current.pitch;
+  for (let i = 0; i < 100; i++) {
+    const out = adaptive.update({ face: true, pose: [6, 4, -2], bs: quietBs }, current);
+    if (out.changed) {
+      maxStep = Math.max(maxStep, Math.abs(out.offset.pitch - prev));
+      prev = out.offset.pitch;
+    }
+    current = out.offset;
+  }
+  assert.ok(adaptive.stats.updates > 0, "安静时应缓慢更新");
+  assert.ok(current.pitch < 0 && current.pitch > -1.5, "应朝「最终角度归零」极慢挪动，实际 " + current.pitch);
+  assert.ok(current.yaw < 0 && current.roll > 0, "三轴都应缓慢趋零");
+  assert.ok(maxStep <= 0.005 * 6 + 1e-9, "每帧步长必须极小（≤ rate × 最终角度），实际 " + maxStep);
+});
+
+await test("缓慢自适应：头在动 / 丢脸时跳过更新，不污染 offset", () => {
+  const adaptive = new AdaptivePoseOffset({ quietFrames: 2 });
+  adaptive.enabled = true;
+  let current = { pitch: 0, yaw: 0, roll: 0 };
+  const quietBs = makeBs();
+  for (let i = 0; i < 30; i++) {
+    // 头每帧摆 5° = 在动
+    const out = adaptive.update({ face: true, pose: [i * 5, 0, 0], bs: quietBs }, current);
+    assert.equal(out.changed, false, "头在动时不该更新");
+    current = out.offset;
+  }
+  assert.ok(adaptive.stats.skippedMotion > 0);
+  for (let i = 0; i < 30; i++) {
+    const out = adaptive.update({ face: false, pose: [6, 4, -2], bs: quietBs }, current);
+    assert.equal(out.changed, false, "丢脸时不该更新");
+    current = out.offset;
+  }
+  assert.deepEqual(current, { pitch: 0, yaw: 0, roll: 0 });
+});
+
+await test("缓慢自适应：漂移锚定在手动锚点 ±maxDriftDeg 内，不会跑飞", () => {
+  const adaptive = new AdaptivePoseOffset({ quietFrames: 2, maxDriftDeg: 1, rate: 0.005 });
+  adaptive.enabled = true;
+  adaptive.setAnchor({ pitch: 0, yaw: 0, roll: 0 });
+  let current = { pitch: 0, yaw: 0, roll: 0 };
+  const quietBs = makeBs();
+  for (let i = 0; i < 200; i++) {
+    current = adaptive.update({ face: true, pose: [30, 0, 0], bs: quietBs }, current).offset;
+  }
+  assert.ok(current.pitch <= 0.001 && current.pitch >= -1.001, "最多只能漂到锚点 -1°，实际 " + current.pitch);
+});
+
+await test("缓慢自适应：rate 钳制在 0.001~0.005，默认 0.002", () => {
+  assert.equal(new AdaptivePoseOffset().rate, 0.002);
+  assert.equal(new AdaptivePoseOffset({ rate: 0.5 }).rate, 0.005);
+  assert.equal(new AdaptivePoseOffset({ rate: 0 }).rate, 0.001);
+});
+
+await test("量程偏好：默认 1 与现在完全一致；rangeScale 只缩放默认量程", () => {
+  const base = createMapper().apply(makeBs(), [20, 0, 0]);
+  const explicit = createMapper({ rangeScale: 1 }).apply(makeBs(), [20, 0, 0]);
+  near(base.params.ParamAngleY, explicit.params.ParamAngleY, 1e-12);
+  near(base.params.ParamAngleY, -15.143866733972741, 1e-9); // 与协议 §8.2 基线一致
+  const wide = createMapper({ rangeScale: 2 });
+  const w = wide.apply(makeBs(), [20, 0, 0]);
+  assert.ok(Math.abs(w.params.ParamAngleY) < Math.abs(base.params.ParamAngleY), "量程放大后同样的角度应更不满量程");
+  near(wide.setRangeScale(1), 1);
+  // setScale 边界：截断到 [0.5, 2]，坏数据回落 1；符号约定不受影响
+  const norm = new AdaptiveAngleNormalizer(20, 40, 10);
+  assert.equal(norm.setScale(99), 2);
+  assert.equal(norm.setScale(0.01), 0.5);
+  assert.equal(norm.setScale("x"), 1);
+  assert.equal(new AdaptiveAngleNormalizer(20, 40, 10).defaultNeg, 20);
+});
+
 console.log("[selftest] interp.js · 输入帧率低 / 间隔不稳定时的插值与抖动缓冲");
 
 /** 只让 ParamAngleX 变化，便于用「值 = 斜率 × 时间」验证插值是否均匀。 */
@@ -342,8 +526,9 @@ function simulateUnstable({
   useStamps = false,
   seed = 1,
   skipMs = 900,
+  options = {},
 } = {}) {
-  const timeline = new ParamTimeline();
+  const timeline = new ParamTimeline(options);
   const random = makeRandom(seed);
   const renderInterval = 1000 / renderHz;
   const slack = intervalsMs.reduce((sum, value) => sum + value, 0);
@@ -371,7 +556,7 @@ function simulateUnstable({
   for (let t = 0; t <= durationMs; t += renderInterval) {
     while (cursor < events.length && events[cursor].arrival <= t + 1e-9) {
       const event = events[cursor];
-      timeline.push(event.params, event.arrival, useStamps ? event.production : null);
+      timeline.push(event.params, event.arrival, useStamps ? event.production : null, cursor);
       cursor += 1;
     }
     const starvedBefore = timeline.starvedFrames;
@@ -594,6 +779,195 @@ await test("到达节奏比手机时钟略快（两端时钟频差）：偏移�
   assert.ok(timeline.transitJitterMs < 8, "到达规律时传输抖动应很小，实际 " + timeline.transitJitterMs);
   near(timeline.delayMs, 1000 / 30 + 8, 8);
   assert.ok(starvedRatio < 0.02, "见底比例 " + starvedRatio);
+});
+
+console.log("[selftest] interp.js · jitterBufferV1 自适应抖动缓冲（M1：手机 500 ms 缓冲迁 PC）");
+
+await test("jitterBufferV1 起播预缓冲：攒够一个缓冲深度才起播，预缓冲期间保持首帧（不倒带）", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  for (let i = 0; i < 3; i++) timeline.push(makeAngleParams(i), i * 33, i * 33, i);
+  const held = timeline.sample(70);
+  assert.equal(timeline.primed, false, "内容跨度 66 ms < 深度 80 ms，不应起播");
+  assert.equal(held.ParamAngleX, 0, "预缓冲期间应保持首帧");
+  for (let i = 3; i < 6; i++) timeline.push(makeAngleParams(i), i * 33, i * 33, i);
+  const value = timeline.sample(210).ParamAngleX;
+  assert.equal(timeline.primed, true, "内容攒够一个深度后应起播");
+  assert.ok(value > 0 && value < 5, "起播后应从时间轴插值取值，实际 " + value);
+});
+
+await test("jitterBufferV1 稳定局域网（手机仍在 500 ms 缓冲、PC 输入均匀）：深度稳定档 80~150 ms，不叠加成 1 s", () => {
+  const { timeline, steps, starvedRatio } = simulateUnstable({
+    intervalsMs: [1000 / 30],
+    useStamps: true,
+    durationMs: 2500,
+    skipMs: 1500,
+    options: { jitterBuffer: true },
+  });
+  assert.equal(timeline.depthTier, "stable", "均匀输入应判稳定档，实际 " + timeline.depthTier);
+  assert.ok(timeline.delayMs >= 80 && timeline.delayMs <= 150, "稳定档深度 80~150 ms，实际 " + timeline.delayMs);
+  assert.ok(starvedRatio < 0.02, "见底比例应 < 2%，实际 " + starvedRatio);
+  for (const step of steps) assert.ok(step > 0.4 && step < 0.6, "步进应≈0.5，实际 " + step);
+});
+
+await test("jitterBufferV1 注入 100 ms 到达抖动：升到抖动档 200~300 ms，播放无可见卡顿", () => {
+  const { timeline, steps, starvedRatio } = simulateUnstable({
+    intervalsMs: [1000 / 30],
+    arrivalJitterMs: 100,
+    useStamps: true,
+    durationMs: 6000,
+    skipMs: 3000,
+    seed: 3,
+    options: { jitterBuffer: true },
+  });
+  assert.ok(
+    timeline.depthTier === "jitter" || timeline.depthTier === "heavy",
+    "100 ms 抖动应离开稳定档，实际 " + timeline.depthTier,
+  );
+  assert.ok(timeline.delayMs >= 195 && timeline.delayMs <= 500, "深度应 ≈200 ms（抖动档下限），实际 " + timeline.delayMs);
+  assert.ok(starvedRatio < 0.05, "见底比例应 < 5%（无可见卡顿），实际 " + starvedRatio);
+  for (const step of steps) assert.ok(step > 0.4 && step < 0.6, "步进应≈0.5（插值仍平滑），实际 " + step);
+});
+
+await test("jitterBufferV1 剧烈抖动（到达抖动 0~300 ms）：深度升到 250 ms 以上、播放不卡顿", () => {
+  const { timeline, steps, starvedRatio } = simulateUnstable({
+    intervalsMs: [1000 / 30],
+    arrivalJitterMs: 300,
+    useStamps: true,
+    durationMs: 8000,
+    skipMs: 4000,
+    seed: 5,
+    options: { jitterBuffer: true },
+  });
+  // 到达时刻单调整形后滞后抖动是 80~130 ms 量级（不是均匀 0~300），档位在抖动/剧烈间切换
+  assert.ok(timeline.depthTier === "jitter" || timeline.depthTier === "heavy", "实际 " + timeline.depthTier);
+  assert.ok(timeline.delayMs >= 250, "持续剧烈抖动下深度应收敛到 250 ms 以上，实际 " + timeline.delayMs);
+  assert.ok(timeline.delayMs <= 500, "上限 500 ms，实际 " + timeline.delayMs);
+  assert.ok(starvedRatio < 0.05, "深度应盖住绝大部分迟到，见底比例 " + starvedRatio);
+  // 无可见卡顿 = 不倒退、不跳变；深度加深的瞬间播放会短暂放慢（限速吸收缓冲），属设计行为
+  let nearPace = 0;
+  for (const step of steps) {
+    assert.ok(step > -0.01, "播放绝不倒退（不倒带），实际 " + step);
+    assert.ok(step < 0.6, "不应跳帧，实际 " + step);
+    if (step > 0.4 && step < 0.6) nearPace += 1;
+  }
+  assert.ok(nearPace / steps.length > 0.8, "绝大多数渲染帧应按正常节奏推进，实际 " + nearPace + "/" + steps.length);
+});
+
+await test("jitterBufferV1 连续大间隔 ≥3 次（生产端卡顿）：判剧烈档，目标深度 400~500 ms", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  // 30 fps 基线上连续 3 个 200 ms 大间隔：连续大间隔是「剧烈抖动」的直接信号
+  const stamps = [0, 33, 66, 266, 466, 666];
+  for (let i = 0; i < stamps.length; i++) timeline.push(makeAngleParams(i), stamps[i], stamps[i], i);
+  const target = timeline.targetDelayMs();
+  assert.equal(timeline.depthTier, "heavy", "连续 3 次大间隔应判剧烈档，实际 " + timeline.depthTier);
+  assert.ok(target >= 400 && target <= 500, "剧烈档深度 400~500 ms，实际 " + target);
+});
+
+await test("jitterBufferV1 seq 跳变：2 s 内连续跳变判剧烈档（丢帧 / 拥塞信号）", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  for (let i = 0; i < 20; i++) {
+    timeline.push(makeAngleParams(i), i * (1000 / 30), i * (1000 / 30), i * 3); // 每帧之间丢 2 帧
+  }
+  const target = timeline.targetDelayMs();
+  assert.equal(timeline.depthTier, "heavy", "seq 连续跳变应判剧烈档，实际 " + timeline.depthTier);
+  assert.ok(target >= 400 && target <= 500, "剧烈档深度 400~500 ms，实际 " + target);
+});
+
+await test("jitterBufferV1 断流 2 s 再恢复：重新预缓冲、不倒带、不冻结在最后一帧", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  const renderInterval = 1000 / 60;
+  const sampleAts = [];
+  let lastValue = 0;
+  let index = 0;
+  const feed = (from, to, step) => {
+    for (let t = from; t <= to; t += step) {
+      while (index * (1000 / 30) <= t + 1e-9) {
+        timeline.push(makeAngleParams(index), index * (1000 / 30), index * (1000 / 30), index);
+        index += 1;
+      }
+      const value = timeline.sample(t);
+      if (value) lastValue = value.ParamAngleX;
+      sampleAts.push(t - timeline.delayMs);
+    }
+  };
+  feed(0, 1000, renderInterval); // 第一段：30 fps 推 1 s
+  assert.equal(timeline.primed, true, "第一段应已起播");
+  const valueAtBreak = lastValue;
+
+  // 断流 2 s：只采样不推帧（应外推 ≤ 40 ms 后保持，不炸不倒）
+  for (let t = 1000 + renderInterval; t <= 3000; t += renderInterval) {
+    const value = timeline.sample(t);
+    if (value) lastValue = value.ParamAngleX;
+    sampleAts.push(t - timeline.delayMs);
+  }
+
+  // 恢复：重新按 30 fps 推（seq 连续）
+  const resumesAt = 3000;
+  let sawReprime = false;
+  for (let t = resumesAt + renderInterval; t <= 4200; t += renderInterval) {
+    while (index * (1000 / 30) <= t + 1e-9) {
+      const now = resumesAt + (index - 30) * (1000 / 30);
+      timeline.push(makeAngleParams(index), now, now, index);
+      index += 1;
+      if (!timeline.primed) sawReprime = true;
+    }
+    const value = timeline.sample(t);
+    if (value) lastValue = value.ParamAngleX;
+    sampleAts.push(t - timeline.delayMs);
+  }
+
+  assert.equal(sawReprime, true, "断流恢复后应重新进入预缓冲");
+  assert.equal(timeline.primed, true, "恢复后应重新起播");
+  assert.ok(lastValue > valueAtBreak + 5, "恢复后应继续播放新帧（不冻结在最后一帧），实际 " + lastValue);
+  let prev = -Infinity;
+  for (const at of sampleAts) {
+    assert.ok(at >= prev - 1e-6, "sampleAt 不应倒退（不倒带）：" + prev + " -> " + at);
+    prev = at;
+  }
+});
+
+await test("jitterBufferV1 断流外推上限：≤ 40 ms 且 ≤ 0.75 个输入间隔（沿用原约束）", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  for (let i = 0; i < 10; i++) timeline.push(makeAngleParams(i * 2), i * (1000 / 30), i * (1000 / 30), i);
+  for (let t = 0; t <= 400; t += 1000 / 60) timeline.sample(t); // 起播
+  assert.equal(timeline.primed, true);
+  const value = timeline.sample(5000).ParamAngleX;
+  // 最后两帧 16 → 18、跨度 33 ms：外推上限 min(40/33, 0.75) = 0.75 → 最大 18 + 2×0.75 = 19.5
+  assert.ok(value >= 18 && value <= 19.5 + 1e-6, "外推应有上限，实际 " + value);
+});
+
+await test("jitterBufferV1 溢出保护：样本上限到顶丢最旧，延迟不滚雪球", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  for (let i = 0; i < 200; i++) timeline.push(makeAngleParams(i), i * 16, i * 16, i);
+  assert.ok(timeline.count <= 64, "样本数应 ≤ 64，实际 " + timeline.count);
+  assert.ok(timeline.delayMs <= 500, "延迟上限 500 ms，实际 " + timeline.delayMs);
+});
+
+await test("jitterBufferV1 快升慢降：抖动出现立即加深，稳定后缓慢收回", () => {
+  const timeline = new ParamTimeline({ jitterBuffer: true });
+  const renderInterval = 1000 / 60;
+  const random = makeRandom(11);
+  let index = 0;
+  let delayRise = null;
+  let delayHigh = 0;
+  let delayAfterRelease = null;
+  for (let t = 0; t <= 8000; t += renderInterval) {
+    while (index * (1000 / 30) <= t + 1e-9) {
+      const production = index * (1000 / 30);
+      // 0~2 s 稳定；2~4 s 到达抖动 0~120 ms；4 s 后恢复稳定
+      const arrival = production >= 2000 && production < 4000 ? production + random() * 120 : production;
+      timeline.push(makeAngleParams(index), arrival, production, index);
+      index += 1;
+    }
+    timeline.sample(t);
+    if (t >= 2500 && delayRise === null) delayRise = timeline.delayMs;
+    if (t >= 3800 && t <= 4000) delayHigh = Math.max(delayHigh, timeline.delayMs);
+    if (t >= 4500 && delayAfterRelease === null) delayAfterRelease = timeline.delayMs;
+  }
+  assert.ok(delayRise > 150, "抖动出现 500 ms 内深度应从 80 冲到 150 以上（快升），实际 " + delayRise);
+  assert.ok(delayHigh >= 195, "持续抖动期间深度应保持在抖动档下限以上，实际 " + delayHigh);
+  assert.ok(delayAfterRelease > delayHigh - 80, "恢复后 500 ms 内应缓慢回落（慢降），实际 " + delayAfterRelease);
+  assert.ok(timeline.delayMs < delayAfterRelease, "更久之后继续缓慢回落，实际 " + timeline.delayMs);
 });
 
 console.log("[selftest] server.js · 模型发现与静态路由");

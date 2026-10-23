@@ -37,6 +37,7 @@ import {
   encodePoseOffset,
   encodePoseProfileStore,
   formatPoseOffset,
+  getProfileFor,
   isNeutralOffset,
   offsetToProfile,
   profileKeyFor,
@@ -45,6 +46,13 @@ import {
   sanitizePoseProfile,
   setProfileFor,
 } from "./calibrate.js";
+import { isDefaultFilterProfile, sanitizeFilterProfile } from "./filter.js";
+import {
+  RAW_BODY_RENDER_TAU_MS,
+  UpperBodyPostProcessor,
+  createBodyState as createBodyStateCore,
+  updateBodyStateFromTrack,
+} from "./mapping.js";
 import { Live2DStage, checkEnvironment } from "./live2d.js";
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws";
@@ -96,6 +104,14 @@ const query = new URLSearchParams(window.location.search);
 const native = window.vfcNative ?? null; // Electron preload 注入；纯 Web 下为 null
 const TARGET_FPS = parseTargetFps(query.get("fps"));
 
+/**
+ * jitterBufferV1 开关（PC 侧自适应抖动缓冲，M1）：默认开启；`?jb=0` 回退旧延迟逻辑。
+ * 关闭时**不**在 hello 里声明 jitterBufferV1 —— 手机端就不会把 send.bufferMs 用到 0，
+ * 仍保留自己的 500 ms 发送缓冲（回滚路径完整，两步都能退回去）。
+ */
+const JITTER_BUFFER_ENABLED = query.get("jb") !== "0";
+const CLIENT_FEATURES = [...(JITTER_BUFFER_ENABLED ? ["jitterBufferV1"] : []), "upperBodyPostV1"];
+
 const ui = {
   root: document.getElementById("ui"),
   dot: document.getElementById("conn-dot"),
@@ -132,6 +148,21 @@ const ui = {
     pitch: document.getElementById("cal-pitch-val"),
     roll: document.getElementById("cal-roll-val"),
   },
+  tgPoseAdaptive: document.getElementById("tg-pose-adaptive"),
+  tgFinalFilter: document.getElementById("tg-final-filter"),
+  filterSliders: {
+    headSlow: document.getElementById("fl-head-slow"),
+    headFast: document.getElementById("fl-head-fast"),
+    bodySlow: document.getElementById("fl-body-slow"),
+    bodyFast: document.getElementById("fl-body-fast"),
+  },
+  filterValues: {
+    headSlow: document.getElementById("fl-head-slow-val"),
+    headFast: document.getElementById("fl-head-fast-val"),
+    bodySlow: document.getElementById("fl-body-slow-val"),
+    bodyFast: document.getElementById("fl-body-fast-val"),
+  },
+  btnFilterReset: document.getElementById("btn-filter-reset"),
   btnHide: document.getElementById("btn-hide"),
   btnQuit: document.getElementById("btn-quit"),
   debugBox: document.getElementById("debug-box"),
@@ -174,6 +205,8 @@ const state = {
   poseProfiles: decodePoseProfileStore(storeGet(POSE_PROFILE_STORAGE_KEY)),
   /** 当前角色的量程偏好（映射归一化默认量程的倍率，1 = 与现在一致）。 */
   poseRangeScale: DEFAULT_POSE_PROFILE.rangeScale,
+  /** M4 最终观感滤波 profile（含总开关）：按角色随 poseProfiles 保存；默认关闭 = 旧行为。 */
+  filterProfile: sanitizeFilterProfile(null),
   /** 可选的缓慢自适应偏移（默认关闭，见 calibrate.js 的 AdaptivePoseOffset）。 */
   poseAdaptive: new AdaptivePoseOffset(),
   adaptiveEnabled: false,
@@ -199,6 +232,7 @@ const stage = new Live2DStage({
   canvas: document.getElementById("live2d"),
   smoothing: SMOOTHING,
   targetFps: TARGET_FPS,
+  jitterBuffer: JITTER_BUFFER_ENABLED,
 });
 
 /** verifier / 调试读取的稳定对象（原地更新，引用不变）。 */
@@ -370,6 +404,10 @@ class TrackerClient {
       this.pingSentAt.clear();
       this.lastInboundAt = Date.now();
       this.startHeartbeat();
+      // 能力协商（M1 jitterBufferV1）：连接一建立就声明本客户端支持哪些能力。
+      // 手机端只有看到 jitterBufferV1 才允许 send.bufferMs=0（否则保留 500 ms 发送缓冲）。
+      // 老手机把未知 type 当未知消息忽略，完全兼容（协议 §3）。
+      this.send({ type: "hello", protocol: "vfc-tracker", version: 1, features: CLIENT_FEATURES, t: Date.now() });
       this.handlers.onOpen?.();
     };
 
@@ -503,6 +541,8 @@ class TrackerClient {
 const client = new TrackerClient({
   onOpen() {
     state.connected = true;
+    // 新会话：播放时间轴重新预缓冲（jitterBufferV1 的 primed 复位，见 interp.js）
+    stage.resetTimeline();
     setStatus("已连接，等待数据…", "connected");
     ui.btnConnect.textContent = "断开";
     publishDebug();
@@ -516,6 +556,8 @@ const client = new TrackerClient({
     state.poseAdaptive.reset();
     state.faceMissingSince = null;
     resetBodyState();
+    // 断线也清时间轴：重连后重新预缓冲，不会把断线前的旧样本接着播
+    stage.resetTimeline();
     if (stage.ready) stage.relax();
     if (info?.manual) {
       setStatus("未连接", "idle");
@@ -540,6 +582,8 @@ const client = new TrackerClient({
     mapper.reset();
     state.poseAdaptive.reset();
     resetBodyState();
+    // 收到 hello 也要重新预缓冲（手机可能在同一条连接上重新开始推流，seq 会重计数）
+    stage.resetTimeline();
     state.faceMissingSince = null;
     state.device = typeof message.device === "string" ? message.device : "";
     state.phoneApp = typeof message.app === "string" ? message.app : "";
@@ -643,7 +687,8 @@ function feedTrack(track) {
 
   // 走时间轴：输入帧率低于渲染帧率时，渲染层会在两帧之间插值（见 interp.js）。
   // track.t 是手机采集时间戳：到达时间被 WS 批量/PC 卡顿挤在一起时，用它还原真实帧间隔。
-  stage.pushTrackParams(result.params, now, track.t);
+  // track.seq 供时间轴统计跳变（丢帧 / 拥塞信号，jitterBufferV1 分档用；去重在 handleMessage 已做）。
+  stage.pushTrackParams(result.params, now, track.t, Number.isFinite(Number(track.seq)) ? Number(track.seq) : null);
   // 上半身参数单独交给 stage：ParamBodyAngleX 与头部**相加后 clamp**，其余写可选参数
   stage.setBodyParams(body.current);
 
@@ -674,6 +719,7 @@ function publishDebug() {
   debugState.normalized = result?.normalized ?? null;
   debugState.raw = result?.raw ?? null;
   debugState.poseOffset = { ...state.poseOffset };
+  debugState.poseOffsetTarget = { ...state.poseOffsetTarget };
   debugState.calibratedPose = state.lastAppliedPose ? { ...state.lastAppliedPose } : null;
   debugState.calibration = {
     active: !!state.align,
@@ -681,10 +727,27 @@ function publishDebug() {
     remainingMs: state.align
       ? Math.max(0, Math.round(state.align.startedAt + state.align.durationMs - performance.now()))
       : 0,
-    stored: !isNeutralOffset(state.poseOffset),
+    stored: !isNeutralOffset(state.poseOffsetTarget),
     lastAlignAt: state.lastAlign ? state.lastAlign.at : null,
     lastAlignSamples: state.lastAlign ? state.lastAlign.samples : null,
     lastAlignSpread: state.lastAlign ? state.lastAlign.spread : null,
+  };
+  debugState.poseAdaptive = {
+    enabled: state.poseAdaptive.enabled,
+    rate: state.poseAdaptive.rate,
+    quietStreak: state.poseAdaptive.quietStreak,
+    updates: state.poseAdaptive.stats.updates,
+    skippedMotion: state.poseAdaptive.stats.skippedMotion,
+    skippedExpression: state.poseAdaptive.stats.skippedExpression,
+    rangeScale: state.poseRangeScale,
+  };
+  // M4 最终观感滤波：总开关 + 分组参数 + 当前输入速度（验收 / 调试面板用）
+  debugState.filter = {
+    enabled: state.filterProfile.enabled,
+    head: { ...state.filterProfile.head },
+    body: { ...state.filterProfile.body },
+    normalizer: { ...state.filterProfile.normalizer },
+    motionSpeed: Math.round((stage.timeline.motionSpeed ?? 0) * 100) / 100,
   };
   debugState.angles = {
     x: params?.ParamAngleX ?? 0,
@@ -735,6 +798,10 @@ function publishDebug() {
     confidence: body.metrics?.confidence ?? 0,
     params: { ...(body.current ?? {}) },
     support: { ...(stage.bodySupport ?? {}) },
+    raw: Boolean(body.raw),
+    phoneRawTorso: body.phoneRawTorso ? [...body.phoneRawTorso] : null,
+    postCalibrated: bodyPost.baseline.isCalibrated,
+    postBaseline: bodyPost.serializeBaseline(),
   };
   debugState.mergedParams = state.mergedParams ? { ...state.mergedParams } : null;
   debugState.dropped = state.dropped;
@@ -750,28 +817,79 @@ function publishDebug() {
  *
  * points / torso 保留最后一帧给调试骨架灰显；ok=false 时所有 body 参数按帧回 0。
  */
+/** 上半身后处理管线（任务 M2 upperBodyPostV1）：原始点 → One-Euro 平滑 → 躯干角 → TorsoBaseline。 */
+const bodyPost = new UpperBodyPostProcessor();
+
+/** 基线是否已落盘（只在收齐 10 帧转 calibrated 时写一次 localStorage）。 */
+let bodyBaselineWasCalibrated = false;
+
+/** 切换角色 profile 时同步的渲染层低通模式（见 syncBodySmoothingTau）。 */
+let lastBodyRawMode = null;
+
+/** 角色 profile 维度的躯干基线持久化 key（按角色各存各的，换角色互不干扰）。 */
+function bodyBaselineKey(modelName) {
+  return `vfc.bodyBaseline.${profileKeyFor(modelName)}`;
+}
+
+/**
+ * 切换角色 profile：载入该角色持久化的躯干基线（没有就冷启动重收 10 帧）。
+ * 与姿态偏移的 profile（calibrate.js）同一套「按角色 profile 区分」语义。
+ */
+function activateBodyBaselineProfile(modelName) {
+  bodyPost.resetSmoothers();
+  bodyBaselineWasCalibrated = false;
+  let restored = false;
+  try {
+    const raw = window.localStorage.getItem(bodyBaselineKey(modelName));
+    if (raw) restored = bodyPost.loadBaseline(JSON.parse(raw));
+  } catch {
+    restored = false;
+  }
+  return restored;
+}
+
+/** 基线收齐（isCalibrated）后落盘；只在状态变化时写一次，不逐帧写盘。 */
+function maybeSaveBodyBaseline() {
+  const calibrated = bodyPost.baseline.isCalibrated;
+  if (!calibrated) {
+    bodyBaselineWasCalibrated = false;
+    return;
+  }
+  if (bodyBaselineWasCalibrated) return;
+  bodyBaselineWasCalibrated = true;
+  try {
+    window.localStorage.setItem(bodyBaselineKey(state.modelName ?? ""), JSON.stringify(bodyPost.serializeBaseline()));
+  } catch {
+    /* 隐私模式 / 配额不足：不落盘不影响运行 */
+  }
+}
+
+/**
+ * 手动重置躯干基线（UI 按钮 / __vfc.resetBodyBaseline）：清掉该角色的持久化基线，
+ * 重新收 10 帧渐入（TorsoBaseline 的 collected/10 权重保证不从 0 突跳到基线）。
+ */
+function resetBodyBaselineForProfile() {
+  bodyPost.resetBaseline();
+  bodyBaselineWasCalibrated = false;
+  try {
+    window.localStorage.removeItem(bodyBaselineKey(state.modelName ?? ""));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 上半身状态机的初始值（连接 / 重连 / 断线时复位）——纯函数版在 mapping.js.createBodyState。
+ *
+ * points / torso 保留最后一帧给调试骨架灰显；ok=false 时所有 body 参数按帧回 0。
+ */
 function createBodyState() {
-  return {
-    /** 本帧上半身数据是否可用（有 ub + 长度对 + ubOk + 未过期）。 */
-    ok: false,
-    /** 报文里出现过 ub 字段（老手机的 track 没有）。 */
-    present: false,
-    ubOk: true,
-    stale: false,
-    ageMs: null,
-    points: null,
-    torso: [0, 0],
-    t: null,
-    receivedAt: null,
-    metrics: null,
-    /** 本帧实际写给 live2d 的上半身参数（smoothBodyParams 的结果）。 */
-    current: {},
-    /** 下一帧直接落到目标（__vfc.applyUpperBody 截图 / 自测用）。 */
-    snap: false,
-  };
+  return createBodyStateCore();
 }
 
 function resetBodyState() {
+  // 新会话：平滑器与 dt 锚点重置（基线是「这个人的中性姿态」，跨会话保留）
+  bodyPost.resetSmoothers();
   state.body = createBodyState();
   state.mergedParams = null;
 }
@@ -780,20 +898,53 @@ function resetBodyState() {
  * 解析 track 的 ub / ubOk / ubT / body，并算出这一帧要驱动的上半身参数。
  *
  * 丢失（ubOk=false / 字段缺失 / ubT 过期 / ub 长度不对 / 低可见度侧的参数）时，
- * 由 smoothBodyParams() 按帧向 0 衰减 —— 绝不保留最后一帧不动。
+ * 由 smoothBodyParams() 按帧向 0 衰减 —— 绝不保留最后一帧不动（三层回退完全不变）。
+ *
+ * upperBodyPostV1（ubRaw:true）时先走 bodyPost 后处理链（One-Euro 平滑 + 躯干角 +
+ * TorsoBaseline，与 Kotlin 原实现对拍 ≤0.5°），mapBody / smoothBodyParams 不变；
+ * 未协商（老报文）不进管线，行为与改动前逐值一致。
  */
 function updateBodyState(track, now) {
   const prev = state.body ?? createBodyState();
-  const next = readUpperBodyTrack(track, now, prev);
-  const mapped = next.ok ? mapBody(next.torso, next.points) : null;
-  next.metrics = mapped ? mapped.metrics : prev.metrics;
-  next.current = smoothBodyParams(prev.current, mapped ? mapped.params : null, {
-    decay: BODY_DECAY_PER_FRAME,
-    snap: Boolean(prev.snap),
-  });
-  next.snap = false; // snap 只作用于本帧
+  const next = updateBodyStateFromTrack(track, now, prev, { pipeline: bodyPost });
+  maybeSaveBodyBaseline();
+  syncBodySmoothingTau(next.raw === true);
   state.body = next;
   return next;
+}
+
+/**
+ * 滤波责任归属（docs/upper-body.md §3.2）：One-Euro（bodyPost）负责信号调理，
+ * 渲染层只留**一层**轻量观感平滑。原始模式把渲染层低通降到 RAW_BODY_RENDER_TAU_MS，
+ * 避免「One-Euro + 160ms」双重过度平滑；未协商保持旧 160ms 逐位不变。
+ * 可配置低通本体由 M4 的 filter.js 统一实现（存在 setBodySmoothTau 才对接，否则 no-op）。
+ */
+function syncBodySmoothingTau(raw) {
+  if (raw === lastBodyRawMode) return;
+  lastBodyRawMode = raw;
+  stage.setBodySmoothTau?.(raw ? RAW_BODY_RENDER_TAU_MS : 160);
+}
+
+/** 「重置上半身基线」按钮（动态创建，避免与并行任务的 index.html 改动抢同一文件）。 */
+function initBodyBaselineUi() {
+  try {
+    const host = ui.calibHint?.parentElement ?? null;
+    if (!host || document.getElementById("btn-body-baseline")) return;
+    const button = document.createElement("button");
+    button.id = "btn-body-baseline";
+    button.type = "button";
+    button.textContent = "重置上半身基线";
+    button.title = "按角色保存的躯干中性姿态基线：点击清掉并重新收集（约 0.7 秒渐入）";
+    button.addEventListener("click", () => {
+      resetBodyBaselineForProfile();
+      setCalibHint("已重置上半身基线：保持自然坐姿约 0.7 秒，重新收集中性姿态。", "muted");
+      publishDebug();
+    });
+    host.appendChild(button);
+    window.addEventListener("pagehide", () => maybeSaveBodyBaseline());
+  } catch {
+    /* 无 UI（截图 / 自测环境）不影响运行 */
+  }
 }
 
 /**
@@ -975,7 +1126,8 @@ function persistPoseProfile() {
   state.poseProfiles = setProfileFor(
     state.poseProfiles,
     state.modelName,
-    offsetToProfile(state.poseOffsetTarget, state.poseRangeScale),
+    // filter：最终滤波参数随角色一起保存（offsetToProfile 不带它就会回落默认值）
+    offsetToProfile(state.poseOffsetTarget, state.poseRangeScale, state.filterProfile),
   );
   storeSet(POSE_PROFILE_STORAGE_KEY, encodePoseProfileStore(state.poseProfiles));
   // 旧版全局 key 继续写「最后生效的偏移」：老版本客户端只认它也不受影响。
@@ -1022,7 +1174,51 @@ function activatePoseProfile(modelName) {
   state.poseRangeScale = profile.rangeScale;
   mapper.setRangeScale(profile.rangeScale); // 量程偏好：1 = 与现在完全一致
   state.poseAdaptive.reset();
+  // M4：最终观感滤波参数也随角色恢复（总开关默认关 = 与旧版行为完全一致）
+  applyFilterProfile(profile.filter, { persist: false });
   applyPoseCalibration(profileToOffset(profile), { persist: true, resetNormalizers: true, smooth: false });
+}
+
+/**
+ * M4：应用最终观感滤波 profile（含总开关）。
+ *
+ * - enabled = false（默认）：完全走现有滤波参数（时间轴插值 + 每帧缓动 + 上半身 160ms 低通），
+ *   归一化旋钮也回到默认（AdaptiveAngleNormalizer 保持「向外快 0.1 / 向内慢 0.05→0.01」）；
+ * - enabled = true：live2d.js 用速度自适应低通**替换**那两段低通（不叠加），头/脸与上半身分开配置；
+ * - persist=true 时写进当前角色的 profile（vfc.poseProfiles），换角色各用各的。
+ */
+function applyFilterProfile(profile, { persist = true } = {}) {
+  state.filterProfile = sanitizeFilterProfile(profile);
+  stage.setFilterProfile(state.filterProfile);
+  mapper.configureNormalizers(state.filterProfile.enabled ? state.filterProfile.normalizer : null);
+  if (persist) persistPoseProfile();
+  renderFilterUi();
+  publishDebug();
+  return { ...state.filterProfile };
+}
+
+/** 滤波滑块 ↔ profile 字段映射（头/脸 与 上半身 分开配置）。 */
+const FILTER_SLIDER_MAP = {
+  headSlow: ["head", "slowTauMs"],
+  headFast: ["head", "fastTauMs"],
+  bodySlow: ["body", "slowTauMs"],
+  bodyFast: ["body", "fastTauMs"],
+};
+
+/** 把当前 filterProfile 回填到开关 / 滑块（拖动中不回写，与校准滑块同一约定）。 */
+function renderFilterUi() {
+  const profile = state.filterProfile;
+  if (ui.tgFinalFilter && document.activeElement !== ui.tgFinalFilter) {
+    ui.tgFinalFilter.checked = Boolean(profile.enabled);
+  }
+  for (const [key, [group, field]] of Object.entries(FILTER_SLIDER_MAP)) {
+    const input = ui.filterSliders?.[key];
+    const label = ui.filterValues?.[key];
+    const value = profile[group][field];
+    if (input && document.activeElement !== input) input.value = String(value);
+    if (label) label.textContent = `${Math.round(value)} ms`;
+  }
+  if (ui.btnFilterReset) ui.btnFilterReset.disabled = isDefaultFilterProfile(profile);
 }
 
 /**
@@ -1248,6 +1444,7 @@ async function loadModel(name) {
     debugState.model = target.name;
     // 每个角色各存各的偏移 + 量程偏好：加载完模型就把该角色的 profile 装上（立即生效）。
     activatePoseProfile(target.name);
+    activateBodyBaselineProfile(target.name);
     if (state.lastResult) stage.setTargetParams(state.lastResult.params);
     setStatus(state.connected ? (state.device ? `已连接 · ${state.device}` : "已连接") : "未连接", connPhase());
     publishDebug();
@@ -1292,10 +1489,18 @@ function renderDebugGrid() {
     ["pose pitch", fmt(pose[0], 2)],
     ["pose yaw", fmt(pose[1], 2)],
     ["pose roll", fmt(pose[2], 2)],
-    ["偏移 p/y/r", formatPoseOffset(state.poseOffset)],
+    ["偏移 p/y/r", formatPoseOffset(state.poseOffsetTarget)],
     ["校准后 pose", state.lastAppliedPose
       ? `${fmt(state.lastAppliedPose.pitch, 2)} / ${fmt(state.lastAppliedPose.yaw, 2)} / ${fmt(state.lastAppliedPose.roll, 2)}`
       : "-"],
+    ["缓慢自适应", state.poseAdaptive.enabled ? `开 · 已更 ${state.poseAdaptive.stats.updates} 次` : "关（默认）"],
+    ["最终滤波", state.filterProfile.enabled ? "开 · 速度自适应" : "关（默认）"],
+    [
+      "滤波 τ 头/身",
+      `${Math.round(state.filterProfile.head.slowTauMs)}→${Math.round(state.filterProfile.head.fastTauMs)}` +
+        ` / ${Math.round(state.filterProfile.body.slowTauMs)}→${Math.round(state.filterProfile.body.fastTauMs)} ms`,
+    ],
+    ["动作速度", fmt(stage.timeline.motionSpeed, 2) + " 量程/s"],
     ["norm pitch", fmt(result?.normalized?.pitch, 3)],
     ["norm yaw", fmt(result?.normalized?.yaw, 3)],
     ["norm roll", fmt(result?.normalized?.roll, 3)],
@@ -1324,6 +1529,7 @@ function renderDebugGrid() {
     ["输入间隔", fmt(interp.inputIntervalMs, 1) + " ms"],
     ["输入抖动", fmt(interp.jitterMs, 1) + " ms" + (interp.starvedEpisodes ? ` · 见底 ${interp.starvedEpisodes} 次` : "")],
     ["插值延迟", fmt(interp.delayMs, 1) + " ms" + (interp.active ? " · 插值中" : "")],
+    ["缓冲档位", (interp.primed === false ? "预缓冲中 · " : "") + ({ stable: "稳定", jitter: "抖动", heavy: "剧烈" }[interp.depthTier] ?? interp.depthTier ?? "-") + (interp.targetDelayMs != null ? ` · 目标 ${fmt(interp.targetDelayMs, 0)} ms` : "")],
     ["frames", String(state.frames)],
     ["dropped", String(state.dropped)],
     ["缺失参数", (stage.missingParams ?? []).length ? (stage.missingParams ?? []).join(",") : "无"],
@@ -1491,6 +1697,31 @@ function wireUi() {
     setCalibHint("已清零（平滑过渡）：模型正缓慢回到手机端基线驱动。", "muted");
   });
 
+  // 可选缓慢自适应偏移：默认关闭，开关状态持久化（vfc.poseAdaptive）。
+  ui.tgPoseAdaptive?.addEventListener("change", () => {
+    setAdaptiveEnabled(ui.tgPoseAdaptive.checked);
+  });
+
+  // M4 最终观感滤波：总开关 + 头/脸与上半身分开的慢/快强度（按角色 profile 自动保存）
+  ui.tgFinalFilter?.addEventListener("change", () => {
+    applyFilterProfile({ ...state.filterProfile, enabled: ui.tgFinalFilter.checked });
+  });
+  for (const [key, [group, field]] of Object.entries(FILTER_SLIDER_MAP)) {
+    const input = ui.filterSliders?.[key];
+    if (!input) continue;
+    input.addEventListener("input", () => {
+      applyFilterProfile(
+        { ...state.filterProfile, [group]: { ...state.filterProfile[group], [field]: Number(input.value) } },
+        { persist: false },
+      );
+    });
+    // 松手才落盘（与校准滑块同一约定）：拖动过程中只改内存里的 profile
+    input.addEventListener("change", () => persistPoseProfile());
+  }
+  ui.btnFilterReset?.addEventListener("click", () => {
+    applyFilterProfile(sanitizeFilterProfile(null));
+  });
+
   ui.btnHide.addEventListener("click", () => toggleUiHidden());
 
   ui.collapse.addEventListener("click", () => {
@@ -1595,13 +1826,58 @@ window.__vfc = {
     return { body: { ...(debugState.body ?? {}) }, params: state.mergedParams };
   },
 
-  /** 本地姿态偏移（镜头没正对你时的校准量，度）。 */
+  /** 本地姿态偏移（镜头没正对你时的校准量，度）——当前**应用中**的值（平滑过渡期间可能未到目标）。
+   *  叠加公式：最终角度 = track.pose + poseOffset（track.pose 已减手机基线，PC 端不再减）。 */
   get poseOffset() {
     return { ...state.poseOffset };
   },
-  /** 直接设置三轴偏移（度），立即生效并持久化。 */
+  /** 目标偏移（滑块 / 持久化值；手动重置等平滑过渡结束后与 poseOffset 相等）。 */
+  get poseOffsetTarget() {
+    return { ...state.poseOffsetTarget };
+  },
+  /** 直接设置三轴偏移（度），立即生效并按当前角色持久化。 */
   setPoseOffset(offset) {
     return applyPoseCalibration(offset, { persist: true });
+  },
+  /** 手动重置：偏移清零，限速平滑过渡（不瞬移），并持久化到当前角色。 */
+  resetPoseOffset() {
+    return applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true, smooth: true });
+  },
+  /** 读某角色的 profile（{pitchOffset,yawOffset,rollOffset,rangeScale}）。 */
+  /** 手动重置当前角色的上半身基线（M2；与 UI「重置上半身基线」按钮同源）。 */
+  resetBodyBaseline() {
+    resetBodyBaselineForProfile();
+    return true;
+  },
+  /** 后处理管线 / 基线状态（验收与调试用）。 */
+  bodyPostState() {
+    return {
+      calibrated: bodyPost.baseline.isCalibrated,
+      baseline: bodyPost.serializeBaseline(),
+    };
+  },
+  getPoseProfile(modelName) {
+    return { ...getProfileFor(state.poseProfiles, modelName ?? state.modelName) };
+  },
+  /** 按角色 profile store 的原始快照（调试 / 验收用）。 */
+  get poseProfiles() {
+    return decodePoseProfileStore(encodePoseProfileStore(state.poseProfiles));
+  },
+  /** 可选缓慢自适应：开关（默认关）+ 当前统计。 */
+  setAdaptiveEnabled(enabled) {
+    setAdaptiveEnabled(Boolean(enabled));
+    return state.poseAdaptive.enabled;
+  },
+  get poseAdaptive() {
+    return {
+      enabled: state.poseAdaptive.enabled,
+      rate: state.poseAdaptive.rate,
+      quietStreak: state.poseAdaptive.quietStreak,
+      updates: state.poseAdaptive.stats.updates,
+      skippedMotion: state.poseAdaptive.stats.skippedMotion,
+      skippedExpression: state.poseAdaptive.stats.skippedExpression,
+      maxDriftDeg: state.poseAdaptive.maxDriftDeg,
+    };
   },
   /** 一键校准状态（verifier / 调试用）。 */
   get calibration() {
@@ -1611,8 +1887,8 @@ window.__vfc = {
       remainingMs: state.align
         ? Math.max(0, Math.round(state.align.startedAt + state.align.durationMs - performance.now()))
         : 0,
-      offset: { ...state.poseOffset },
-      neutral: isNeutralOffset(state.poseOffset),
+      offset: { ...state.poseOffsetTarget },
+      neutral: isNeutralOffset(state.poseOffsetTarget),
       lastAlign: state.lastAlign ? { ...state.lastAlign } : null,
     };
   },
@@ -1701,6 +1977,18 @@ window.__vfc = {
   setSmoothing(value) {
     return stage.setSmoothing(value);
   },
+  /** M4 最终观感滤波：当前完整 profile（含总开关；按角色随 vfc.poseProfiles 保存）。 */
+  get filterProfile() {
+    return { ...state.filterProfile };
+  },
+  /** 整体替换最终滤波 profile（自动持久化到当前角色）。 */
+  setFilterProfile(profile) {
+    return applyFilterProfile(profile);
+  },
+  /** 只切总开关（默认 false = 与旧版行为完全一致）。 */
+  setFinalFilter(enabled) {
+    return applyFilterProfile({ ...state.filterProfile, enabled: Boolean(enabled) });
+  },
   /** 改渲染目标帧率（0 = 不限制），返回实际生效值。 */
   setTargetFps(value) {
     const fps = stage.setTargetFps(value);
@@ -1730,6 +2018,14 @@ async function boot() {
   initSkeletonView();
   syncSkeletonVisibility();
   renderCalibUi(); // 把 localStorage 里保存的本地姿态偏移回填到滑块 / 提示
+  initBodyBaselineUi();
+  renderFilterUi(); // M4：最终滤波开关 / 滑块回填（模型加载后 activatePoseProfile 会再按角色套用）
+  // 平滑过渡器与应用中偏移对齐；缓慢自适应默认关闭，只有显式存过 "1" 才开（行为与现在一致）。
+  state.poseRamp.setTarget(state.poseOffsetTarget, { snap: true });
+  const adaptiveOn = storeGet(POSE_ADAPTIVE_STORAGE_KEY) === "1";
+  state.poseAdaptive.enabled = adaptiveOn;
+  state.adaptiveEnabled = adaptiveOn;
+  if (ui.tgPoseAdaptive) ui.tgPoseAdaptive.checked = adaptiveOn;
   await initNativeControls();
   ui.renderFps.title =
     stage.targetFps > 0 ? `目标 ${stage.targetFps} fps（URL ?fps=<n> 可改，0 = 不限）` : "不限制帧率（跟随 vsync）";

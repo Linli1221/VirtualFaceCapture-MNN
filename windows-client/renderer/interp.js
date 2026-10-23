@@ -76,6 +76,7 @@
  */
 
 import { PARAM_IDS } from "./mapping.js";
+import { paramSpan } from "./filter.js";
 
 export const INTERP_DEFAULTS = Object.freeze({
   /** 目标渲染帧间隔（ms），用于判断「输入是否比渲染慢」。 */
@@ -151,8 +152,11 @@ export const INTERP_DEFAULTS = Object.freeze({
   /** jitter 模式的延迟变化时间常数与限速：快升慢降，且 rise rate < 1 保证不倒带。 */
   attackMsJitter: 100,
   releaseMsJitter: 2500,
-  maxRiseRateJitter: 0.75,
+  maxRiseRateJitter: 0.6,
   maxFallRateJitter: 0.1,
+  /** 档位迟滞：升档立即（快升），降档要保持 tierHoldMs（慢降），
+   *  避免信号在阈值附近抖动时深度目标 200↔400 来回横跳、画面反复放慢。 */
+  tierHoldMs: 2000,
 });
 
 function nowMs() {
@@ -160,6 +164,18 @@ function nowMs() {
     ? performance.now()
     : Date.now();
 }
+
+/**
+ * 输入侧动作速度（任务 M4：最终滤波的「快升」前馈，见 filter.js）。
+ *
+ * 时间轴最清楚「输入帧之间隔了多久」（播放时间口径，不是到达时间），在这里按
+ * `|Δ参数| / 满量程 / Δt` 估计每个参数的**归一化速度**（满量程/秒）。filter.js 的
+ * 速度自适应低通把它当 feed-forward：快动作在输入侧一出现就弱滤波（跟手），不用等
+ * 渲染侧微分慢半拍；快慢塑形（快升慢降）仍由 filter.js 统一处理，这里只做轻 EMA。
+ */
+const SPEED_EMA = 0.5;
+/** 速度样本的最小时间间隔（ms）：同一时刻的重复帧不参与速度估计。 */
+const SPEED_MIN_INTERVAL_MS = 2;
 
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
@@ -249,6 +265,14 @@ export class ParamTimeline {
     this._lastSeq = null;
     /** 当前深度档（调试 / 调试面板展示）："stable" | "jitter" | "heavy"。 */
     this.depthTier = "stable";
+    /** 档位迟滞：开始考虑降档的时刻（null = 没有在考虑降档）。 */
+    this._tierDownAt = null;
+
+    // ---- M4：输入侧速度估计（feed-forward，见文件头 SPEED_EMA） ----
+    /** 每个参数的归一化速度 EMA（满量程/秒），speedOf(id) 读取。 */
+    this._speeds = new Map();
+    this._lastSpeedAt = null;
+    this._lastSpeedParams = null;
   }
 
   get count() {
@@ -274,6 +298,10 @@ export class ParamTimeline {
     this.starvedEpisodes = 0;
     this._starved = false;
     this._lastSampleAt = -Infinity;
+    // M4：时间轴清空 = 运动基线重来，速度估计一起清（否则断线恢复后前几帧速度是旧的）
+    this._speeds.clear();
+    this._lastSpeedAt = null;
+    this._lastSpeedParams = null;
     if (this.jitter && !options.keepPriming) {
       // 新会话 / 断线：重新走起播预缓冲（M1 要求：onopen / onhello / 重连都要重新 primed）
       this.primed = false;
@@ -292,6 +320,7 @@ export class ParamTimeline {
       this._bigGapStreak = 0;
       this._lastSeq = null;
       this.depthTier = "stable";
+      this._tierDownAt = null;
     }
   }
 
@@ -410,9 +439,10 @@ export class ParamTimeline {
         if (this._intervals.length > o.intervalWindow) this._intervals.shift();
         this.inputIntervalMs =
           this.inputIntervalMs > 0 ? this.inputIntervalMs + (dt - this.inputIntervalMs) * o.intervalSmoothing : dt;
-        // 连续大间隔统计：比 p50 的 bigGapRatio 倍还大才算，单帧抽风不触发
-        const p50 = percentile(this._intervals, o.intervalMidQuantile);
-        if (dt > Math.max(o.bigGapMinMs, p50 * o.bigGapRatio)) this._bigGapStreak += 1;
+        // 连续大间隔统计：和「最近窗口最慢节奏」（min，与偏移估计同思路）比，
+        // 超过 bigGapRatio 倍才算大间隔——均匀慢（如稳定 5 fps）不算抖动，单帧抽风也不累进。
+        const baseline = Math.min(...this._intervals);
+        if (dt > Math.max(o.bigGapMinMs, baseline * o.bigGapRatio)) this._bigGapStreak += 1;
         else this._bigGapStreak = 0;
       }
     }
@@ -424,6 +454,7 @@ export class ParamTimeline {
     }
 
     this._updateJitterStats();
+    this._updateSpeed(t, params);
 
     this.samples.push({ t, params });
     if (this.samples.length > o.maxSamples) this.samples.shift();
@@ -431,6 +462,41 @@ export class ParamTimeline {
     this._lastStamp = stampMs;
     if (this.jitter && !this.primed && this._primeStartAt == null) this._primeStartAt = atMs;
     return true;
+  }
+
+  /**
+   * 输入侧速度估计（M4 前馈）：相邻两帧输入的归一化速度（满量程/秒）做轻 EMA。
+   * 只在真正排进时间轴的新帧（dt ≥ SPEED_MIN_INTERVAL_MS）时更新；覆盖帧 / 乱序帧不算。
+   */
+  _updateSpeed(t, params) {
+    const lastT = this._lastSpeedAt;
+    const lastParams = this._lastSpeedParams;
+    this._lastSpeedAt = t;
+    this._lastSpeedParams = params;
+    if (lastT == null || !lastParams) return;
+    const dt = (t - lastT) / 1000;
+    if (!(dt * 1000 >= SPEED_MIN_INTERVAL_MS)) return;
+    for (const id of PARAM_IDS) {
+      const a = Number(lastParams?.[id]);
+      const b = Number(params?.[id]);
+      if (!isFiniteNumber(a) || !isFiniteNumber(b)) continue;
+      const speed = Math.min(200, Math.abs(b - a) / paramSpan(id) / dt);
+      const prev = this._speeds.get(id) ?? 0;
+      this._speeds.set(id, prev + (speed - prev) * SPEED_EMA);
+    }
+  }
+
+  /** 某个参数的输入侧速度（满量程/秒，轻 EMA；没测过返回 0）。filter.js 做 feed-forward。 */
+  speedOf(id) {
+    const value = this._speeds.get(id);
+    return isFiniteNumber(value) ? value : 0;
+  }
+
+  /** 全部参数里最大的输入速度（调试面板 / 自检展示用）。 */
+  get motionSpeed() {
+    let max = 0;
+    for (const value of this._speeds.values()) if (value > max) max = value;
+    return max;
   }
 
   _updateJitterStats() {
@@ -506,13 +572,32 @@ export class ParamTimeline {
       starves >= 1 ||
       this.transitJitterMs >= o.transitJitterLightMs ||
       spread >= o.spreadLightMs;
-    this.depthTier = heavy ? "heavy" : light ? "jitter" : "stable";
+    let tier = heavy ? "heavy" : light ? "jitter" : "stable";
 
-    // 分位数估计（p85 覆盖典型节奏、lag95 覆盖典型迟到）+ 固定余量，再夹进当前档位的深度范围
+    // 档位迟滞：升档立即生效（抖动一出现就加深），降档必须稳定保持 tierHoldMs ——
+    // 信号在阈值附近抖动时深度目标不会 200↔400 来回横跳（横跳会反复触发「加深→放慢」）。
+    const rank = { stable: 0, jitter: 1, heavy: 2 };
+    if (rank[tier] < rank[this.depthTier]) {
+      if (this._tierDownAt == null) this._tierDownAt = now;
+      if (now - this._tierDownAt < o.tierHoldMs) tier = this.depthTier;
+      else this._tierDownAt = null;
+    } else {
+      this._tierDownAt = null;
+    }
+    this.depthTier = tier;
+
+    // 分位数估计（p85 覆盖典型节奏、lag95 覆盖典型迟到）+ 固定余量，再夹进**迟滞后**档位的深度范围
     const base = p85 + lag95 + o.jitterMarginMs;
-    if (heavy) return Math.min(Math.max(base, o.depthHeavyMinMs), o.depthHeavyMaxMs);
-    if (light) return Math.min(Math.max(base, o.depthJitterMinMs), o.depthJitterMaxMs);
-    return Math.min(Math.max(base, o.depthMinMs), o.depthStableMaxMs);
+    const target =
+      tier === "heavy"
+        ? Math.min(Math.max(base, o.depthHeavyMinMs), o.depthHeavyMaxMs)
+        : tier === "jitter"
+          ? Math.min(Math.max(base, o.depthJitterMinMs), o.depthJitterMaxMs)
+          : Math.min(Math.max(base, o.depthMinMs), o.depthStableMaxMs);
+    // 逃逸：输入本身很慢（如稳定 5 fps，p85=200 ms）时，分档上限会系统性盖不住真实需要，
+    // 宁可突破档位上限（不超过剧烈档上限），也不能让缓冲长期饿着——正常局域网不会触发。
+    if (tier !== "heavy" && base > target) return Math.min(base, o.depthHeavyMaxMs);
+    return target;
   }
 
   /**
@@ -574,6 +659,8 @@ export class ParamTimeline {
     if (sampleAt < this._lastSampleAt) sampleAt = this._lastSampleAt;
     this._lastSampleAt = sampleAt;
 
+    const first = this.samples[0];
+    const last = this.samples[count - 1];
     if (count === 1 || sampleAt <= first.t) {
       this._starved = false;
       return copyParams(first.params, this.out);
@@ -586,6 +673,9 @@ export class ParamTimeline {
         if (!this._starved) {
           this._starved = true;
           this.starvedEpisodes += 1;
+          // 见底是「当前深度不够」的直接证据：记入 2 s 窗口，参与分档（见 _targetDelayJitter）
+          this._starveAt.push(now);
+          this._pruneWindow(this._starveAt, now, o.starveWindowMs);
         }
         const prev = this.samples[count - 2];
         if (count >= 2 && prev) {

@@ -24,6 +24,7 @@
  */
 import { BODY_ANGLE_LIMIT, BODY_PARAM_IDS, PARAM_IDS, combineBodyAngleX } from "./mapping.js";
 import { ParamTimeline } from "./interp.js";
+import { ParamFilterBank } from "./filter.js";
 
 /** 默认渲染目标帧率（协议 §9：PC 渲染 60 FPS @ 1080p）。 */
 export const DEFAULT_TARGET_FPS = 60;
@@ -88,11 +89,13 @@ export function checkEnvironment() {
 
 export class Live2DStage {
   /**
-   * @param {{canvas?:HTMLCanvasElement, smoothing?:number, targetFps?:number, interpolate?:boolean}} [options]
+   * @param {{canvas?:HTMLCanvasElement, smoothing?:number, targetFps?:number, interpolate?:boolean, jitterBuffer?:boolean}} [options]
    *   smoothing  = 每帧（按 60 fps 计）向目标值靠拢的系数（1 = 立即生效，0.6 ≈ 1~2 帧缓动），
    *                实际生效值按 dt 折算，与渲染帧率无关；
    *   targetFps  = 渲染目标帧率（默认 60，0 / 负数 = 不限制）；
-   *   interpolate = 输入帧率低于渲染帧率时是否做时间轴插值（默认 true）。
+   *   interpolate = 输入帧率低于渲染帧率时是否做时间轴插值（默认 true）；
+   *   jitterBuffer = 启用 jitterBufferV1 自适应抖动缓冲（默认 true；false = 回退旧延迟逻辑，
+   *                  仅作回滚开关，见 interp.js 的职责边界说明——**没有第二套缓冲层**）。
    */
   constructor(options = {}) {
     this.options = options;
@@ -106,7 +109,12 @@ export class Live2DStage {
     this.smoothing = typeof options.smoothing === "number" ? options.smoothing : 0.6;
     this._smoothingTau = this._tauFor(this.smoothing);
     this.interpolate = options.interpolate !== false;
-    this.timeline = new ParamTimeline();
+    this.timeline = new ParamTimeline({ jitterBuffer: options.jitterBuffer !== false });
+    /**
+     * M4：PC 端最终表现层滤波（速度自适应低通，见 filter.js）。
+     * 总开关默认关：关闭时 _computeFrameValues 完全走现有滤波参数（行为与旧版一致）。
+     */
+    this.filterBank = new ParamFilterBank();
     this.targetFps = DEFAULT_TARGET_FPS;
     this.availableParams = [];
     /** 上半身派生参数（mapBody 的结果）：与头部参数分开存，每帧在头部之后叠加写入。 */
@@ -213,6 +221,7 @@ export class Live2DStage {
     this.currentParams = Object.create(null);
     this._frameValues = Object.create(null);
     this.timeline.reset();
+    this.filterBank.reset();
 
     const previous = this.model;
     this.model = null;
@@ -295,13 +304,22 @@ export class Live2DStage {
    * @param {number} [at] 到达时间（performance.now()，默认取当前时刻）
    * @param {number} [stamp] 手机采集时间戳（track.t）；有它时按真实采集时间排时间轴，
    *                        WS 批量到达 / PC 卡顿不会把两帧挤在同一个时刻
+   * @param {number} [seq] 帧序号（track.seq）；仅用于跳变统计，去重在 app.js 已做
    */
-  pushTrackParams(params, at = performance.now(), stamp = null) {
+  pushTrackParams(params, at = performance.now(), stamp = null, seq = null) {
     if (!params) return false;
     this._clearRelaxTimer();
     this.targetParams = params;
     if (!this.interpolate) return true;
-    return this.timeline.push(params, at, stamp);
+    return this.timeline.push(params, at, stamp, seq);
+  }
+
+  /**
+   * 重置播放时间轴并重新预缓冲（onopen / onhello / 重连 / 新会话时调用）。
+   * 保留已测出的节奏与时钟偏移由 options 控制（默认全清：新会话的时钟偏移要重估）。
+   */
+  resetTimeline(options = {}) {
+    this.timeline.reset(options);
   }
 
   /**
@@ -318,6 +336,30 @@ export class Live2DStage {
    *
    * @param {object|null} params mapBody(...).params
    */
+  /**
+   * M4：应用最终滤波 profile（含总开关）。enabled=false 时完全走现有滤波参数（行为与旧版一致）。
+   * @param {object|null} profile 见 filter.js 的 sanitizeFilterProfile
+   * @returns {object} 生效的完整 profile
+   */
+  setFilterProfile(profile = null) {
+    return this.filterBank.setProfile(profile);
+  }
+
+  /** 当前最终滤波 profile 快照（写回角色 profile / 调试用）。 */
+  getFilterProfile() {
+    return this.filterBank.profile;
+  }
+
+  /** 最终滤波总开关（默认 false = 与旧行为一致）。 */
+  get finalFilterEnabled() {
+    return this.filterBank.enabled;
+  }
+
+  /** 只切总开关（其余参数保持当前 profile），返回生效 profile。 */
+  setFinalFilter(enabled) {
+    return this.setFilterProfile({ ...this.filterBank.profile, enabled: Boolean(enabled) });
+  }
+
   setBodyParams(params) {
     const next = Object.create(null);
     if (params && typeof params === "object") {
@@ -465,13 +507,20 @@ export class Live2DStage {
       alpha = tau > 0 ? 1 - Math.exp(-dt / tau) : 1;
     }
 
+    // M4 最终滤波（总开关打开且非截图/单步）：速度自适应低通**替换**上面的每帧缓动
+    // 与下面的上半身 160ms 低通（不叠加，避免多层强滤波把动作做肉）；头/脸与上半身分组配置。
+    const useFinalFilter = this.filterBank.enabled && !immediate;
+
     const values = this._frameValues;
     for (const id of PARAM_IDS) {
       const goal = target[id];
       if (typeof goal !== "number" || !Number.isFinite(goal)) continue;
       const current = this.currentParams[id];
       let value = goal;
-      if (alpha < 1) {
+      if (useFinalFilter) {
+        // 输入侧速度做前馈（interp.js）：快动作一出现就弱滤波，不等渲染侧微分慢半拍
+        value = this.filterBank.step(id, goal, dt, this.timeline.speedOf(id));
+      } else if (alpha < 1) {
         const base = typeof current === "number" && Number.isFinite(current) ? current : goal;
         value = base + (goal - base) * alpha;
         // 足够接近就直接落位，避免浮点尾巴让参数永远"差一点"
@@ -485,14 +534,20 @@ export class Live2DStage {
     // 上半身：在头部参数之后叠加（ParamBodyAngleX 相加后 clamp，其余写可选参数）。
     // Pose 只有 ~15 fps，按 0.15~0.2 s 一阶低通再写（协议 §8.5 建议），
     // 与头部参数的时间轴插值互不影响；immediate（截图 / 单步）直接落位。
+    // M4 总开关打开时改走 filter.js 的 body 组（更稳的那组参数），**替换**而不是叠加 160ms 低通；
+    // 躯干 X 是独立滤波状态（key="torsoX"），与头部驱动的 ParamBodyAngleX 互不干扰。
     const bodyAlpha = immediate ? 1 : 1 - Math.exp(-dt / BODY_SMOOTH_TAU_MS);
     const body = this.bodyParams;
     const torsoX = body?.ParamBodyAngleX;
     if (typeof torsoX === "number" && Number.isFinite(torsoX)) {
-      const previous =
-        typeof this.currentTorsoX === "number" && Number.isFinite(this.currentTorsoX) ? this.currentTorsoX : torsoX;
-      const smoothed = bodyAlpha >= 1 ? torsoX : previous + (torsoX - previous) * bodyAlpha;
-      this.currentTorsoX = Math.abs(torsoX - smoothed) < 0.0005 ? torsoX : smoothed;
+      if (useFinalFilter) {
+        this.currentTorsoX = this.filterBank.stepGroup("body", "torsoX", torsoX, dt);
+      } else {
+        const previous =
+          typeof this.currentTorsoX === "number" && Number.isFinite(this.currentTorsoX) ? this.currentTorsoX : torsoX;
+        const smoothed = bodyAlpha >= 1 ? torsoX : previous + (torsoX - previous) * bodyAlpha;
+        this.currentTorsoX = Math.abs(torsoX - smoothed) < 0.0005 ? torsoX : smoothed;
+      }
       const headX = this.currentParams.ParamBodyAngleX;
       values.ParamBodyAngleX = this._mapBodyValue(
         "ParamBodyAngleX",
@@ -507,7 +562,9 @@ export class Live2DStage {
       if (typeof goal !== "number" || !Number.isFinite(goal)) continue;
       const current = this.currentParams[id];
       let value = goal;
-      if (bodyAlpha < 1) {
+      if (useFinalFilter) {
+        value = this.filterBank.step(id, goal, dt);
+      } else if (bodyAlpha < 1) {
         const base = typeof current === "number" && Number.isFinite(current) ? current : goal;
         value = base + (goal - base) * bodyAlpha;
         if (Math.abs(goal - value) < 0.0005) value = goal;
@@ -542,11 +599,14 @@ export class Live2DStage {
   /** 立即把画面同步到最新目标参数（截图 / 单步调试用，不依赖 rAF）。 */
   renderNow() {
     if (!this.app || !this.model) return;
-    // 截图 / 自测要的是「最新目标」，不能等插值缓冲，也不能把延迟留在时间轴上
-    this.timeline.reset({ keepTiming: true });
+    // 截图 / 自测要的是「最新目标」，不能等插值缓冲，也不能把延迟留在时间轴上。
+    // keepPriming：截图不该把会话踢回预缓冲（否则截图后要再等一个缓冲深度才能动）
+    this.timeline.reset({ keepTiming: true, keepPriming: true });
     this._immediate = true;
     this.applyParams(true);
     this._immediate = false;
+    // 截图 / 单步直接落位后滤波器重新落位：恢复推流时不拿旧状态去「追」新目标（不甩尾）
+    this.filterBank.reset();
     this.model.update(16.7);
     this.app.renderer.render(this.app.stage);
   }
@@ -601,6 +661,10 @@ export class Live2DStage {
       samples: timeline.count,
       starvedFrames: timeline.starvedFrames,
       starvedEpisodes: timeline.starvedEpisodes,
+      // jitterBufferV1：是否已起播 / 当前深度档 / 目标深度（分位数估计，不是最大值）
+      primed: timeline.primed,
+      depthTier: timeline.depthTier,
+      targetDelayMs: Math.round(timeline.targetDelayMs() * 10) / 10,
     };
   }
 
@@ -612,6 +676,7 @@ export class Live2DStage {
     this.bodyParams = Object.create(null);
     this.currentTorsoX = null;
     this.timeline.reset();
+    this.filterBank.reset();
   }
 
   destroy() {
