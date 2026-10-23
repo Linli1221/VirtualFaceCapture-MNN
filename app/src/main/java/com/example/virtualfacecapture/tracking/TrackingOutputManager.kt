@@ -6,7 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import android.view.WindowManager
 import androidx.compose.runtime.mutableStateOf
 import com.example.commondata.ARKitBlendShapes

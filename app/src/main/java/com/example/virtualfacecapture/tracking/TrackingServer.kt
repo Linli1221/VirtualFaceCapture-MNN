@@ -1,7 +1,7 @@
 package com.example.virtualfacecapture.tracking
 
 import android.util.Base64
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.HeadPoseData
 import com.example.commondata.UpperBodyPoseFrame

@@ -253,6 +253,16 @@ pwsh -File tools/fetch-pose-model.ps1   # Windows
 | **眼睛灵敏度** | 眼部 EAR 阈值灵敏度（0.5x ～ 2.0x），下方实时显示生效的 `closed / open` 阈值 |
 | **上半身: 开 / 关** | 启动 / 停止 MediaPipe Pose 上半身采集（需要先放模型，见「模型从哪来」）；开启后预览画面叠加骨架、HUD 显示 body fps / 点数 / 躯干角；与面捕开始 / 停止联动 |
 | **显示调试 / 关键点** | 顶栏调试 HUD（fps、帧耗时、pitch/yaw/roll + 条形图、ARKit 数值）与相机画面上的关键点 / 检测框叠加 |
+| **导出日志（仅 debug 包）** | 控制面板底部「导出日志 (debug)」：把应用日志、设备 / 版本信息、检测器首帧 dump、SharedPreferences 打成一个 zip，用系统「保存到」对话框导出 |
+
+> **日志落在哪**：debug 包启动时 `VfcApp` 会调用 `VfcLog.init()`，所有 `Log.x` 调用
+> （面捕 / 相机 / 上半身 / 网络输出 / 崩溃栈）在写 logcat 的同时异步追加到
+> `filesDir/logs/vfc.log`（2 MB 轮转、保留 3 份），点「导出日志 (debug)」即可打包成
+> `vfc-log-<时间>.zip`（内含 `README.txt` / `device-info.txt` / `app-info.txt` / `logs/` /
+> `dump/` / `prefs/`）。release 包不写文件、也不显示按钮。`dump/` 里是检测器首帧
+> （相机原始画面，仅用于排查取景 / 旋转），日志目录也不参与云备份。native(C++) 日志、
+> 其它进程日志和 tombstone 仍只存在于 logcat，需要时用 `adb logcat`
+> （见 [PERFORMANCE.md](PERFORMANCE.md) §5）。
 
 ### Windows 客户端
 

@@ -1,6 +1,6 @@
 package com.live2d.facecapture
 
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import kotlin.math.abs
 import kotlin.math.cos
 
@@ -18,6 +18,7 @@ import kotlin.math.cos
  * - 睁眼阶段：~120ms（稍慢）
  * - 总计：~230ms
  */
+// 兼容旧版公开 API（曾作为 typealias 暴露给 SDK 使用者）；新代码请直接用 Log / VfcLog。
 typealias BLog = android.util.Log
 class BlinkCurveProcessor {
     
@@ -522,7 +523,7 @@ class BlinkCurveProcessor {
     // 是否启用
     var isEnabled: Boolean = true
         set(value) {
-            BLog.i(TAG, "BlinkCurveProcessor isEnabled set to $value")
+            Log.i(TAG, "BlinkCurveProcessor isEnabled set to $value")
             field = value
             if (value) {
                 reset()

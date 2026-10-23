@@ -4,10 +4,11 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Bundle
-import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,6 +39,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.HeadPoseData
@@ -49,12 +51,17 @@ import com.example.virtualfacecapture.tracking.TrackingOutputManager
 import com.example.virtualfacecapture.ui.theme.VirtualFaceCaptureTheme
 import com.facecapture.sdk.PipelineFaceTracker
 import com.live2d.facecapture.SimpleEyeExtractor
+import com.vfc.log.VfcLog as Log
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val CAMERA_PREFS_NAME = "face_capture_prefs"
 private const val KEY_PREFERRED_CAMERA_ID = "preferred_camera_id"
+
+/** 导出日志时等待 SAF 返回的 zip 路径（进程被杀后重建时用它恢复，避免丢弃用户选好的位置）。 */
+private const val KEY_PENDING_LOG_ZIP = "pending_log_zip"
 
 /**
  * 调试面板数据的合并快照。
@@ -199,6 +206,18 @@ class MainActivity : ComponentActivity() {
     private lateinit var trackingOutput: TrackingOutputManager
     private var isTracking = mutableStateOf(false)
 
+    /** 是否 debug（可调试）包：文件日志 / 导出日志按钮只在这种包里启用。 */
+    private val isDebuggable: Boolean by lazy {
+        (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    }
+
+    /** 导出按钮的进行中状态与结果文案（Compose 直接读）。 */
+    private val logExporting = mutableStateOf(false)
+    private val logExportStatus = mutableStateOf("")
+
+    /** 已打好包、等待用户在 SAF 里选保存位置的 zip。 */
+    private var pendingLogZip: File? = null
+
     /** 上半身关键点控制器（可选功能，默认关；契约见 docs/upper-body.md §3.5）。 */
     private lateinit var upperBody: UpperBodyPoseController
 
@@ -250,8 +269,95 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 导出日志的保存位置选择器（SAF，不需要存储权限）。
+     *
+     * 流程：按钮 → IO 线程打包 zip → 主线程拉起系统「保存到」对话框 →
+     * 用户选好目录后把 zip 写进对应 URI。
+     */
+    private val exportLogLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        val zip = pendingLogZip
+        pendingLogZip = null
+        if (uri == null) {
+            logExporting.value = false
+            logExportStatus.value = "导出已取消"
+            Log.i("MainActivity", "导出日志已取消")
+            // 取消后把临时 zip 删掉，避免用户反复点「导出」把 cache 撑大
+            zip?.delete()
+            return@registerForActivityResult
+        }
+        if (zip == null || !zip.isFile) {
+            logExporting.value = false
+            logExportStatus.value = "日志文件已丢失，请重新导出"
+            Log.w("MainActivity", "导出失败：待写入的日志包不存在")
+            return@registerForActivityResult
+        }
+        lifecycleScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                LogExporter.writeTo(this@MainActivity, uri, zip)
+            }
+            logExporting.value = false
+            logExportStatus.value = if (ok) "日志已导出: " + zip.name else "导出失败，请重试"
+            Toast.makeText(this@MainActivity, logExportStatus.value, Toast.LENGTH_LONG).show()
+            Log.i("MainActivity", "导出日志 -> $uri, ok=$ok")
+        }
+    }
+
+    /**
+     * 收集日志并导出（仅 debug 包可见的按钮会调用）。
+     *
+     * 打包在 IO 线程完成；失败只会更新状态文案，不影响面捕 / 推流。
+     */
+    private fun exportLogs() {
+        if (logExporting.value) return
+        logExporting.value = true
+        logExportStatus.value = "正在收集日志..."
+        Log.i("MainActivity", "开始导出日志...")
+        lifecycleScope.launch {
+            val zip = withContext(Dispatchers.IO) {
+                try {
+                    LogExporter.buildZip(this@MainActivity)
+                } catch (t: Throwable) {
+                    Log.e("MainActivity", "打包日志失败", t)
+                    null
+                }
+            }
+            if (zip == null) {
+                logExporting.value = false
+                logExportStatus.value = "打包失败，请重试"
+                Toast.makeText(this@MainActivity, logExportStatus.value, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            pendingLogZip = zip
+            logExportStatus.value = "请选择保存位置"
+            try {
+                exportLogLauncher.launch(zip.name)
+                Log.i("MainActivity", "日志包已生成: " + zip.absolutePath + " (" + zip.length() + "B)")
+            } catch (t: Throwable) {
+                Log.e("MainActivity", "无法打开保存对话框", t)
+                // 没有 SAF 请求在等，清掉 pending 以免旋转/重建后按钮永久卡在「导出中」
+                pendingLogZip = null
+                logExporting.value = false
+                logExportStatus.value = "无法打开保存对话框，日志在 " + zip.absolutePath
+                Toast.makeText(this@MainActivity, logExportStatus.value, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // SAF 对话框期间进程被杀：重建后恢复待写入的 zip，否则用户选好的位置会被丢弃
+        savedInstanceState?.getString(KEY_PENDING_LOG_ZIP)?.let { path ->
+            val file = File(path)
+            if (file.isFile) {
+                pendingLogZip = file
+                logExporting.value = true
+                logExportStatus.value = "请选择保存位置"
+            }
+        }
 
         Log.i("MainActivity", "onCreate: Initializing face capture (tracking-only build)...")
 
@@ -302,9 +408,18 @@ class MainActivity : ComponentActivity() {
                     upperBody = upperBody,
                     upperBodyEnabled = upperBodyEnabled,
                     onAttachBodyTap = ::attachBodyTap,
+                    isDebugBuild = isDebuggable,
+                    logExporting = logExporting.value,
+                    logExportStatus = logExportStatus.value,
+                    onExportLogs = ::exportLogs,
                 )
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingLogZip?.let { outState.putString(KEY_PENDING_LOG_ZIP, it.absolutePath) }
     }
 
     override fun onResume() {
@@ -369,6 +484,10 @@ fun FaceCaptureScreen(
     upperBody: UpperBodyPoseController,
     upperBodyEnabled: MutableState<Boolean>,
     onAttachBodyTap: (Boolean) -> Unit,
+    isDebugBuild: Boolean = false,
+    logExporting: Boolean = false,
+    logExportStatus: String = "",
+    onExportLogs: () -> Unit = {},
 ) {
     // 调试面板数据：fps / BlendShape / 姿态合并为一个快照，且限制在 ≤10Hz（见 DebugSnapshotBatcher）
     val debugSnapshotState = remember { mutableStateOf(DebugSnapshot()) }
@@ -700,6 +819,9 @@ fun FaceCaptureScreen(
                     upperBodyEnabled = upperBodyEnabled.value,
                     upperBodyBusy = upperBodyBusy,
                     upperBodyMessage = upperBodyMessage,
+                    isDebugBuild = isDebugBuild,
+                    logExporting = logExporting,
+                    logExportStatus = logExportStatus,
                     maxHeight = controlPanelMaxHeight,
                     onToggleTracking = {
                         scope.launch {
@@ -797,6 +919,7 @@ fun FaceCaptureScreen(
                         }
                     },
                     onToggleUpperBody = onToggleUpperBody,
+                    onExportLogs = onExportLogs,
                     onToggleGpuChannels = {
                         // 并行度变化要在 start() 里拉起/收起推理线程，属于管线重启，
                         // 和切后端一样放 IO 线程，避免主线程卡顿。
@@ -1185,6 +1308,10 @@ fun ControlPanel(
     upperBodyBusy: Boolean,
     upperBodyMessage: String,
     maxHeight: Dp = 380.dp,
+    isDebugBuild: Boolean = false,
+    logExporting: Boolean = false,
+    logExportStatus: String = "",
+    onExportLogs: () -> Unit = {},
     onToggleTracking: () -> Unit,
     onResetBaseline: () -> Unit,
     onToggleDebug: () -> Unit,
@@ -1475,6 +1602,37 @@ fun ControlPanel(
                             blinkSpeedScale > 1.5f -> Color(0xFF4CAF50)
                             else -> Color.Gray
                         }
+                    )
+                }
+            }
+
+            // 导出日志（仅 debug 包）：把 VfcLog 落盘的日志 + 设备 / 版本信息 + 首帧 dump
+            // 打成一个 zip，通过系统「保存到」对话框导出（SAF，不需要存储权限）。
+            if (isDebugBuild) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Button(
+                    onClick = onExportLogs,
+                    enabled = !logExporting,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF546E7A)
+                    )
+                ) {
+                    Text(
+                        text = when {
+                            logExporting && logExportStatus == "请选择保存位置" -> "等待选择保存位置..."
+                            logExporting -> "正在导出日志..."
+                            else -> "导出日志 (debug)"
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (logExportStatus.isNotEmpty()) {
+                    Text(
+                        text = logExportStatus,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }

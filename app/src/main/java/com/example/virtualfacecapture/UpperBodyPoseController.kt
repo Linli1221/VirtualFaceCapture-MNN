@@ -1,7 +1,7 @@
 package com.example.virtualfacecapture
 
 import android.content.Context
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.UpperBodyPoseFrame
 import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.YuvFrameData

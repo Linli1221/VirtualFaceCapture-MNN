@@ -192,6 +192,10 @@ debug 与 release 是**两个独立 Artifact**，并行构建、互不阻塞：
 
 > ⚠️ 测帧率优先用 release 包：debug 包带调试信息、JIT/校验开销更大，同一份代码会低几帧。
 > 手边只有 debug 包时，结论请按「相对变化」看，不要拿绝对值卡 60。
+>
+> 手机上不方便连 adb 时，debug 包控制面板有 **「导出日志 (debug)」** 按钮：把应用日志
+> （`filesDir/logs/vfc.log`）、设备 / 版本信息、检测器首帧 dump 打成一个 zip，用系统
+> 「保存到」对话框直接导出。native / 系统日志仍需下面的 `adb logcat`。
 
 ### 5.1 看什么
 

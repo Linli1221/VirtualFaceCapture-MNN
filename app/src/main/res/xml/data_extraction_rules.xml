@@ -5,15 +5,10 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <!-- debug 包的应用日志可能含机型 / 相机信息 / 崩溃栈，不参与云备份 -->
+        <exclude domain="file" path="logs/" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="file" path="logs/" />
     </device-transfer>
-    -->
 </data-extraction-rules>

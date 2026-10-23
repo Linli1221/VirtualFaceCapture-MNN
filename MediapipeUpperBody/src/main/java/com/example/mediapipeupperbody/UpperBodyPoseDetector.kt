@@ -2,7 +2,7 @@ package com.example.mediapipeupperbody
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.BodyPoint
 import com.example.commondata.TorsoAngles
 import com.example.commondata.UpperBodyPoseFrame

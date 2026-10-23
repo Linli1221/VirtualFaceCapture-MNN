@@ -13,7 +13,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import android.util.Size
 import android.view.Surface
 import android.view.WindowManager

@@ -257,6 +257,17 @@ pwsh -File tools/fetch-pose-model.ps1   # Windows
 | **Eye sensitivity** | eye EAR threshold sensitivity (0.5x–2.0x) with live closed/open thresholds |
 | **Upper body: on / off** | start/stop MediaPipe Pose upper-body capture (needs the model first — see "Where do models come from?"); adds a skeleton overlay, HUD body fps / points / torso angles; follows capture start/stop |
 | **Debug / landmarks** | fps, frame cost, pitch/yaw/roll with bars, raw ARKit values, landmark + bbox overlay |
+| **Export logs (debug builds only)** | the "导出日志 (debug)" button at the bottom of the control panel zips the app log, device/version info, the detector's first-frame dump and SharedPreferences, then opens the system "Save as" dialog |
+
+> **Where the log lives**: on a debug build `VfcApp` calls `VfcLog.init()`, so every `Log.x`
+> call (pipeline / camera / upper body / tracking server / crash stack) is appended
+> asynchronously to `filesDir/logs/vfc.log` (2 MB rotation, 3 files kept) while still going
+> to logcat. "导出日志 (debug)" packages them into `vfc-log-<timestamp>.zip` containing
+> `README.txt` / `device-info.txt` / `app-info.txt` / `logs/` / `dump/` / `prefs/`.
+> Release builds never write the file and hide the button. `dump/` holds the detector's
+> first frame (a raw camera image, only used to debug framing/rotation), and the log
+> directory is excluded from cloud backup. Native (C++) logs, other processes' logs and
+> tombstones still live only in logcat — use `adb logcat` for those.
 
 ### Windows client
 

@@ -1,7 +1,7 @@
 package com.live2d.facecapture
 
 import android.os.SystemClock
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CALIBRATION_DURATION_MS
 import com.example.commondata.FaceLandmarkIndices

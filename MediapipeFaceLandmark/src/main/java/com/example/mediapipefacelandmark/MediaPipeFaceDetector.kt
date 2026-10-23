@@ -1,7 +1,7 @@
 package com.example.mediapipefacelandmark
 
 import android.content.Context
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.BlendShapeResult
 import com.example.commondata.Point3D
 import java.io.File

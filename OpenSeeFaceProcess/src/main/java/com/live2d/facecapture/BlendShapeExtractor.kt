@@ -5,7 +5,7 @@
 
 package com.live2d.facecapture
 
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.EyePoints
 import com.example.commondata.FaceKeyPoints

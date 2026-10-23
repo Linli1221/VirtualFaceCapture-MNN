@@ -12,7 +12,7 @@
 
 package com.live2d.facecapture
 
-import android.util.Log
+import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.FaceLandmarkIndices
 import com.example.commondata.Point3D
