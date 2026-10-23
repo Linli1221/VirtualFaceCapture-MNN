@@ -7,7 +7,6 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.Surface
 import android.view.TextureView
-import android.view.View
 import android.widget.FrameLayout
 
 /**
@@ -135,10 +134,12 @@ class CameraPreviewSurfaceContainer @JvmOverloads constructor(
 
             override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
         }
-        // 布局 / 分屏尺寸变化后重算 fit-center 变换
-        setOnLayoutChangeListener { _: View, _: Int, _: Int, _: Int, _: Int, _: Int, _: Int, _: Int, _: Int ->
-            updateTransform()
-        }
+    }
+
+    // 布局 / 分屏尺寸变化后重算 fit-center 变换（TextureView 铺满本容器）
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateTransform()
     }
 
     /** 宿主告知当前采集帧尺寸（未旋转），相机启动 / 切换时调用。 */
