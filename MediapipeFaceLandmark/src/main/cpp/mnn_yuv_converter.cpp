@@ -17,7 +17,6 @@
 #include <cstring>
 #include <memory>
 #include <cmath>
-#include <vector>
 
 #include "MNN/ImageProcess.hpp"
 #include "MNN/Matrix.h"
@@ -259,74 +258,41 @@ extern "C" void convertYuvToRgbMNN(
     // Determine YUV format
     MNN::CV::ImageFormat yuvFormat = determineYuvFormat(uvPixelStride, uData, vData);
     
-    // 预览转换每帧都会跑（30fps）：整帧 YUV 打包缓冲和 ImageProcess 都必须复用。
-    // 之前每帧 new/delete 一块 1.38MB（720p）的连续缓冲并重建 ImageProcess，
-    // 在相机线程上纯属浪费；这里按 (源尺寸, 目标尺寸, 旋转, 格式) 缓存。
-    // 该函数只在相机线程调用，thread_local 缓存同时兼顾了线程安全。
-    struct PreviewConvertCache {
-        std::vector<uint8_t> yuvBuffer;
-        std::unique_ptr<MNN::CV::ImageProcess> process;
-        int srcWidth = -1;
-        int srcHeight = -1;
-        int dstWidth = -1;
-        int dstHeight = -1;
-        int rotation = -1;
-        int format = -1;
-    };
-    static thread_local PreviewConvertCache cache;
-
-    const int formatKey = static_cast<int>(yuvFormat);
-    const bool configChanged =
-        cache.srcWidth != srcWidth || cache.srcHeight != srcHeight ||
-        cache.dstWidth != dstWidth || cache.dstHeight != dstHeight ||
-        cache.rotation != rotation || cache.format != formatKey ||
-        !cache.process;
-    if (configChanged) {
-        MNN::CV::ImageProcess::Config config;
-        config.sourceFormat = yuvFormat;
-        config.destFormat = MNN::CV::RGB;
-        config.filterType = MNN::CV::BILINEAR;  // Smooth interpolation
-        config.wrap = MNN::CV::ZERO;            // Black padding for out-of-bounds
-
-        // No normalization for uint8 output
-        config.mean[0] = 0.0f;
-        config.mean[1] = 0.0f;
-        config.mean[2] = 0.0f;
-        config.normal[0] = 1.0f;
-        config.normal[1] = 1.0f;
-        config.normal[2] = 1.0f;
-
-        cache.process.reset(MNN::CV::ImageProcess::create(config));
-        if (!cache.process) {
-            LOGE("ImageProcess::create failed for preview conversion");
-            return;
-        }
-        if (rotation != 0) {
-            MNN::CV::Matrix matrix =
-                createRotationMatrix(rotation, srcWidth, srcHeight, dstWidth, dstHeight);
-            cache.process->setMatrix(matrix);
-        }
-        cache.srcWidth = srcWidth;
-        cache.srcHeight = srcHeight;
-        cache.dstWidth = dstWidth;
-        cache.dstHeight = dstHeight;
-        cache.rotation = rotation;
-        cache.format = formatKey;
-    }
-
-    // Prepare contiguous YUV buffer (reused: resize only, no per-frame free/alloc).
-    const size_t yuvBufferSize =
-        static_cast<size_t>(srcWidth) * static_cast<size_t>(srcHeight) * 3 / 2;
-    if (cache.yuvBuffer.size() < yuvBufferSize) {
-        cache.yuvBuffer.resize(yuvBufferSize);
-    }
+    // Prepare contiguous YUV buffer
+    size_t yuvBufferSize = srcWidth * srcHeight + srcWidth * srcHeight / 2;
+    std::unique_ptr<uint8_t[]> yuvBuffer(new uint8_t[yuvBufferSize]);
+    
     prepareYuvBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
-                     srcWidth, srcHeight, yuvFormat, cache.yuvBuffer.data());
-
+                     srcWidth, srcHeight, yuvFormat, yuvBuffer.get());
+    
+    // Configure MNN ImageProcess
+    MNN::CV::ImageProcess::Config config;
+    config.sourceFormat = yuvFormat;
+    config.destFormat = MNN::CV::RGB;
+    config.filterType = MNN::CV::BILINEAR;  // Smooth interpolation
+    config.wrap = MNN::CV::ZERO;            // Black padding for out-of-bounds
+    
+    // No normalization for uint8 output
+    config.mean[0] = 0.0f;
+    config.mean[1] = 0.0f;
+    config.mean[2] = 0.0f;
+    config.normal[0] = 1.0f;
+    config.normal[1] = 1.0f;
+    config.normal[2] = 1.0f;
+    
+    std::unique_ptr<MNN::CV::ImageProcess> process(MNN::CV::ImageProcess::create(config));
+    
+    // Set rotation matrix
+    if (rotation != 0) {
+        MNN::CV::Matrix matrix = createRotationMatrix(rotation, srcWidth, srcHeight, dstWidth, dstHeight);
+        process->setMatrix(matrix);
+    }
+    
     // Perform conversion
-    cache.process->convert(cache.yuvBuffer.data(), srcWidth, srcHeight, 0,
-                           rgbOut, dstWidth, dstHeight, 3, 0,
-                           halide_type_t{halide_type_uint, 8, 1});
+    // Using raw pointer output (simpler than tensor for just RGB bytes)
+    process->convert(yuvBuffer.get(), srcWidth, srcHeight, 0,
+                     rgbOut, dstWidth, dstHeight, 3, 0,
+                     halide_type_t{halide_type_uint, 8, 1});
 }
 
 // ============================================================================

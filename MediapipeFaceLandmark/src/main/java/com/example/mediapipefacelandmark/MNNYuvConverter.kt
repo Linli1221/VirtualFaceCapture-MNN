@@ -1,6 +1,6 @@
 package com.example.mediapipefacelandmark
 
-import com.vfc.log.VfcLog as Log
+import android.util.Log
 import java.nio.ByteBuffer
 
 /**

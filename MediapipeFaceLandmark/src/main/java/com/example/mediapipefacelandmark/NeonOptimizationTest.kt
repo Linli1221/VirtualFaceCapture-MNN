@@ -1,7 +1,5 @@
 package com.example.mediapipefacelandmark
 
-import com.vfc.log.VfcLog as Log
-
 /**
  * NEON Optimization Test utility.
  * Runs correctness tests and benchmarks for NEON-optimized linear algebra functions.
@@ -18,7 +16,7 @@ object NeonOptimizationTest {
         try {
             System.loadLibrary("mediapipefacelandmark")
         } catch (e: UnsatisfiedLinkError) {
-            Log.e("NeonOptTest", "Failed to load native library: ${e.message}")
+            android.util.Log.e("NeonOptTest", "Failed to load native library: ${e.message}")
         }
     }
 

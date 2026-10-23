@@ -1580,9 +1580,8 @@ class PipelineFaceTracker(private val context: Context) {
         Log.i(TAG, "  MNN backend: ${faceDetector.getBackend()}, MNN threads: $mnnThreadCount")
 
         // 相机侧真相：CPU/GPU 都不忙却上不去 60，绝大多数情况就卡在这一行。
-        val cbMs = camera2Manager.cameraCallbackAvgMs
-        Log.i(TAG, "  Camera delivered: %.1f FPS (applied frameDuration=%.2f ms, callback avg=%.2f ms)"
-            .format(camFps, frameDurMs, cbMs))
+        Log.i(TAG, "  Camera delivered: %.1f FPS (applied frameDuration=%.2f ms)"
+            .format(camFps, frameDurMs))
         Log.i(TAG, "    Requested AE range: ${camera2Manager.activeFpsRange}, " +
             "applied: ${camera2Manager.appliedFpsRange}, " +
             "exposure=${camera2Manager.appliedExposureNs / 1_000_000.0} ms, " +
@@ -1593,9 +1592,6 @@ class PipelineFaceTracker(private val context: Context) {
         } else if (frameDurMs >= 30.0) {
             Log.w(TAG, ("  ⚠ SENSOR_FRAME_DURATION=%.2f ms（%.1f fps）→ 传感器/AE 本身就不是 60fps，" +
                 "降采集尺寸 / 砍预览都无效").format(frameDurMs, 1000.0 / frameDurMs))
-        } else if (camFps > 0f && camFps < 55f && cbMs >= 16.0f) {
-            Log.w(TAG, ("  ⚠ 相机回调平均 %.2f ms 超过 16.7ms 预算 → 是处理链路在拖慢交付帧率，" +
-                "不是传感器").format(cbMs))
         } else if (camFps > 0f && camFps < 55f) {
             Log.w(TAG, "  ⚠ Camera only delivers %.1f FPS ".format(camFps) +
                 "→ 相机是瓶颈，先解决采集帧率再谈推理优化")
