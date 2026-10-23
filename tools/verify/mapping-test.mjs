@@ -454,10 +454,12 @@ const BP = {
   shoulder_left: 5, shoulder_right: 6, elbow_left: 7, elbow_right: 8,
   wrist_left: 9, wrist_right: 10, hip_left: 11, hip_right: 12
 };
-/** 构造 52 项 ub：默认直立站姿、双臂自然下垂。 */
+/** 构造 52 项 ub：默认直立站姿、双臂自然下垂（肘在肩腕中点 = 手臂伸直）。 */
 function makeUb({
   shoulderL = [0.35, 0.4], shoulderR = [0.65, 0.4],
+  elbowL = null, elbowR = null,
   wristL = [0.35, 0.78], wristR = [0.65, 0.78],
+  hipL = [0.39, 0.86], hipR = [0.61, 0.86],
   visibility = 0.9, visibilityL = null, visibilityR = null
 } = {}) {
   const ub = new Array(52).fill(0);
@@ -471,12 +473,15 @@ function makeUb({
   set(BP.ear_right, 0.58, 0.17, 0, visibility);
   set(BP.shoulder_left, shoulderL[0], shoulderL[1], 0, vL);
   set(BP.shoulder_right, shoulderR[0], shoulderR[1], 0, vR);
-  set(BP.elbow_left, (shoulderL[0] + wristL[0]) / 2, (shoulderL[1] + wristL[1]) / 2, 0, vL);
-  set(BP.elbow_right, (shoulderR[0] + wristR[0]) / 2, (shoulderR[1] + wristR[1]) / 2, 0, vR);
+  const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  const eL = elbowL || mid(shoulderL, wristL);
+  const eR = elbowR || mid(shoulderR, wristR);
+  set(BP.elbow_left, eL[0], eL[1], 0, vL);
+  set(BP.elbow_right, eR[0], eR[1], 0, vR);
   set(BP.wrist_left, wristL[0], wristL[1], 0, vL);
   set(BP.wrist_right, wristR[0], wristR[1], 0, vR);
-  set(BP.hip_left, 0.39, 0.86, 0, visibility);
-  set(BP.hip_right, 0.61, 0.86, 0, visibility);
+  set(BP.hip_left, hipL[0], hipL[1], 0, visibility);
+  set(BP.hip_right, hipR[0], hipR[1], 0, visibility);
   return ub;
 }
 
@@ -491,7 +496,9 @@ test('upper body: BODY_LANDMARK_ORDER / BODY_BONES match CommonData (§5.3)', ()
   );
   assert.deepStrictEqual(
     [...api.BODY_PARAM_IDS],
-    ['ParamBodyAngleX', 'ParamBodyAngleY', 'ParamBodyAngleZ', 'ParamArmLA', 'ParamArmRA']
+    ['ParamBodyAngleX', 'ParamBodyAngleY', 'ParamBodyAngleZ',
+     'ParamArmLA', 'ParamArmRA', 'ParamArmLB', 'ParamArmRB',
+     'ParamShoulderL', 'ParamShoulderR']
   );
 });
 
@@ -561,6 +568,66 @@ test('upper body: mapBody tolerates bad ub and supports docs §3.6 arg order', (
   const task = api.mapBody([3, -7], makeUb({ wristL: [0.05, 0.4] }));
   close(doc.params.ParamBodyAngleX, task.params.ParamBodyAngleX, 1e-12, 'doc order X');
   close(doc.params.ParamArmLA, task.params.ParamArmLA, 1e-12, 'doc order ArmLA');
+});
+
+test('upper body skeleton (§8.5): elbow bend -> ParamArmLB/RB, symmetric sign, straight = 0', () => {
+  const bent = api.mapBody([0, 0], makeUb({
+    elbowL: [0.35, 0.57], wristL: [0.26, 0.57],
+    elbowR: [0.65, 0.57], wristR: [0.74, 0.57]
+  }));
+  close(bent.params.ParamArmLB, 18, 1e-9, 'ParamArmLB = 90/150*30');
+  close(bent.params.ParamArmRB, 18, 1e-9, 'ParamArmRB (mirror-symmetric)');
+  close(bent.metrics.elbowBendL, 90, 0.01, 'elbowBendL');
+  close(bent.metrics.elbowBendR, 90, 0.01, 'elbowBendR');
+  const straight = api.mapBody([0, 0], makeUb());
+  close(straight.params.ParamArmLB, 0, 1e-12, 'straight elbow = 0');
+  close(straight.params.ParamArmRB, 0, 1e-12, 'straight elbow R = 0');
+});
+
+test('upper body skeleton (§8.5): clavicle differential -> ParamShoulderL/R opposite signs', () => {
+  // right shoulder sinks (shoulder line +7.59deg, pelvis level) -> left shoulder up
+  const shrug = api.mapBody([0, 0], makeUb({ shoulderL: [0.35, 0.38], shoulderR: [0.65, 0.42] }));
+  close(shrug.metrics.clavicleRelTilt, (Math.atan2(0.04, 0.3) * 180) / Math.PI, 0.01, 'clavicleRelTilt');
+  if (!(shrug.params.ParamShoulderL > 0)) throw new Error('ParamShoulderL should be positive (left up)');
+  if (!(shrug.params.ParamShoulderR < 0)) throw new Error('ParamShoulderR should be negative');
+  close(shrug.params.ParamShoulderL + shrug.params.ParamShoulderR, 0, 1e-9, 'antisymmetric');
+  // whole-torso lean (shoulders and hips tilt the same angle) -> no shoulder drive
+  const tilt = (8 * Math.PI) / 180;
+  const shoulderDy = 0.3 * Math.tan(tilt);
+  const hipDy = 0.22 * Math.tan(tilt);
+  const lean = api.mapBody([0, 0], makeUb({
+    shoulderL: [0.35, 0.4 - shoulderDy / 2], shoulderR: [0.65, 0.4 + shoulderDy / 2],
+    hipL: [0.39, 0.86 - hipDy / 2], hipR: [0.61, 0.86 + hipDy / 2]
+  }));
+  close(lean.metrics.clavicleRelTilt, 0, 0.1, 'lean relTilt ~ 0');
+  close(lean.params.ParamShoulderL, 0, 0.5, 'lean ParamShoulderL ~ 0');
+});
+
+test('upper body skeleton (§8.5): hierarchical bones keep arm angle torso-relative', () => {
+  const sk = api.buildUpperBodySkeleton(makeUb({
+    shoulderL: [0.4, 0.3], shoulderR: [0.7, 0.3],
+    elbowL: [0.37058, 0.44709], wristL: [0.34117, 0.59417],
+    hipL: [0.34, 0.8], hipR: [0.56, 0.8]
+  }));
+  const leanDeg = (Math.atan2(0.1, 0.5) * 180) / Math.PI;
+  close(sk.spine.leanDeg, leanDeg, 0.01, 'spine lean');
+  // arm hangs parallel to the torso: absolute angle follows the lean, torso-relative stays 0
+  close(sk.arms.L.elevationDeg, leanDeg, 0.2, 'absolute elevation');
+  close(sk.arms.L.elevationTorsoDeg, 0, 0.2, 'torso-relative elevation');
+  if (!sk.arms.L.valid) throw new Error('arm should be valid');
+});
+
+test('upper body skeleton (§8.5): low visibility gates arm B / shoulder params but keeps metrics', () => {
+  const low = api.mapBody([0, 0], makeUb({
+    visibilityL: 0.1, elbowL: [0.35, 0.57], wristL: [0.26, 0.57],
+    shoulderL: [0.35, 0.38], shoulderR: [0.65, 0.42]
+  }));
+  if ('ParamArmLB' in low.params) throw new Error('ParamArmLB must be omitted (visibility < 0.3)');
+  if ('ParamShoulderL' in low.params || 'ParamShoulderR' in low.params) {
+    throw new Error('ParamShoulderL/R must be omitted (shoulder visibility < 0.3)');
+  }
+  if (!('ParamArmRB' in low.params)) throw new Error('ParamArmRB should still be present');
+  close(low.metrics.elbowBendL, 90, 0.01, 'metrics keep raw elbow bend');
 });
 
 test('upper body: readUpperBodyTrack handles ubOk / stale / missing fields', () => {

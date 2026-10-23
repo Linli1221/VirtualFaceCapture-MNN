@@ -447,8 +447,14 @@ export const BODY_BONES = Object.freeze([
  * 上半身派生出的 Live2D 参数（全部是**可选参数**：模型没有时由 live2d.js 查参数表跳过）。
  *
  * ParamBodyAngleX 同时被头部姿态驱动（协议 §8.2 的 `-yaw*10`），叠加规则见 combineBodyAngleX()。
- * `ParamShoulderL/R`、`ParamHandL/R` 协议没有可靠数据源，mapBody 不输出（不造数据）；
- * live2d.js 仍会应用这两个 id，模型将来真有参数时可以直接接。
+ *
+ * 骨骼驱动（buildUpperBodySkeleton 的层级关节角，协议 §8.5）：
+ *   ParamBodyAngleX/Y/Z  躯干（手机端 TorsoAngles，body = [roll, yaw]）
+ *   ParamArmLA/RA        上臂抬起角（肩→腕与竖直向下的夹角，0 = 下垂、150 = 满量程）
+ *   ParamArmLB/RB        肘关节角（前臂相对上臂的屈曲；侧别镜像后**正 = 屈肘**）
+ *   ParamShoulderL/R     锁骨角（肩线相对髋线的差动倾斜；**正 = 该侧肩抬起**）
+ * `ParamHandL/R` 不输出：13 点协议里没有手部关键点，腕关节朝向无从测量（不造数据）；
+ * 需要时由调用方拿 buildUpperBodySkeleton().arms[side].forearmDeg 自行接。
  */
 export const BODY_PARAM_IDS = Object.freeze([
   "ParamBodyAngleX",
@@ -456,6 +462,10 @@ export const BODY_PARAM_IDS = Object.freeze([
   "ParamBodyAngleZ",
   "ParamArmLA",
   "ParamArmRA",
+  "ParamArmLB",
+  "ParamArmRB",
+  "ParamShoulderL",
+  "ParamShoulderR",
 ]);
 
 /** 上半身快照多久没更新就按「丢失」处理（协议 §4.2：手机端 1500 ms 过期）。 */
@@ -479,6 +489,14 @@ export const BODY_DEFAULTS = Object.freeze({
   armAngleMax: 150,
   /** armUp（0..1）× armScale → ParamArmLA/RA。 */
   armScale: 30,
+  /** 肘屈曲角满量程（度）：0 = 手臂伸直，150 = 折到极限。 */
+  elbowAngleMax: 150,
+  /** elbowBend（-1..1）× elbowScale → ParamArmLB/RB。模型铰链方向相反时传负值。 */
+  elbowScale: 30,
+  /** 锁骨差动倾斜满量程（度）：肩线相对髋线倾斜多少算「满量程耸肩」。 */
+  clavicleTiltMax: 25,
+  /** clavicleRelTilt（-1..1）× shoulderScale → ParamShoulderL/R。 */
+  shoulderScale: 30,
   /** 该侧肩 / 肘 / 腕可见度下限。 */
   minVisibility: BODY_ARM_MIN_VISIBILITY,
   /** 所有躯干 / 手臂参数的绝对值上限。 */
@@ -566,27 +584,173 @@ function armAngleFromDown(shoulder, wrist) {
   return (Math.atan2(Math.abs(dx), dy) * 180) / Math.PI;
 }
 
+/** 向量与「竖直向下」的**带符号**夹角（度，(-180,180]）：+ = 向画面右偏。 */
+function signedAngleFromDown(dx, dy) {
+  if (Math.hypot(dx, dy) < 1e-6) return 0;
+  return (Math.atan2(dx, dy) * 180) / Math.PI;
+}
+
+/** 把角度折回 (-180, 180]。 */
+function wrapDeg(angle) {
+  let a = angle % 360;
+  if (a > 180) a -= 360;
+  if (a <= -180) a += 360;
+  return a;
+}
+
+/** 两点连线相对水平线的倾角（度）：+ = 右端（b）下沉，与协议 §5.3 的 roll 同号。 */
+function lineTiltDeg(a, b) {
+  if (Math.hypot(b.x - a.x, b.y - a.y) < 1e-6) return 0;
+  return (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+}
+
+const EMPTY_ARM_BONE = Object.freeze({
+  /** 上臂（肩→肘）与竖直向下的夹角（0..180，无符号）。 */
+  upperArmDeg: 0,
+  /** 前臂（肘→腕）与竖直向下的夹角（0..180，无符号）。 */
+  forearmDeg: 0,
+  /** 整条手臂（肩→腕）抬起角（0..180，无符号）——mapBody 的 armAngleL/R 同源。 */
+  elevationDeg: 0,
+  /** 上臂相对**躯干坐标系**的抬起角（带符号）：躯干跟着倾斜时手臂不会被误读为「抬起」。 */
+  elevationTorsoDeg: 0,
+  /** 肘关节角 = 前臂相对上臂的旋转（带符号，侧别镜像后 + = 屈肘）。 */
+  elbowBendDeg: 0,
+  /** 该侧肩 / 肘 / 腕可见度的最小值。 */
+  visibility: 0,
+  /** 肩→肘→腕 三段都非退化（重合点会让关节角失去意义）。 */
+  valid: false,
+});
+
 /**
- * 上半身躯干 + 手臂 → Live2D 可选参数（纯函数，无 DOM，Node 可直接单测）。
+ * 13 点 → 上半身**运动骨骼**（层级关节角）。纯函数，无 DOM，Node 可直接单测。
+ *
+ * 骨骼层级（角度都是**相对父骨**的旋转，父骨动了子骨跟着动、不会重复计数）：
+ *
+ * ```
+ * root   髋中点（只有位置）
+ * └─ spine      髋中点 → 肩中点      leanDeg        相对「竖直向上」，+ = 肩向画面右倾
+ *    ├─ clavicle    肩线相对髋线      relTiltDeg     + = 右肩相对下沉（= 左肩相对抬起）
+ *    └─ upperArm L/R  肩 → 肘        elevationTorsoDeg  相对躯干的抬起角（带符号）
+ *       └─ forearm L/R  肘 → 腕     elbowBendDeg    相对上臂的屈曲（带符号，+ = 屈肘）
+ * ```
+ *
+ * 约定（画面 y 向下；ub 已镜像，本人左 = 画面左，协议 §5.3）：
+ * - `*Deg` 里「与竖直向下的夹角」沿用 armAngleFromDown：0 = 下垂、90 = 平举、180 = 上举；
+ * - 带符号角 + = 向画面右；`elbowBendDeg` 做了**侧别镜像**（左手取反），两侧屈肘同为正；
+ * - 可见度不足的点照样算（方便调试面板看原始角度），`valid` / `visibility` 由调用方门控。
+ *
+ * @param {ArrayLike<number>|{x:number,y:number,z:number,v:number}[]} ub `track.ub` 或 parseUpperBody() 的结果
+ * @returns {{points:object[]|null, spine:object, clavicle:object, arms:{L:object,R:object}}}
+ */
+export function buildUpperBodySkeleton(ub) {
+  const points = toBodyPoints(ub);
+  const arms = { L: { ...EMPTY_ARM_BONE }, R: { ...EMPTY_ARM_BONE } };
+  const skeleton = {
+    points,
+    spine: {
+      /** 脊柱相对「竖直向上」的倾斜（度，+ = 肩向画面右）。 */
+      leanDeg: 0,
+      shoulderMid: { x: 0, y: 0 },
+      hipMid: { x: 0, y: 0 },
+      valid: false,
+    },
+    clavicle: {
+      /** 肩线倾角（+ = 右肩下沉，与协议 roll 同号）。 */
+      tiltDeg: 0,
+      /** 髋线倾角（同上）。 */
+      pelvisTiltDeg: 0,
+      /** 肩线相对髋线的差动倾斜：整体侧倾时 ≈ 0，耸肩 / 塌肩时才有值。 */
+      relTiltDeg: 0,
+      valid: false,
+    },
+    arms,
+  };
+  if (!points) return skeleton;
+
+  const shoulderL = points[BODY_LANDMARK_ORDER.shoulder_left];
+  const shoulderR = points[BODY_LANDMARK_ORDER.shoulder_right];
+  const hipL = points[BODY_LANDMARK_ORDER.hip_left];
+  const hipR = points[BODY_LANDMARK_ORDER.hip_right];
+
+  const shoulderMid = { x: (shoulderL.x + shoulderR.x) / 2, y: (shoulderL.y + shoulderR.y) / 2 };
+  const hipMid = { x: (hipL.x + hipR.x) / 2, y: (hipL.y + hipR.y) / 2 };
+  skeleton.spine.shoulderMid = shoulderMid;
+  skeleton.spine.hipMid = hipMid;
+  const spineDx = shoulderMid.x - hipMid.x;
+  const spineDy = shoulderMid.y - hipMid.y; // 通常为负：肩在髋上方
+  if (Math.hypot(spineDx, spineDy) >= 1e-4) {
+    skeleton.spine.leanDeg = (Math.atan2(spineDx, -spineDy) * 180) / Math.PI;
+    skeleton.spine.valid = true;
+  }
+
+  const tilt = lineTiltDeg(shoulderL, shoulderR);
+  const pelvisTilt = lineTiltDeg(hipL, hipR);
+  skeleton.clavicle.tiltDeg = tilt;
+  skeleton.clavicle.pelvisTiltDeg = pelvisTilt;
+  skeleton.clavicle.relTiltDeg = wrapDeg(tilt - pelvisTilt);
+  skeleton.clavicle.valid =
+    Math.hypot(shoulderR.x - shoulderL.x, shoulderR.y - shoulderL.y) >= 1e-4 &&
+    Math.hypot(hipR.x - hipL.x, hipR.y - hipL.y) >= 1e-4;
+
+  for (const side of ["L", "R"]) {
+    const [shoulderIndex, elbowIndex, wristIndex] = BODY_ARM_CHAINS[side];
+    const shoulder = points[shoulderIndex];
+    const elbow = points[elbowIndex];
+    const wrist = points[wristIndex];
+    const arm = arms[side];
+    const upperDx = elbow.x - shoulder.x;
+    const upperDy = elbow.y - shoulder.y;
+    const foreDx = wrist.x - elbow.x;
+    const foreDy = wrist.y - elbow.y;
+    const armDx = wrist.x - shoulder.x;
+    const armDy = wrist.y - shoulder.y;
+    const upperOk = Math.hypot(upperDx, upperDy) >= 1e-4;
+    const foreOk = Math.hypot(foreDx, foreDy) >= 1e-4;
+
+    arm.visibility = Math.min(shoulder.v, elbow.v, wrist.v);
+    arm.upperArmDeg = armAngleFromDown(shoulder, elbow);
+    arm.forearmDeg = armAngleFromDown(elbow, wrist);
+    arm.elevationDeg = armAngleFromDown(shoulder, wrist);
+    const upperRot = upperOk ? signedAngleFromDown(upperDx, upperDy) : 0;
+    const foreRot = foreOk ? signedAngleFromDown(foreDx, foreDy) : 0;
+    const bend = wrapDeg(foreRot - upperRot);
+    arm.elbowBendDeg = upperOk && foreOk ? (side === "L" ? -bend : bend) : 0;
+    const armRot = Math.hypot(armDx, armDy) >= 1e-4 ? signedAngleFromDown(armDx, armDy) : 0;
+    // 躯干「向下」轴与竖直向下的夹角恰好是 -leanDeg：手臂相对躯干 = armRot - (-lean)
+    arm.elevationTorsoDeg = wrapDeg(armRot + skeleton.spine.leanDeg);
+    arm.valid = upperOk && foreOk && Math.hypot(armDx, armDy) >= 1e-4;
+  }
+
+  return skeleton;
+}
+
+/**
+ * 上半身运动骨骼 → Live2D 可选参数（纯函数，无 DOM，Node 可直接单测）。
  *
  * @param {ArrayLike<number>} bodyAngles 协议 §4.2 的 `body` = [roll, yaw]（相对基线，度）
  * @param {ArrayLike<number>|{x:number,y:number,z:number,v:number}[]} ub `track.ub` 或 parseUpperBody() 的结果
  * @param {Partial<typeof BODY_DEFAULTS>} [opts]
- * @returns {{params:object, metrics:{roll:number,yaw:number,armAngleL:number|null,armAngleR:number|null,shoulderWidth:number,confidence:number}}}
+ * @returns {{params:object, metrics:object, skeleton:ReturnType<buildUpperBodySkeleton>}}
  *
- * 算法（协议 §4.2 / docs/upper-body.md §3.6）：
+ * 算法（协议 §8.5 / docs/upper-body.md §3.6）：
  *   ParamBodyAngleZ = clamp(roll * 0.5, ±30)   // roll > 0 = 右肩下沉
  *   ParamBodyAngleX = clamp(-yaw * 0.3, ±30)   // yaw > 0 = 向本人左侧转（与头部同向）
  *   ParamBodyAngleY = clamp(-roll * 0.2, ±30)  // 幅度很小，保持接口完整
  *   armAngle(side)  = 肩→腕 与竖直向下的夹角（度，0..180）
  *   armUp(side)     = clamp(armAngle / 150, 0, 1) → ParamArm{side}A = armUp * 30
+ *   elbow(side)     = 前臂相对上臂的屈曲（度，侧别镜像后 + = 屈肘）
+ *                     → ParamArm{side}B = clamp(elbow / 150, -1, 1) * 30
+ *   shrug           = clamp(锁骨差动倾斜 / 25, -1, 1)
+ *                     → ParamShoulderL = shrug * 30、ParamShoulderR = -shrug * 30
  *
  * params 只包含「这一帧想驱动」的参数：
  *   - ParamBodyAngleX/Y/Z 始终输出（躯干角来自手机端 TorsoAngles，与关键点可见度无关）；
- *   - ParamArmLA/RA 只在该侧肩 / 肘 / 腕可见度都 ≥ minVisibility 时输出；低可见度 → 不输出，
- *     由客户端把该参数平滑回模型默认，而不是拿坏关键点硬驱动。
+ *   - ParamArmLA/RA、ParamArmLB/RB 只在该侧肩 / 肘 / 腕可见度都 ≥ minVisibility 时输出；
+ *   - ParamShoulderL/R 只在双肩 + 双胯可见度都 ≥ minVisibility 且肩 / 髋线非退化时输出；
+ *   低可见度 → 不输出，由客户端把该参数平滑回模型默认，而不是拿坏关键点硬驱动。
  *
- * metrics.armAngleL/R 是**原始角度**（不可信侧也有值，方便调试面板看），是否真的驱动看 params。
+ * metrics.armAngleL/R、elbowBendL/R 是**原始角度**（不可信侧也有值，方便调试面板看），
+ * 是否真的驱动看 params；skeleton 是层级骨骼（buildUpperBodySkeleton 的结果）。
  */
 export function mapBody(bodyAngles, ub, opts = {}) {
   // docs/upper-body.md §3.6 写的是 mapBody(ub, body, opts)。两个参数都是数组，这里按长度
@@ -603,6 +767,10 @@ export function mapBody(bodyAngles, ub, opts = {}) {
   const limit = Math.max(1, finiteOr(o.angleLimit, BODY_ANGLE_LIMIT));
   const armScale = finiteOr(o.armScale, 30);
   const armAngleMax = Math.max(1, finiteOr(o.armAngleMax, 150));
+  const elbowScale = finiteOr(o.elbowScale, 30);
+  const elbowAngleMax = Math.max(1, finiteOr(o.elbowAngleMax, 150));
+  const shoulderScale = finiteOr(o.shoulderScale, 30);
+  const clavicleTiltMax = Math.max(1, finiteOr(o.clavicleTiltMax, 25));
   const minVisibility = clamp(finiteOr(o.minVisibility, BODY_ARM_MIN_VISIBILITY), 0, 1);
 
   const params = {
@@ -615,12 +783,18 @@ export function mapBody(bodyAngles, ub, opts = {}) {
     yaw,
     armAngleL: null,
     armAngleR: null,
+    elbowBendL: null,
+    elbowBendR: null,
+    spineLean: 0,
+    clavicleTilt: 0,
+    clavicleRelTilt: 0,
     shoulderWidth: 0,
     confidence: 0,
   };
 
-  const points = toBodyPoints(ub);
-  if (!points) return { params, metrics };
+  const skeleton = buildUpperBodySkeleton(ub);
+  const points = skeleton.points;
+  if (!points) return { params, metrics, skeleton };
 
   // 肩宽与 Android 端 UpperBodyPoseFrame.shoulderSpan() 同一公式（便于两端对数字）。
   const shoulderL = points[BODY_LANDMARK_ORDER.shoulder_left];
@@ -634,19 +808,39 @@ export function mapBody(bodyAngles, ub, opts = {}) {
     points[BODY_LANDMARK_ORDER.wrist_left].v,
     points[BODY_LANDMARK_ORDER.wrist_right].v,
   );
+  metrics.spineLean = skeleton.spine.leanDeg;
+  metrics.clavicleTilt = skeleton.clavicle.tiltDeg;
+  metrics.clavicleRelTilt = skeleton.clavicle.relTiltDeg;
 
   for (const side of ["L", "R"]) {
-    const [shoulderIndex, elbowIndex, wristIndex] = BODY_ARM_CHAINS[side];
-    const visibility = Math.min(points[shoulderIndex].v, points[elbowIndex].v, points[wristIndex].v);
-    const angle = armAngleFromDown(points[shoulderIndex], points[wristIndex]);
+    const arm = skeleton.arms[side];
     const angleKey = side === "L" ? "armAngleL" : "armAngleR";
-    metrics[angleKey] = angle;
-    if (visibility < minVisibility) continue; // 不可信 → 不输出该侧手臂参数
-    const armUp = clamp(angle / armAngleMax, 0, 1);
+    const bendKey = side === "L" ? "elbowBendL" : "elbowBendR";
+    metrics[angleKey] = arm.elevationDeg;
+    metrics[bendKey] = arm.elbowBendDeg;
+    if (arm.visibility < minVisibility) continue; // 不可信 → 不输出该侧手臂参数
+    const armUp = clamp(arm.elevationDeg / armAngleMax, 0, 1);
     params[side === "L" ? "ParamArmLA" : "ParamArmRA"] = armUp * armScale;
+    // 肘：前臂相对上臂的屈曲（侧别镜像后正 = 屈肘）→ ParamArmLB/RB
+    const elbowBend = clamp(arm.elbowBendDeg / elbowAngleMax, -1, 1);
+    params[side === "L" ? "ParamArmLB" : "ParamArmRB"] = elbowBend * elbowScale;
   }
 
-  return { params, metrics };
+  // 锁骨：肩线相对髋线的差动倾斜（整体侧倾归 body roll → ParamBodyAngleZ，这里只管肩膀差动）
+  const clavicleVisibility = Math.min(
+    shoulderL.v,
+    shoulderR.v,
+    points[BODY_LANDMARK_ORDER.hip_left].v,
+    points[BODY_LANDMARK_ORDER.hip_right].v,
+  );
+  if (skeleton.clavicle.valid && clavicleVisibility >= minVisibility) {
+    const shrug = clamp(skeleton.clavicle.relTiltDeg / clavicleTiltMax, -1, 1);
+    // 符号约定（协议 §8.5）：正 = 该侧肩抬起。右肩相对下沉（relTilt > 0）= 左肩抬起。
+    params.ParamShoulderL = shrug * shoulderScale;
+    params.ParamShoulderR = -shrug * shoulderScale;
+  }
+
+  return { params, metrics, skeleton };
 }
 
 /**

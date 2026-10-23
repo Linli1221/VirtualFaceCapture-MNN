@@ -232,9 +232,10 @@ export class Live2DStage {
     this.availableParams = PARAM_IDS.filter((id) => realIds.includes(id));
     this.missingParams = PARAM_IDS.filter((id) => !realIds.includes(id));
 
-    // 上半身可选参数（ParamBodyAngleY/Z、ParamArmLA/RA）：模型没有就跳过 —— 属预期降级，
-    // 不算错误（自带 4 个模型都只有 ParamBodyAngleX/Y/Z + ParamBreath，没有手臂参数）。
-    // 判定用 getParameterIndex(id) >= 0 + 真实 id 表双保险：Cubism 对未知 id 也会给虚拟索引。
+    // 上半身骨骼参数（BODY_PARAM_IDS 里模型有的：BodyAngleY/Z、ArmLA/RB、ShoulderL/R 等）：
+    // 模型没有就跳过 —— 属预期降级，不算错误（自带 4 个模型都只有 ParamBodyAngleX/Y/Z +
+    // ParamBreath，没有手臂 / 肩参数）。判定用 getParameterIndex(id) >= 0 + 真实 id 表双保险：
+    // Cubism 对未知 id 也会给虚拟索引。
     this.bodyParams = Object.create(null);
     this.bodySupport = Object.create(null);
     this.bodyOnlyParamIds = [];
@@ -284,7 +285,8 @@ export class Live2DStage {
    *
    * - `ParamBodyAngleX`：与头部同源（协议 §8.2 的 `-yaw*10`），按 combineBodyAngleX() 相加后
    *   clamp 到 ±30，两个来源不会互相打架；
-   * - `ParamBodyAngleY/Z`、`ParamArmLA/RA`：模型没有对应参数时自动跳过（见 bodySupport）；
+   * - `ParamBodyAngleY/Z`、`ParamArmLA/RA`、`ParamArmLB/RB`（肘）、`ParamShoulderL/R`（肩）：
+   *   模型没有对应参数时自动跳过（见 bodySupport）；
    * - 传 null / {}：本帧没有可用的上半身数据（ubOk=false / 过期 / 该侧低可见度），
    *   立刻停止驱动这些参数，把控制权交还给 idle motion / breath，避免冻结在最后一帧。
    *

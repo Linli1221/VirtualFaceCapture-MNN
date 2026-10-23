@@ -663,6 +663,10 @@ function publishDebug() {
     ParamBodyAngleZ: stage.getEngineParam("ParamBodyAngleZ"),
     ParamArmLA: stage.getEngineParam("ParamArmLA"),
     ParamArmRA: stage.getEngineParam("ParamArmRA"),
+    ParamArmLB: stage.getEngineParam("ParamArmLB"),
+    ParamArmRB: stage.getEngineParam("ParamArmRB"),
+    ParamShoulderL: stage.getEngineParam("ParamShoulderL"),
+    ParamShoulderR: stage.getEngineParam("ParamShoulderR"),
   };
   const body = state.body ?? createBodyState();
   // 上半身调试信息（verifier / 调试面板 / 无手机截图都能读到）
@@ -676,6 +680,10 @@ function publishDebug() {
     torso: { roll: body.torso?.[0] ?? 0, yaw: body.torso?.[1] ?? 0 },
     armAngleL: body.metrics?.armAngleL ?? null,
     armAngleR: body.metrics?.armAngleR ?? null,
+    elbowBendL: body.metrics?.elbowBendL ?? null,
+    elbowBendR: body.metrics?.elbowBendR ?? null,
+    spineLean: body.metrics?.spineLean ?? 0,
+    clavicleRelTilt: body.metrics?.clavicleRelTilt ?? 0,
     shoulderWidth: body.metrics?.shoulderWidth ?? 0,
     confidence: body.metrics?.confidence ?? 0,
     params: { ...(body.current ?? {}) },
@@ -770,13 +778,15 @@ function bodyStatusText(body) {
   return "无效";
 }
 
-/** 手臂参数在当前模型上是否存在（自带 4 个模型都没有 → 预期降级）。 */
-function armParamSupportText() {
+/** 上半身骨骼参数（臂 A / 肘 B / 肩）在当前模型上是否存在（自带 4 个模型都没有 → 预期降级）。 */
+function bodyParamSupportText() {
   const support = stage.bodySupport ?? {};
-  const left = Boolean(support.ParamArmLA);
-  const right = Boolean(support.ParamArmRA);
-  if (!left && !right) return "模型没有（跳过）";
-  return `L:${left ? "有" : "无"} R:${right ? "有" : "无"}`;
+  const pick = (id) => (support[id] ? "有" : "无");
+  return [
+    `臂A L:${pick("ParamArmLA")} R:${pick("ParamArmRA")}`,
+    `肘B L:${pick("ParamArmLB")} R:${pick("ParamArmRB")}`,
+    `肩 L:${pick("ParamShoulderL")} R:${pick("ParamShoulderR")}`,
+  ].join(" · ");
 }
 
 // ---- 调试骨架：画布右下角，13 点 + 15 条边（低可见度灰点），D 键 / ?skeleton=1 显示 ----
@@ -1163,7 +1173,9 @@ function renderDebugGrid() {
     ["ub age", state.body?.ageMs == null ? "-" : `${Math.round(state.body.ageMs)} ms`],
     ["torso r/y", `${fmt(state.body?.torso?.[0], 1)} / ${fmt(state.body?.torso?.[1], 1)}`],
     ["arm L/R", `${fmt(state.body?.metrics?.armAngleL, 0)}° / ${fmt(state.body?.metrics?.armAngleR, 0)}°`],
-    ["手臂参数", armParamSupportText()],
+    ["elbow L/R", `${fmt(state.body?.metrics?.elbowBendL, 0)}° / ${fmt(state.body?.metrics?.elbowBendR, 0)}°`],
+    ["肩 差动/脊柱", `${fmt(state.body?.metrics?.clavicleRelTilt, 1)}° / ${fmt(state.body?.metrics?.spineLean, 1)}°`],
+    ["骨骼参数", bodyParamSupportText()],
     ["target AngleX", fmt(params.ParamAngleX, 2)],
     ["target AngleY", fmt(params.ParamAngleY, 2)],
     ["目标帧率", stage.targetFps ? String(stage.targetFps) : "不限"],

@@ -341,9 +341,12 @@ wrists / hips) plus **baseline-relative torso angles**, so the avatar can lean, 
   back to full-frame coordinates, so the `ub[]` protocol semantics are unchanged.
 - **~0.6 KB extra per frame**: `ubOk` / `ub` (13×4) / `ubT` / `body` are appended to `track`
   ([`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)), ≈36 KB/s at 60 fps.
-- **Consumed automatically on the PC**: torso drives `ParamBodyAngleX/Y/Z`, arms drive
-  `ParamArmLA/RA`; parameters a model does not have are **skipped** (the four bundled models only
-  ship `ParamBodyAngleX/Y/Z`, so arms will not visibly move there — expected degradation).
+- **Consumed automatically on the PC**: the 13 points become an upper-body motion skeleton
+  (spine → clavicle → upper arm → forearm); the torso drives `ParamBodyAngleX/Y/Z`, the
+  shoulders `ParamShoulderL/R`, the arms `ParamArmLA/RA`, the elbows `ParamArmLB/RB`;
+  parameters a model does not have are **skipped** (the four bundled models only
+  ship `ParamBodyAngleX/Y/Z`, so shoulder/arm/elbow motion will not visibly move there —
+  expected degradation).
 - **Smooth fallback**: on `ubOk=false` or 1.5 s without an update the parameters decay toward 0
   per frame, handing control back to the model's own idle motion.
 - **Visible while debugging**: skeleton overlay on the phone preview; PC debug panel gets an

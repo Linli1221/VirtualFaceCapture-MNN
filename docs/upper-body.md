@@ -17,8 +17,10 @@
   `PoseLandmarker`（LIVE_STREAM 模式）**在相机同一路 YUV 帧上抽帧推理（默认 15 fps，可调）；
 - 怎么传：沿用 VFC Tracking Protocol v1，在 `track` 报文里**新增可选字段** `ub` / `ubOk` /
   `ubT` / `body`（纯增量，不升 `version`，老客户端会按协议 §3 「未知字段忽略」直接跳过）；
-- 谁用：Windows 客户端用 `body`（相对躯干 roll/yaw）+ `ub`（手臂位置）驱动 Live2D 的
-  身体 / 手臂参数（模型没有对应参数时自动跳过），并在调试面板画出骨架。
+- 谁用：Windows 客户端把 13 点换算成**上半身运动骨骼**（脊柱 → 锁骨 → 上臂 → 前臂），
+  用 `body`（躯干 roll/yaw）+ 骨骼关节角驱动 Live2D 的身体 / 肩 / 手臂 / 肘参数
+  （`ParamBodyAngleX/Y/Z`、`ParamShoulderL/R`、`ParamArmLA/RA`、`ParamArmLB/RB`，
+  模型没有对应参数时自动跳过），并在调试面板画出骨架。
 
 > 和面捕管线的关系：**完全解耦**。上半身是可选功能（默认关），关掉时相机线程零额外开销，
 > 也不加载 MediaPipe Tasks 运行时；面捕的「零 MediaPipe 运行时依赖」设计不变。
@@ -193,9 +195,12 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
   - `BODY_LANDMARK_ORDER`：名字 → **协议顺序下标**（0..12），与 `UpperBodyLandmarkIndex.ORDER`
     的 MediaPipe 原始索引一一对应；`BODY_BONES` 15 条边，与 `UpperBodySkeleton.BONES` 逐项一致；
   - `parseUpperBody(ub)`：52 项 → 13 个 `{x,y,z,v}`（长度不对 / NaN → 清洗或 null）；
+  - `buildUpperBodySkeleton(ub)`：13 点 → **上半身运动骨骼**（层级关节角：脊柱 → 锁骨 →
+    上臂 → 前臂，角度都是相对父骨的旋转）。返回 `{points, spine, clavicle, arms:{L,R}}`，
+    每根骨带 `valid` / `visibility` 门控信息；躯干倾斜时手臂的**躯干相对角**保持不变；
   - `mapBody(bodyAngles, ub, opts)`：输入 `body = [roll, yaw]` + `ub`（扁平 52 或
-    `parseUpperBody()` 结果），返回 `{params, metrics}`。两个参数按长度识别，写成文档顺序
-    `mapBody(ub, body)` 也会自动交换（有单测）；
+    `parseUpperBody()` 结果），返回 `{params, metrics, skeleton}`。两个参数按长度识别，
+    写成文档顺序 `mapBody(ub, body)` 也会自动交换（有单测）；
   - `readUpperBodyTrack(track, now, prev)`：解析 `ub/ubOk/ubT/body`，返回
     `{ok, present, ubOk, stale, ageMs, points, torso, t, receivedAt}`。**`ubT` 只用来判断
     「是不是新样本」**（手机与本机时钟不同步，不能直接和本机 now 相减），过期用本地到达时间
@@ -204,17 +209,20 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
     衰减到 0 后**删掉参数**，交回模型自己的 idle motion（不会把参数写死成 0）；
   - `combineBodyAngleX(head, torso)`：头部与躯干的 `ParamBodyAngleX` **相加后 clamp ±30**，
     不互相覆盖。
-  - 输出参数：`ParamBodyAngleX/Y/Z`、`ParamArmLA/RA`（模型没有的由 `live2d.js` 跳过）。
-    `ParamShoulderL/R`、`ParamHandL/R` 协议没有可靠数据源，参考实现**不输出**，留给以后扩展。
+  - 输出参数（骨骼驱动，协议 §8.5）：`ParamBodyAngleX/Y/Z`（躯干）、`ParamArmLA/RA`
+    （上臂抬起角）、`ParamArmLB/RB`（肘屈曲，正 = 屈肘）、`ParamShoulderL/R`（锁骨差动，
+    正 = 该侧肩抬起）。模型没有的由 `live2d.js` 跳过。
+    `ParamHandL/R` 协议没有可靠数据源（13 点里没有手部关键点），参考实现**不输出**，留给以后扩展。
 - `renderer/app.js`：每帧 `readUpperBodyTrack` → `mapBody` → `smoothBodyParams`，喂给 stage；
-  `__vfcDebug.body` 暴露原始帧 / ageMs / torso / armAngle / 参数；调试骨架 canvas 也在这里
-  （`D` 键或 `?skeleton=1`，低可见度点灰显，`ubOk=false` 灰显最后一帧）。
+  `__vfcDebug.body` 暴露原始帧 / ageMs / torso / armAngle / elbowBend / clavicleRelTilt / 参数；
+  调试骨架 canvas 也在这里（`D` 键或 `?skeleton=1`，低可见度点灰显，`ubOk=false` 灰显最后一帧）。
 - `renderer/live2d.js`：`setBodyParams()` 在头部参数之后应用，上半身参数 0.16s 一阶低通；
   用 `getParameterIndex() >= 0` + 真实参数 id 表双保险判断模型是否有该参数。
 - `tools/mock-body.js`（新）：mock 手机端的上半身合成（13 点 + 躯干角 + 双手交替抬起 +
-  周期性丢失窗口）；`tools/mock-tracker.js` 的 track / hello 带上 `ub/ubOk/ubT/body`
-  （`--no-upper-body` 可关）；`tools/selftest.js` 与 `tools/verify/mapping-test.mjs`
-  新增解析 / 映射 / 平滑 / 全链路用例。
+  肘屈曲 + 耸肩差动 + 周期性丢失窗口）；`tools/mock-tracker.js` 的 track / hello 带上
+  `ub/ubOk/ubT/body`（`--no-upper-body` 可关）；`windows-client/tools/selftest.js` 与
+  `tools/verify/mapping-test.mjs`（仓库根，协议契约）新增解析 / 骨骼 / 映射 / 平滑 /
+  全链路用例。
 
 ## 4. 协议增量（最终以 docs/tracking-protocol.md 为准）
 
@@ -244,7 +252,8 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 - 参数映射参考（客户端实现）：`ParamBodyAngleZ = clamp(roll * 0.5, ±30)`、
   `ParamBodyAngleX = clamp(headX + (-yaw * 0.3), ±30)`、`ParamBodyAngleY = clamp(-roll * 0.2, ±30)`；
   手臂抬起角 = **肩→腕** 与「竖直向下」的夹角（度，0..180），`armUp = clamp(angle / 150, 0, 1)`、
-  `ParamArmLA/RA = armUp * 30`；该侧肩/肘/腕可见度 < 0.3 时**不输出**该侧手臂参数。
+  `ParamArmLA/RA = armUp * 30`；肘屈曲（前臂相对上臂）→ `ParamArmLB/RB`，锁骨差动（肩线相对
+  髋线）→ `ParamShoulderL/R`；该侧肩/肘/腕可见度 < 0.3 时**不输出**该侧手臂参数。
   详见 `docs/tracking-protocol.md` §8.5 参考实现。
 
 ## 5. 验收清单

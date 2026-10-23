@@ -460,6 +460,11 @@ setParam("ParamBodyAngleX", -y * 10);
 `body` / `ub` 是**可选**输入：模型没有对应参数时直接跳过（`getParameterIndex` 返回 -1）。
 MediaPipe Pose 只有约 15 fps，所有派生值建议再做 0.15~0.25 s 的一阶低通后再写给模型。
 
+参考实现把 13 点先换算成**上半身运动骨骼**（`windows-client/renderer/mapping.js` 的
+`buildUpperBodySkeleton()`）：`脊柱（髋中点→肩中点）→ 锁骨（肩线相对髋线）→ 上臂（肩→肘）→
+前臂（肘→腕）`，每根骨的角度都是**相对父骨**的旋转——躯干跟着倾斜时手臂不会被误读成「抬起」，
+整体侧倾也不会重复计数进肩膀参数。
+
 **躯干**（`body = [roll, yaw]`，与 §8.2 的头姿派生值**相加后 clamp**，不要互相覆盖）：
 
 ```js
@@ -469,15 +474,16 @@ ParamBodyAngleY = clamp(-body[0] * 0.2, -30, 30);                // 幅度很小
 ParamBodyAngleZ = clamp(body[0] * 0.5, -30, 30);
 ```
 
-**手臂**（画面坐标 y 向下；「自然下垂」= 0°，水平 = 90°，举过头 = 180°）：
+**肩 / 手臂 / 肘**（画面坐标 y 向下；「自然下垂」= 0°，水平 = 90°，举过头 = 180°）：
 
 ```js
 // ub 取点：下标顺序见 §5.3
 const p = (i) => ({ x: ub[i * 4], y: ub[i * 4 + 1], z: ub[i * 4 + 2], v: ub[i * 4 + 3] });
 const P_LEFT_SHOULDER = 5, P_RIGHT_SHOULDER = 6,
-      P_LEFT_ELBOW = 7, P_RIGHT_ELBOW = 8, P_LEFT_WRIST = 9, P_RIGHT_WRIST = 10;
+      P_LEFT_ELBOW = 7, P_RIGHT_ELBOW = 8, P_LEFT_WRIST = 9, P_RIGHT_WRIST = 10,
+      P_LEFT_HIP = 11, P_RIGHT_HIP = 12;
 
-// 肩 → 腕向量相对「竖直向下」的夹角（度）：0 = 自然下垂、90 = 平举、180 = 举过头顶。
+// ① 上臂抬起：肩 → 腕向量相对「竖直向下」的夹角（度，0..180）。
 // 画面 y 向下，所以竖直向下 = (0, +1)；左右对称取 |dx|，镜像只影响 x 正负、不影响该角。
 function armAngleFromDown(shoulder, wrist) {
   const dx = wrist.x - shoulder.x;
@@ -485,24 +491,47 @@ function armAngleFromDown(shoulder, wrist) {
   return Math.atan2(Math.abs(dx), dy) * 180 / Math.PI;
 }
 
-const angleL = armAngleFromDown(p(P_LEFT_SHOULDER), p(P_LEFT_WRIST));
-const angleR = armAngleFromDown(p(P_RIGHT_SHOULDER), p(P_RIGHT_WRIST));
-
-// 参考实现：满量程 150°，归一后乘模型手臂参数量程（常见 30）
 const ARM_ANGLE_MAX = 150, ARM_SCALE = 30;
-setParam("ParamArmLA", clamp(angleL / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
-setParam("ParamArmRA", clamp(angleR / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
+setParam("ParamArmLA", clamp(armAngleFromDown(p(P_LEFT_SHOULDER), p(P_LEFT_WRIST)) / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
+setParam("ParamArmRA", clamp(armAngleFromDown(p(P_RIGHT_SHOULDER), p(P_RIGHT_WRIST)) / ARM_ANGLE_MAX, 0, 1) * ARM_SCALE);
+
+// ② 肘关节角：前臂相对上臂的屈曲（0 = 伸直）。按侧别镜像后**两侧屈肘同为正**。
+function elbowBendDeg(shoulder, elbow, wrist, side) {
+  const rot = (a, b) => Math.atan2(b.x - a.x, b.y - a.y) * 180 / Math.PI;   // 相对竖直向下，+ = 向画面右
+  const bend = ((rot(elbow, wrist) - rot(shoulder, elbow) + 540) % 360) - 180;  // 折回 (-180,180)
+  return side === "L" ? -bend : bend;
+}
+
+const ELBOW_ANGLE_MAX = 150, ELBOW_SCALE = 30;
+setParam("ParamArmLB", clamp(elbowBendDeg(p(P_LEFT_SHOULDER), p(P_LEFT_ELBOW), p(P_LEFT_WRIST), "L") / ELBOW_ANGLE_MAX, -1, 1) * ELBOW_SCALE);
+setParam("ParamArmRB", clamp(elbowBendDeg(p(P_RIGHT_SHOULDER), p(P_RIGHT_ELBOW), p(P_RIGHT_WRIST), "R") / ELBOW_ANGLE_MAX, -1, 1) * ELBOW_SCALE);
+
+// ③ 锁骨差动：肩线相对髋线的倾斜。整体侧倾（肩髋同倾）时 ≈ 0，耸肩 / 塌肩才有值。
+function lineTiltDeg(a, b) { return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }  // + = 右端下沉
+const shrugDeg = lineTiltDeg(p(P_LEFT_SHOULDER), p(P_RIGHT_SHOULDER))
+               - lineTiltDeg(p(P_LEFT_HIP), p(P_RIGHT_HIP));
+
+const CLAVICLE_TILT_MAX = 25, SHOULDER_SCALE = 30;
+const shrug = clamp(shrugDeg / CLAVICLE_TILT_MAX, -1, 1);
+setParam("ParamShoulderL",  shrug * SHOULDER_SCALE);   // 符号约定：正 = 该侧肩抬起
+setParam("ParamShoulderR", -shrug * SHOULDER_SCALE);   // （右肩相对下沉 = 左肩抬起）
 ```
 
+- **参数总表**：`ParamBodyAngleX/Y/Z`（躯干）、`ParamArmLA/RA`（上臂抬起）、
+  `ParamArmLB/RB`（肘屈曲）、`ParamShoulderL/R`（锁骨差动）。`ParamShoulderL/R` 的符号约定是
+  **正 = 该侧肩抬起**；`ParamArmLB/RB` 是**正 = 屈肘**（模型的铰链方向相反时把 `ELBOW_SCALE`
+  取负即可）。各模型的 `ParamArmB` / `ParamShoulder` 具体变形方向随 rig 而异，接新模型时先小
+  幅度试一下符号。
+- `ParamHandL/R` **不输出**：13 点里没有手部关键点，腕关节朝向无从测量（不造数据）。要接时用
+  骨骼层的 `forearmDeg`（肘→腕段的绝对角）自行近似，并接受它是前臂方向、不是手腕旋转。
 - 手肘被躯干挡住时用肩 → 腕更稳；需要更精细时可用
   `armAngleFromDown(shoulder, elbow)` + `armAngleFromDown(elbow, wrist)` 两段近似
   （协议没有手心朝向，不要过度解读）。
 - `x` / `y` 分别按画面宽 / 高归一化，协议不带分辨率，参考实现没有做长宽比矫正；
   手臂主要是上下运动，误差可接受。要精确角度只能由手机端把像素纵横比信息一起下发（v1 不做）。
-- 参考实现（`windows-client/renderer/mapping.js`）只驱动 `ParamBodyAngleX/Y/Z` 与
-  `ParamArmLA/RA`；`ParamShoulderL/R`、`ParamHandL/R` 没有可靠数据源，模型真有参数时再自行接。
 - 参与计算的肩 / 肘 / 腕 `visibility` 任一低于 **0.3** 时，本帧**不更新**该侧手臂参数
-  （参考实现 `BODY_ARM_MIN_VISIBILITY`）。
+  （`ParamArm{L,R}A/B` 四个都算「该侧手臂参数」）；`ParamShoulderL/R` 要求**双肩 + 双胯**
+  可见度都 ≥ 0.3（参考实现 `BODY_ARM_MIN_VISIBILITY`）。低可见度时原始角度仍可在调试面板查看。
 - `ubOk=false` 或连续 1.5 s 没有 `ubOk=true`：目标值按帧向 0 衰减（每帧约 15%，
   0.3~0.8 s 回到中位，同 §7.6 的「回中性」），不要突然跳到默认姿态。
 - `z` 差可以做「手前后」：`wrist.z - shoulder.z < 0` 表示手更靠近镜头；但 MediaPipe 的 `z`

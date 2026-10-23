@@ -330,9 +330,10 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
   （没有可信脸框 / ROI 太小时回退整帧）；结果点回映整帧坐标，协议 `ub[]` 语义不变。
 - **线上一帧只多约 0.6 KB**：`track` 里追加 `ubOk` / `ub`（13×4）/ `ubT` / `body`
   （[`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)），60 fps 下约 36 KB/s。
-- **PC 自动消费**：躯干驱动 `ParamBodyAngleX/Y/Z`、手臂驱动 `ParamArmLA/RA`；
-  模型没有这些参数时**自动跳过**（仓库自带 4 个模型只有 `ParamBodyAngleX/Y/Z`，
-  所以手臂动作在它们身上看不到，属预期降级）。
+- **PC 自动消费**：13 点换算成上半身运动骨骼（脊柱 → 锁骨 → 上臂 → 前臂），躯干驱动
+  `ParamBodyAngleX/Y/Z`、肩驱动 `ParamShoulderL/R`、手臂驱动 `ParamArmLA/RA`、肘驱动
+  `ParamArmLB/RB`；模型没有这些参数时**自动跳过**（仓库自带 4 个模型只有
+  `ParamBodyAngleX/Y/Z`，所以肩 / 手臂 / 肘动作在它们身上看不到，属预期降级）。
 - **丢失平滑回默认**：`ubOk=false` 或 1.5 s 没更新时，参数按帧向 0 衰减回模型自己的 idle motion。
 - **预览 / 调试可见**：手机预览叠加 13 点骨架；PC 调试面板有上半身参数组，
   `D` 面板 + `?skeleton=1` 可看浮层骨架。

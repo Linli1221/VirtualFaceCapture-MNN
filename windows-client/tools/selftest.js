@@ -23,6 +23,7 @@ import {
   BS_INDEX,
   BS_COUNT,
   PARAM_IDS,
+  buildUpperBodySkeleton,
   combineBodyAngleX,
   createMapper,
   mapBshapes,
@@ -653,12 +654,16 @@ console.log("[selftest] mapping.js · 上半身关键点（协议 §4.2 / §5.3�
 // 协议顺序下标（与 CommonData.UpperBodyLandmarkIndex.ORDER 逐项一致）
 const P = BODY_LANDMARK_ORDER;
 
-/** 构造协议 ub（13×4）：默认直立站姿、双臂自然下垂（腕在肩正下方）。 */
+/** 构造协议 ub（13×4）：默认直立站姿、双臂自然下垂（肘在肩腕中点 = 手臂伸直，腕在肩正下方）。 */
 function makeUb({
   shoulderL = [0.35, 0.4],
   shoulderR = [0.65, 0.4],
+  elbowL = null,
+  elbowR = null,
   wristL = [0.35, 0.78],
   wristR = [0.65, 0.78],
+  hipL = [0.39, 0.86],
+  hipR = [0.61, 0.86],
   visibility = 0.9,
   visibilityL = null,
   visibilityR = null,
@@ -680,13 +685,13 @@ function makeUb({
   set(P.ear_right, 0.58, 0.17, 0, visibility);
   set(P.shoulder_left, shoulderL[0], shoulderL[1], 0, vL);
   set(P.shoulder_right, shoulderR[0], shoulderR[1], 0, vR);
-  // 肘取肩腕中点：只影响可见度，不影响肩→腕角度
-  set(P.elbow_left, (shoulderL[0] + wristL[0]) / 2, (shoulderL[1] + wristL[1]) / 2, 0, vL);
-  set(P.elbow_right, (shoulderR[0] + wristR[0]) / 2, (shoulderR[1] + wristR[1]) / 2, 0, vR);
+  // 肘默认取肩腕中点（手臂伸直）；传了 elbowL/elbowR 就按给定位置（可造肘屈曲）
+  set(P.elbow_left, ...(elbowL ?? [(shoulderL[0] + wristL[0]) / 2, (shoulderL[1] + wristL[1]) / 2]), 0, vL);
+  set(P.elbow_right, ...(elbowR ?? [(shoulderR[0] + wristR[0]) / 2, (shoulderR[1] + wristR[1]) / 2]), 0, vR);
   set(P.wrist_left, wristL[0], wristL[1], 0, vL);
   set(P.wrist_right, wristR[0], wristR[1], 0, vR);
-  set(P.hip_left, 0.39, 0.86, 0, visibility);
-  set(P.hip_right, 0.61, 0.86, 0, visibility);
+  set(P.hip_left, hipL[0], hipL[1], 0, visibility);
+  set(P.hip_right, hipR[0], hipR[1], 0, visibility);
   return ub;
 }
 
@@ -792,8 +797,14 @@ await test("mapBody：中性肩线 + 双臂下垂 → 所有参数 0", () => {
   near(mapped.params.ParamBodyAngleZ, 0);
   near(mapped.params.ParamArmLA, 0);
   near(mapped.params.ParamArmRA, 0);
+  near(mapped.params.ParamArmLB, 0);
+  near(mapped.params.ParamArmRB, 0);
+  near(mapped.params.ParamShoulderL, 0);
+  near(mapped.params.ParamShoulderR, 0);
   near(mapped.metrics.armAngleL, 0);
   near(mapped.metrics.armAngleR, 0);
+  near(mapped.metrics.elbowBendL, 0);
+  near(mapped.metrics.elbowBendR, 0);
   near(mapped.metrics.shoulderWidth, 0.3);
   near(mapped.metrics.confidence, 0.9);
 });
@@ -877,6 +888,134 @@ await test("mapBody：也接受 parseUpperBody() 解析后的 13 点（省一次
   const viaPoints = mapBody([0, 0], parseUpperBody(ub));
   near(viaPoints.params.ParamArmLA, viaFlat.params.ParamArmLA);
   near(viaPoints.metrics.armAngleL, viaFlat.metrics.armAngleL);
+});
+
+await test("buildUpperBodySkeleton：层级关节角（脊柱 / 锁骨 / 上臂 / 前臂 / 肘）", () => {
+  // 直立 + 双臂伸直下垂：所有关节角为 0
+  const neutral = buildUpperBodySkeleton(makeUb());
+  assert.equal(neutral.points.length, BODY_COUNT);
+  assert.equal(neutral.spine.valid, true);
+  near(neutral.spine.leanDeg, 0);
+  assert.equal(neutral.clavicle.valid, true);
+  near(neutral.clavicle.tiltDeg, 0);
+  near(neutral.clavicle.relTiltDeg, 0);
+  near(neutral.arms.L.elbowBendDeg, 0);
+  near(neutral.arms.R.elbowBendDeg, 0);
+  assert.equal(neutral.arms.L.valid, true);
+  near(neutral.arms.L.elevationDeg, 0);
+
+  // 左肘屈 90°（前臂平收到身体外侧）、右肘镜像同样动作：两侧 elbowBend 同为正
+  const bent = buildUpperBodySkeleton(
+    makeUb({
+      elbowL: [0.35, 0.57],
+      wristL: [0.26, 0.57],
+      elbowR: [0.65, 0.57],
+      wristR: [0.74, 0.57],
+    }),
+  );
+  near(bent.arms.L.elbowBendDeg, 90, 0.01);
+  near(bent.arms.R.elbowBendDeg, 90, 0.01);
+  // 肘关节角是**相对上臂**的：上臂自己抬起不会算成屈肘
+  const raisedStraight = buildUpperBodySkeleton(makeUb({ wristL: [0.05, 0.4] }));
+  near(raisedStraight.arms.L.elbowBendDeg, 0, 0.01);
+  // 退化骨（肘与腕重合）→ 关节角无意义，valid=false
+  const degenerate = buildUpperBodySkeleton(makeUb({ elbowL: [0.35, 0.78], wristL: [0.35, 0.78] }));
+  assert.equal(degenerate.arms.L.valid, false);
+  near(degenerate.arms.L.elbowBendDeg, 0);
+  // 坏输入 → 空骨架，不抛异常
+  const broken = buildUpperBodySkeleton([1, 2, 3]);
+  assert.equal(broken.points, null);
+  assert.equal(broken.arms.L.valid, false);
+});
+
+await test("buildUpperBodySkeleton：躯干倾斜时手臂的躯干相对角不变（层级旋转不重复计数）", () => {
+  // 肩中点 (0.55, 0.3)、髋中点 (0.45, 0.8) → 脊柱向画面右倾 ≈ 11.31°
+  const shoulderL = [0.4, 0.3];
+  const elbowL = [0.37058, 0.44709];
+  const wristL = [0.34117, 0.59417]; // 左臂平行于脊柱方向下垂
+  const skeleton = buildUpperBodySkeleton(
+    makeUb({ shoulderL, shoulderR: [0.7, 0.3], elbowL, wristL, hipL: [0.34, 0.8], hipR: [0.56, 0.8] }),
+  );
+  near(skeleton.spine.leanDeg, (Math.atan2(0.1, 0.5) * 180) / Math.PI, 0.01);
+  // 绝对画面角跟着躯干倾了 11.31°，但相对躯干仍然是 0 → 不会被误读为「手臂抬起」
+  near(skeleton.arms.L.elevationDeg, (Math.atan2(0.1, 0.5) * 180) / Math.PI, 0.2);
+  near(skeleton.arms.L.elevationTorsoDeg, 0, 0.2);
+});
+
+await test("mapBody：肘弯曲 → ParamArmLB/RB 两侧同号，伸直为 0", () => {
+  const bent = mapBody(
+    [0, 0],
+    makeUb({
+      elbowL: [0.35, 0.57],
+      wristL: [0.26, 0.57],
+      elbowR: [0.65, 0.57],
+      wristR: [0.74, 0.57],
+    }),
+  );
+  near(bent.params.ParamArmLB, 18); // 90/150*30
+  near(bent.params.ParamArmRB, 18);
+  near(bent.metrics.elbowBendL, 90, 0.01);
+  near(bent.metrics.elbowBendR, 90, 0.01);
+  // 满量程与系数可调
+  const scaled = mapBody(
+    [0, 0],
+    makeUb({ elbowL: [0.35, 0.57], wristL: [0.26, 0.57] }),
+    { elbowAngleMax: 90, elbowScale: 10 },
+  );
+  near(scaled.params.ParamArmLB, 10);
+  // 屈肘不该污染抬起角语义之外的参数
+  near(bent.params.ParamBodyAngleZ, 0);
+});
+
+await test("mapBody：锁骨差动（肩线相对髋线）→ ParamShoulderL/R 反号对称", () => {
+  // 右肩相对下沉 0.04（肩线 +7.59°、髋线 0°）→ 左肩抬起、右肩落下
+  const shrug = mapBody([0, 0], makeUb({ shoulderL: [0.35, 0.38], shoulderR: [0.65, 0.42] }));
+  near(shrug.metrics.clavicleRelTilt, (Math.atan2(0.04, 0.3) * 180) / Math.PI, 0.01);
+  assert.ok(shrug.params.ParamShoulderL > 0, "右肩下沉 = 左肩抬起，ParamShoulderL 应为正");
+  assert.ok(shrug.params.ParamShoulderR < 0);
+  near(shrug.params.ParamShoulderL + shrug.params.ParamShoulderR, 0);
+  near(shrug.params.ParamShoulderL, ((Math.atan2(0.04, 0.3) * 180) / Math.PI / 25) * 30, 0.01);
+});
+
+await test("mapBody：整体侧倾（肩髋同倾）不驱动肩参数（层级不重复计数）", () => {
+  const tilt = (8 * Math.PI) / 180;
+  const shoulderDy = 0.3 * Math.tan(tilt); // 肩半宽 0.15 → 两点各 ±dy/2
+  const hipDy = 0.22 * Math.tan(tilt); // 髋半宽 0.11
+  const leaned = mapBody(
+    [0, 0],
+    makeUb({
+      shoulderL: [0.35, 0.4 - shoulderDy / 2],
+      shoulderR: [0.65, 0.4 + shoulderDy / 2],
+      hipL: [0.39, 0.86 - hipDy / 2],
+      hipR: [0.61, 0.86 + hipDy / 2],
+    }),
+  );
+  near(leaned.metrics.clavicleRelTilt, 0, 0.1);
+  near(leaned.params.ParamShoulderL, 0, 0.5);
+  near(leaned.params.ParamShoulderR, 0, 0.5);
+});
+
+await test("mapBody：肘 / 肩可见度不足 → 对应骨骼参数不输出（让客户端回默认）", () => {
+  const low = mapBody(
+    [0, 0],
+    makeUb({
+      visibilityL: 0.1,
+      elbowL: [0.35, 0.57],
+      wristL: [0.26, 0.57],
+      shoulderL: [0.35, 0.38],
+      shoulderR: [0.65, 0.42],
+    }),
+  );
+  assert.equal("ParamArmLA" in low.params, false);
+  assert.equal("ParamArmLB" in low.params, false);
+  // 肩参数要双肩 + 双胯都可信：左肩可见度 0.1 → 整组不输出
+  assert.equal("ParamShoulderL" in low.params, false);
+  assert.equal("ParamShoulderR" in low.params, false);
+  // 右侧不受影响
+  assert.ok("ParamArmRB" in low.params);
+  // 原始角度仍然可读（调试面板用）
+  near(low.metrics.elbowBendL, 90, 0.01);
+  near(low.metrics.clavicleRelTilt, (Math.atan2(0.04, 0.3) * 180) / Math.PI, 0.01);
 });
 
 await test("readUpperBodyTrack：正常帧 / ubOk=false / 缺字段 / ubT 过期 / 新 ubT 恢复", () => {
@@ -1044,18 +1183,30 @@ await test("buildUpperBody：周期内会出现 ubOk=false + 全 0（验证客�
   assert.ok(dropped.ub.every((value) => value === 0));
   assert.deepEqual(dropped.body, [0, 0]);
   // 关掉丢失窗口 + 静止姿态（neutral 场景）：稳定输出、没有随机性
-  const neutral = buildUpperBody(3.7, { rollAmpDeg: 0, yawAmpDeg: 0, armLiftDeg: 0, dropPeriodSec: 0 });
+  const neutral = buildUpperBody(3.7, {
+    rollAmpDeg: 0,
+    yawAmpDeg: 0,
+    armLiftDeg: 0,
+    elbowRestDeg: 0,
+    elbowCurlDeg: 0,
+    shrugAmpDeg: 0,
+    dropPeriodSec: 0,
+  });
   assert.equal(neutral.ubOk, true);
   near(neutral.body[0], 0);
   near(neutral.body[1], 0);
   // 手臂静止 12° → 12/150*30 ≈ 2.4（坐标按协议保留 4 位小数，允许一点舍入误差）
   near(mapBody(neutral.body, neutral.ub).params.ParamArmLA, 2.4, 0.01);
+  near(mapBody(neutral.body, neutral.ub).params.ParamArmLB, 0, 0.01);
+  near(mapBody(neutral.body, neutral.ub).params.ParamShoulderL, 0, 0.01);
 });
 
 await test("上半身链路（mock → readUpperBodyTrack → mapBody → smoothBodyParams）：参数跟随数据，丢失后 1s 内释放", () => {
   let prev = null;
   let current = {};
   let maxArmLA = 0;
+  let maxArmLB = 0;
+  let maxAbsShoulder = 0;
   let maxAbsZ = 0;
   for (let i = 0; i < 240; i++) {
     const nowMs = i * (1000 / 60);
@@ -1071,10 +1222,14 @@ await test("上半身链路（mock → readUpperBodyTrack → mapBody → smooth
       assert.ok(BODY_PARAM_IDS.includes(id), "输出不应包含未知参数：" + id);
     }
     maxArmLA = Math.max(maxArmLA, current.ParamArmLA ?? 0);
+    maxArmLB = Math.max(maxArmLB, current.ParamArmLB ?? 0);
+    maxAbsShoulder = Math.max(maxAbsShoulder, Math.abs(current.ParamShoulderL ?? 0));
     maxAbsZ = Math.max(maxAbsZ, Math.abs(current.ParamBodyAngleZ ?? 0));
     prev = { ...next, current };
   }
   assert.ok(maxArmLA > 20, "手臂参数应被 mock 数据驱动（max " + maxArmLA + "）");
+  assert.ok(maxArmLB > 10, "肘参数应被 mock 数据驱动（max " + maxArmLB + "）");
+  assert.ok(maxAbsShoulder > 5, "肩参数应被 mock 数据驱动（max " + maxAbsShoulder + "）");
   assert.ok(maxAbsZ > 1, "躯干侧倾应被 mock 数据驱动（max " + maxAbsZ + "）");
 
   // 手机端上半身结果丢失（ubOk=false 连续 60 帧 ≈ 1s）：参数单调衰减并最终释放

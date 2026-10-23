@@ -43,6 +43,14 @@ export const MOCK_BODY_DEFAULTS = Object.freeze({
   /** 手臂与竖直向下的夹角：静止 12°、抬起时再 +126°（约 138°，接近举过头顶）。 */
   armRestDeg: 12,
   armLiftDeg: 126,
+  /** 肘屈曲（前臂相对上臂）：静止 8°、周期性弯起再 +95°（两侧同相，验证 ParamArmLB/RB）。 */
+  elbowPeriodSec: 6.1,
+  elbowPhaseRight: 0,
+  elbowRestDeg: 8,
+  elbowCurlDeg: 95,
+  /** 耸肩差动（肩线相对髋线的倾斜）：周期性一侧抬肩一侧沉肩（验证 ParamShoulderL/R）。 */
+  shrugPeriodSec: 8.3,
+  shrugAmpDeg: 7,
   /** 每 9 秒丢 0.7 秒上半身（ubOk=false），用来验证客户端「平滑回默认」。0 = 不丢。 */
   dropPeriodSec: 9,
   dropLengthSec: 0.7,
@@ -68,15 +76,20 @@ const finiteOr = (value, fallback = 0) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
-/** 肩 → 肘 → 腕：从「竖直向下」转 raiseDeg（画面 y 向下为正，左臂往左抬）。 */
-function armChain(side, shoulder, raiseDeg, o) {
-  const radians = (raiseDeg * Math.PI) / 180;
-  const dirX = side === "L" ? -Math.sin(radians) : Math.sin(radians);
-  const dirY = Math.cos(radians);
-  const elbow = { x: shoulder.x + o.upperArmLen * dirX, y: shoulder.y + o.upperArmLen * dirY };
+/** 肩 → 肘 → 腕：上臂从「竖直向下」转 raiseDeg（画面 y 向下为正，左臂往左抬）；
+ *  前臂再相对上臂屈曲 curlDeg（+ = 屈肘，两侧镜像对称）。 */
+function armChain(side, shoulder, raiseDeg, curlDeg, o) {
+  const sideSign = side === "L" ? -1 : 1;
+  const dir = (angleDeg) => {
+    const radians = (angleDeg * Math.PI) / 180;
+    return { x: sideSign * Math.sin(radians), y: Math.cos(radians) };
+  };
+  const upper = dir(raiseDeg);
+  const fore = dir(raiseDeg + curlDeg);
+  const elbow = { x: shoulder.x + o.upperArmLen * upper.x, y: shoulder.y + o.upperArmLen * upper.y };
   return {
     elbow,
-    wrist: { x: elbow.x + o.foreArmLen * dirX, y: elbow.y + o.foreArmLen * dirY },
+    wrist: { x: elbow.x + o.foreArmLen * fore.x, y: elbow.y + o.foreArmLen * fore.y },
   };
 }
 
@@ -108,12 +121,25 @@ export function buildUpperBody(t, options = {}) {
   const raiseL = rest + lift * Math.max(0, Math.sin(armPhase));
   const raiseR = rest + lift * Math.max(0, Math.sin(armPhase + 2 * Math.PI * finiteOr(o.armPhaseRight, 0.5)));
 
-  // roll > 0 = 右肩下沉：肩线绕画面前后倾斜（忽略宽高比，与映射侧一致）
+  // 肘屈曲：前臂相对上臂周期性弯起（两侧同相，验证 ParamArmLB/RB 对称驱动）
+  const elbowPhase = (time / Math.max(0.1, finiteOr(o.elbowPeriodSec, 6.1))) * 2 * Math.PI;
+  const curlRest = finiteOr(o.elbowRestDeg);
+  const curl = finiteOr(o.elbowCurlDeg);
+  const curlL = curlRest + curl * Math.max(0, Math.sin(elbowPhase));
+  const curlR = curlRest + curl * Math.max(0, Math.sin(elbowPhase + 2 * Math.PI * finiteOr(o.elbowPhaseRight, 0)));
+
+  // roll > 0 = 右肩下沉：肩线绕画面前后倾斜（忽略宽高比，与映射侧一致）；
+  // 髋线同倾**同样角度** → 骨架层的「锁骨差动」只剩耸肩分量（整体侧倾归 body roll → ParamBodyAngleZ）
   const sink = o.shoulderHalfSpan * Math.tan((roll * Math.PI) / 180);
-  const shoulderL = { x: 0.5 - o.shoulderHalfSpan, y: o.shoulderY - sink };
-  const shoulderR = { x: 0.5 + o.shoulderHalfSpan, y: o.shoulderY + sink };
-  const chainL = armChain("L", shoulderL, raiseL, o);
-  const chainR = armChain("R", shoulderR, raiseR, o);
+  const sinkHip = o.hipHalfSpan * Math.tan((roll * Math.PI) / 180);
+  // 耸肩差动：一侧抬肩、另一侧沉肩（肩线相对髋线的倾斜，验证 ParamShoulderL/R）
+  const shrugDeg =
+    finiteOr(o.shrugAmpDeg) * Math.sin((time / Math.max(0.1, finiteOr(o.shrugPeriodSec, 8.3))) * 2 * Math.PI);
+  const shrug = o.shoulderHalfSpan * Math.tan((shrugDeg * Math.PI) / 180);
+  const shoulderL = { x: 0.5 - o.shoulderHalfSpan, y: o.shoulderY - sink - shrug };
+  const shoulderR = { x: 0.5 + o.shoulderHalfSpan, y: o.shoulderY + sink + shrug };
+  const chainL = armChain("L", shoulderL, raiseL, curlL, o);
+  const chainR = armChain("R", shoulderR, raiseR, curlR, o);
 
   const points = new Array(COUNT);
   points[P.nose] = { x: 0.5, y: o.noseY };
@@ -127,8 +153,8 @@ export function buildUpperBody(t, options = {}) {
   points[P.elbow_right] = chainR.elbow;
   points[P.wrist_left] = chainL.wrist;
   points[P.wrist_right] = chainR.wrist;
-  points[P.hip_left] = { x: 0.5 - o.hipHalfSpan, y: o.hipY };
-  points[P.hip_right] = { x: 0.5 + o.hipHalfSpan, y: o.hipY };
+  points[P.hip_left] = { x: 0.5 - o.hipHalfSpan, y: o.hipY - sinkHip };
+  points[P.hip_right] = { x: 0.5 + o.hipHalfSpan, y: o.hipY + sinkHip };
 
   const baseVisibility = Math.max(0, Math.min(1, finiteOr(o.visibility, 0.95)));
   const ub = new Array(COUNT * 4).fill(0);
