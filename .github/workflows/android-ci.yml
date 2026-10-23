@@ -79,19 +79,52 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # 把 SDK 根目录透出给后续 step 的 with: 表达式用（runner 环境变量不进 env context）
+      - name: Expose Android SDK root
+        run: echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "$GITHUB_ENV"
+
+      # NDK / CMake 是大包，缓存已装好的目录：命中时 sdkmanager 直接跳过下载，
+      # 两个 matrix job 和后续 push 都不用再拉几百 MB（也就少一次下载损坏的机会）。
+      - name: Cache Android SDK packages (NDK / CMake)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/ndk/28.2.13676358
+            ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1
+            ${{ env.ANDROID_SDK_ROOT }}/cmake/3.18.1
+          key: android-sdk-${{ runner.os }}-ndk-28.2.13676358-cmake-3.22.1-3.18.1
+
       # 版本号与 gradle/wrapper、version.gradle 保持一致：
       # compileSdk 36 / NDK 28.2.13676358 / CMake 3.22.1 (MediapipeFaceLandmark) & 3.18.1 (Live2D)
+      # 大包（尤其 NDK）下载偶发损坏（"Error on ZipFile unknown archive"）：
+      # 失败就清掉半截包重装，最多 3 次，别让一次网络抖动废掉整个构建。
       - name: Install Android SDK packages
         run: |
           set -euo pipefail
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --install \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "ndk;28.2.13676358" \
-            "cmake;3.22.1" \
+          yes 2>/dev/null | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          packages=(
+            "platforms;android-36"
+            "build-tools;36.0.0"
+            "ndk;28.2.13676358"
+            "cmake;3.22.1"
             "cmake;3.18.1"
+          )
+          for attempt in 1 2 3; do
+            if "$SDKMANAGER" --install "${packages[@]}"; then
+              test -d "${ANDROID_HOME}/ndk/28.2.13676358"
+              exit 0
+            fi
+            echo "::warning::sdkmanager 第 ${attempt} 次安装失败，清理半截包后重试"
+            rm -rf \
+              "${ANDROID_HOME}/ndk/28.2.13676358" \
+              "${ANDROID_HOME}/cmake/3.22.1" \
+              "${ANDROID_HOME}/cmake/3.18.1" \
+              "${ANDROID_HOME}/.temp"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Android SDK 包连续 3 次安装失败（网络 / 镜像问题），请重跑 job"
+          exit 1
 
       # 用 Cache 复用 ~/.gradle，两个变体的依赖下载不白跑
       - name: Set up Gradle
