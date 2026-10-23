@@ -16,6 +16,9 @@
 #undef FACE_LOG_TAG
 #define FACE_LOG_TAG "BlendShapePredictor"
 
+// MNN 会话配置 + 真实后端探测（必须在 FACE_LOG_TAG 之后包含，日志才会用本模块 tag）
+#include "common/mnn_session_util.h"
+
 namespace mediapipe_face {
 
 // Performance profiler
@@ -73,6 +76,7 @@ bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads
     input_tensor_ = nullptr;
     input_host_tensor_.reset();
     output_host_tensor_.reset();
+    vulkan_active_ = false;
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -81,17 +85,35 @@ bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads
         return false;
     }
     
+    // 只保留会话本身，不留 op 级回调信息（setSessionMode 必须在 createSession 之前调）。
+    interpreter_->setSessionMode(MNN::Interpreter::Session_Release);
+
     MNN::ScheduleConfig config;
-    config.numThread = num_threads;
-    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
-    backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
-    config.backendConfig = &backendCfg;
+    applyScheduleConfig(config, backendCfg, use_vulkan, num_threads);
     
     session_ = interpreter_->createSession(config);
     if (!session_) {
         last_error_ = "createSession failed for BlendShape model";
         return false;
+    }
+    
+    // 请求的后端不等于真实后端：createSession(VULKAN) 在设备上装不到 Vulkan 时会
+    // 静默退到 CPU，所以这里必须探测一次真实 backend 并记到成员里。
+    int raw_backends[4] = {-1, -1, -1, -1};
+    vulkan_active_ = sessionVulkanActive(interpreter_.get(), session_, raw_backends);
+    if (use_vulkan && !vulkan_active_) {
+        FACE_LOGE("MNN backend[blendshape]: request=Vulkan actual=%s backends=[%d,%d,%d,%d] mnn=%s "
+                  "- requested Vulkan but the real backend is NOT Vulkan "
+                  "(libMNN_Vulkan.so not loaded, or the device/driver does not support it)",
+                  backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
+    } else {
+        FACE_LOGI("MNN backend[blendshape]: request=%s actual=%s backends=[%d,%d,%d,%d] mnn=%s",
+                  backendLabel(use_vulkan), backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
     }
     
     input_tensor_ = interpreter_->getSessionInput(session_, nullptr);
@@ -111,7 +133,7 @@ bool BlendShapePredictor::loadModel(const std::string& mnn_path, int num_threads
     }
     
     FACE_LOGI("BlendShape model loaded: input [%d, %d] (backend=%s, threads=%d)",
-              input_h_, input_w_, use_vulkan ? "Vulkan" : "CPU", num_threads);
+              input_h_, input_w_, vulkan_active_ ? "Vulkan" : "CPU", num_threads);
     return true;
 }
 
@@ -167,7 +189,14 @@ BlendShapeResult BlendShapePredictor::predict(
     
     // Inference
     PERF_START(inference_timer);
-    interpreter_->runSession(session_);
+    {
+        // runSession 的返回码以前被忽略：Vulkan OOM / 后端不可用时会被当成「有输出」。
+        const MNN::ErrorCode code = interpreter_->runSession(session_);
+        if (code != MNN::NO_ERROR) {
+            FACE_LOGE("runSession failed: code=%d (backend=%s)",
+                      static_cast<int>(code), vulkan_active_ ? "Vulkan" : "CPU");
+        }
+    }
     PERF_END(inference_timer, s_perf_profiler.inference);
     
     // Get output

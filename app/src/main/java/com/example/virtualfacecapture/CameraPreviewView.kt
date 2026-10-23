@@ -13,7 +13,9 @@ import com.example.commondata.Point3D
 import com.example.commondata.UpperBodyLandmarkIndex
 import com.example.commondata.UpperBodyPoseFrame
 import com.example.commondata.UpperBodySkeleton
+import com.vfc.log.VfcLog as Log
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -48,12 +50,37 @@ class CameraPreviewView @JvmOverloads constructor(
     /** 回收旧 Bitmap 统一走主线程，避免和 UI 线程正在进行的绘制撞车。 */
     private val mainHandler = Handler(Looper.getMainLooper())
     
-    // Reusable pixel array（只有相机线程访问）
-    private var pixelBuffer: IntArray? = null
+    // 预览位图是 BGRA_8888（ARGB_8888 在小端设备上的内存布局）。
+    // 相机线程把整块 BGRA 直接 copyPixelsFromBuffer 进位图，不再需要
+    // IntArray 打包 / ByteArray 中转 / setPixels（旧实现 720p 单帧 6~11 ms）。
+    // 下面两个标记只用于「同一种错误只打一条日志」，避免相机线程被日志刷屏。
+    private var frameFormatErrorLogged = false
+    private var frameCopyErrorLogged = false
 
-    // Reusable RGB scratch buffer（只有相机线程访问）——720p 下每帧 2.7 MB，
-    // 逐字节 ByteBuffer.get() 会做上百万次边界检查，改成一整块拷进数组再打包。
-    private var rgbBytesBuffer: ByteArray? = null
+    // ---- postInvalidate 节流（≤ 30 Hz）--------------------------------------
+    // 相机帧 30 fps 与叠加数据 60 fps 会各自 postInvalidate，同一帧被标脏两次；
+    // 数据源本身是持续帧流，直接丢掉多余的调用不会造成画面停滞。
+    private val lastInvalidateNs = AtomicLong(0L)
+
+    // ---- 叠加层 LUT：根治「478 点 × N 次 Set<Int>.contains 装箱」-------------
+    private val lutPaint = arrayOfNulls<Paint>(LANDMARK_LUT_SIZE)
+    private val lutRadius = FloatArray(LANDMARK_LUT_SIZE)
+
+    /** LUT 构建时的开关位（drawKeyPoints / drawIris）；变化时才重建（478 次循环）。 */
+    private var lutFlagsKey = -1
+
+    // ---- 文本缓存：姿态 / 检测框分数最多 10 Hz 重新格式化 --------------------
+    private var poseTextNs = 0L
+    private var posePitchText = ""
+    private var poseYawText = ""
+    private var poseRollText = ""
+    private var boxTextNs = 0L
+    private var boxScoreText = ""
+
+    // ---- onDraw 复用的绘制对象（不再每帧 new）-------------------------------
+    private val detectionBoxRect = RectF()
+    private val poseBackgroundRect = RectF()
+    private val meshPath = Path()
     
     private val bitmapPaint = Paint().apply {
         isFilterBitmap = true
@@ -160,6 +187,27 @@ class CameraPreviewView @JvmOverloads constructor(
         isAntiAlias = true
     }
 
+    // 眉毛 / 轮廓的「连线」画笔：一次性建好复用。
+    // 旧实现每次 drawLandmarkPath 都 `Paint(paint).apply { ... }`，drawMesh 打开时
+    // 每帧多 3 个 Paint + 3 个 Path + 3 个局部函数引用。
+    private val imageRightEyebrowStrokePaint = Paint(imageRightEyebrowPaint).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        alpha = 150
+    }
+
+    private val imageLeftEyebrowStrokePaint = Paint(imageLeftEyebrowPaint).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        alpha = 150
+    }
+
+    private val meshStrokePaint = Paint(meshLinePaint).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        alpha = 150
+    }
+
     // ---- 上半身骨架（MediaPipe Pose 13 点）--------------------------------
     // 连线用青色，关节点用黄色；可见度低的点用半透明 / 直接跳过。
     private val bodyBonePaint = Paint().apply {
@@ -220,6 +268,17 @@ class CameraPreviewView @JvmOverloads constructor(
     var drawUpperBody = true
     
     companion object {
+        private const val TAG = "CameraPreviewView"
+
+        /** 叠加层重绘门限：30 fps。相机预览本身也只有 30 fps，再快没有意义。 */
+        private const val INVALIDATE_INTERVAL_NS = 33_000_000L
+
+        /** 姿态 / 分数文本的重格式化门限：10 Hz（String.format 单次 5~10 µs）。 */
+        private const val TEXT_REFRESH_INTERVAL_NS = 100_000_000L
+
+        /** MediaPipe FaceMesh 的 478 个点（LUT 覆盖范围）。 */
+        private const val LANDMARK_LUT_SIZE = 478
+
         /** 上半身连线门槛：两端可见度都 >= 这个值才画，避免低置信度点拉出乱线。 */
         private const val BODY_LINE_VISIBILITY = 0.3f
 
@@ -244,53 +303,36 @@ class CameraPreviewView @JvmOverloads constructor(
     }
     
     /**
-     * Update camera frame - thread-safe with double buffering
-     * Camera now outputs already-rotated frames, so no rotation needed here
+     * 更新相机预览位图（**BGRA_8888**，即 ARGB_8888 在小端设备上的内存布局）。
      *
-     * 只在相机线程调用。整数像素数组是相机线程私有的，位图是双缓冲的：
-     * 这里永远只写「没在展示」的那一块，写完再原子发布，UI 线程按引用读取。
+     * 只在相机线程调用。旋转 / 1/2 降采样 / YUV→BGRA 全部由 native 在 Camera2Manager
+     * 里一次做完，这里只做一次整块 [Bitmap.copyPixelsFromBuffer]：没有 ByteArray 中转、
+     * 没有 IntArray 逐像素打包、没有 setPixels（旧实现 720p 单帧 6~11 ms）。
+     *
+     * 并发契约不变：相机线程只写「没在展示」的那块位图，写完原子发布；UI 线程只读
+     * 发布出去的那块。uiDrawing 期间相机线程最多丢一帧，绝不覆写同一块。
+     *
+     * @param bgraBuffer 直接缓冲区，容量必须 ≥ width*height*4（B,G,R,A 顺序，A=255）
      */
-    fun updateCameraFrame(rgbBuffer: ByteBuffer, width: Int, height: Int) {
+    fun updateCameraFrame(bgraBuffer: ByteBuffer, width: Int, height: Int) {
         if (width <= 0 || height <= 0) return
-        val pixelCount = width * height
-        val byteCount = pixelCount * 3
-        // 防御：尺寸和 buffer 对不上时直接丢帧，避免越界读
-        if (rgbBuffer.capacity() < byteCount) return
+        val byteCount = width * height * 4
+        // 防御：容量和尺寸对不上就丢这一帧，绝不越界读
+        if (bgraBuffer.capacity() < byteCount) {
+            if (!frameFormatErrorLogged) {
+                frameFormatErrorLogged = true
+                Log.w(
+                    TAG,
+                    "updateCameraFrame expects BGRA (w*h*4=" + byteCount +
+                        "), got capacity " + bgraBuffer.capacity() + ", dropping preview frames",
+                )
+            }
+            return
+        }
 
-        // UI 正在绘制：这一帧直接丢掉（转换也一起省掉），保证下面要写的那块位图
-        // 一定没人在读。720p 下一帧转换不便宜，能省就省。
+        // UI 正在绘制：这一帧直接丢掉，保证下面要写的那块位图一定没人在读
         if (uiDrawing) return
 
-        // Reuse pixel buffer（尺寸不变时零分配）
-        val cached = pixelBuffer
-        val pixels = if (cached != null && cached.size == pixelCount) {
-            cached
-        } else {
-            IntArray(pixelCount).also { pixelBuffer = it }
-        }
-        
-        // Convert RGB to ARGB（写的是相机线程私有数组，不需要加锁）。
-        // 先整块 memcpy 进 ByteArray，再按像素打包：直接对 direct ByteBuffer
-        // 逐字节 get() 在 720p 下就是每帧 270 万次调用，光边界检查就能把相机
-        // 线程的帧预算吃掉。
-        val cachedBytes = rgbBytesBuffer
-        val rgbBytes = if (cachedBytes != null && cachedBytes.size == byteCount) {
-            cachedBytes
-        } else {
-            ByteArray(byteCount).also { rgbBytesBuffer = it }
-        }
-        rgbBuffer.clear()
-        rgbBuffer.get(rgbBytes)
-        var src = 0
-        for (i in 0 until pixelCount) {
-            val r = rgbBytes[src].toInt() and 0xFF
-            val g = rgbBytes[src + 1].toInt() and 0xFF
-            val b = rgbBytes[src + 2].toInt() and 0xFF
-            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-            src += 3
-        }
-        
-        // UI 正在绘制时会在上一段提前丢帧，走到这里说明可以安全发布
         synchronized(bitmapLock) {
             // 尺寸变了：摘掉发布出去的引用，旧图交给主线程回收后重建
             if (frameWidth != width || frameHeight != height) {
@@ -300,7 +342,7 @@ class CameraPreviewView @JvmOverloads constructor(
                 frameWidth = width
                 frameHeight = height
             }
-            
+
             val displayed = displayBitmap.get()
             var reusable = backBitmap
             if (reusable != null && (reusable === displayed || reusable.isRecycled ||
@@ -314,22 +356,50 @@ class CameraPreviewView @JvmOverloads constructor(
             }
             val buffer = reusable
                 ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            
-            buffer.setPixels(pixels, 0, width, 0, 0, width, height)
-            
-            // 原子发布：UI 下一次 onDraw 拿到的就是刚写完的这块
+
+            try {
+                // copyPixelsFromBuffer 要求「剩余字节 ≥ byteCount」且按行紧排；
+                // 生产端每帧都会 position(0) + limit(w*h*4)。
+                bgraBuffer.rewind()
+                buffer.copyPixelsFromBuffer(bgraBuffer)
+            } catch (t: RuntimeException) {
+                // 缓冲状态异常（被其它路径改过 position）：丢帧，不能把相机线程抛死
+                if (!frameCopyErrorLogged) {
+                    frameCopyErrorLogged = true
+                    Log.w(TAG, "copyPixelsFromBuffer failed: " + t.message)
+                }
+                return
+            }
+
+            // 原子发布：UI 下一次 onDraw 拿到的就是刚写完的那块
             val previous = displayBitmap.getAndSet(buffer)
             // 上一块「展示中」的位图退回给相机线程当后台缓冲。它可能还被本帧之前发起的
             // 那次 onDraw 读着，所以下一帧写它之前会先检查 uiDrawing。
             backBitmap = if (previous !== buffer) previous else null
         }
-        
-        postInvalidate()
+
+        invalidateThrottled()
+    }
+
+    /**
+     * 带节流的 postInvalidate（≤ 30 Hz）。
+     *
+     * 相机帧（30 fps）与叠加数据（60 fps）会各自 postInvalidate，同一帧被标脏两次；
+     * 数据源本身是持续帧流，丢掉多余的调用只会把这次更新延后一帧。用 CAS 做无锁
+     * 节流：跨越门限的那一次调用负责重绘。
+     */
+    private fun invalidateThrottled() {
+        val now = System.nanoTime()
+        val last = lastInvalidateNs.get()
+        if (now - last < INVALIDATE_INTERVAL_NS) return
+        if (lastInvalidateNs.compareAndSet(last, now)) {
+            postInvalidate()
+        }
     }
     
     fun updateVisualizationData(data: FaceVisualizationData?) {
         visualizationDataRef.set(data)
-        postInvalidate()
+        invalidateThrottled()
     }
 
     /**
@@ -343,7 +413,7 @@ class CameraPreviewView @JvmOverloads constructor(
      */
     fun updateUpperBody(frame: UpperBodyPoseFrame?) {
         upperBodyFrameRef.set(frame)
-        postInvalidate()
+        invalidateThrottled()
     }
     
     /**
@@ -377,8 +447,8 @@ class CameraPreviewView @JvmOverloads constructor(
         }
         visualizationDataRef.set(null)
         upperBodyFrameRef.set(null)
-        pixelBuffer = null
-        rgbBytesBuffer = null
+        // 强制下一次绘制：清空后画面上不该再留任何东西
+        lastInvalidateNs.set(0L)
         postInvalidate()
     }
     
@@ -503,95 +573,90 @@ class CameraPreviewView @JvmOverloads constructor(
         val scaleY = dstRect.height()
         val offsetX = dstRect.left
         val offsetY = dstRect.top
-        
-        fun transformPoint(lx: Float, ly: Float): Pair<Float, Float> {
-            var tx = lx
-            val ty = ly
-            
-            if (mirrorHorizontal) {
-                tx = 1f - tx
-            }
-            
-            return Pair(offsetX + tx * scaleX, offsetY + ty * scaleY)
-        }
-        
-        // Detection box
+        val mirror = mirrorHorizontal
+
+        // Detection box（不再每帧 new RectF / 不每帧 String.format）
         if (drawDetectionBox && data.detectionBox != null) {
             val box = data.detectionBox!!
-            val (x1, y1) = transformPoint(box.x1, box.y1)
-            val (x2, y2) = transformPoint(box.x2, box.y2)
-            
-            val boxRect = RectF(minOf(x1, x2), minOf(y1, y2), maxOf(x1, x2), maxOf(y1, y2))
-            canvas.drawRect(boxRect, detectionBoxPaint)
-            canvas.drawText(String.format("%.2f", box.score), boxRect.left + 5, boxRect.top - 5, textPaint)
+            val x1 = if (mirror) 1f - box.x1 else box.x1
+            val x2 = if (mirror) 1f - box.x2 else box.x2
+            val px1 = offsetX + x1 * scaleX
+            val px2 = offsetX + x2 * scaleX
+            val py1 = offsetY + box.y1 * scaleY
+            val py2 = offsetY + box.y2 * scaleY
+            detectionBoxRect.set(
+                minOf(px1, px2), minOf(py1, py2),
+                maxOf(px1, px2), maxOf(py1, py2),
+            )
+            canvas.drawRect(detectionBoxRect, detectionBoxPaint)
+            canvas.drawText(
+                refreshBoxScoreText(box.score),
+                detectionBoxRect.left + 5,
+                detectionBoxRect.top - 5,
+                textPaint,
+            )
         }
-        
-        // Landmarks - 按部位用不同颜色绘制
-        if (drawLandmarks && data.landmarks.isNotEmpty()) {
-            for ((index, landmark) in data.landmarks.withIndex()) {
-                val (x, y) = transformPoint(landmark.x, landmark.y)
-                
-                // 根据点位所属部位选择颜色和大小
-                val (paint, radius) = when {
-                    // 虹膜（最高优先级）
-                    drawIris && index in IRIS_CENTER_INDICES -> Pair(irisCenterPaint, 6f)
-                    drawIris && index in IRIS_ALL_INDICES -> Pair(irisEdgePaint, 4f)
-                    
-                    // 眼睛
-                    drawKeyPoints && index in IMAGE_RIGHT_EYE_INDICES -> Pair(imageRightEyePaint, 4f)
-                    drawKeyPoints && index in IMAGE_LEFT_EYE_INDICES -> Pair(imageLeftEyePaint, 4f)
-                    
-                    // 眉毛
-                    drawKeyPoints && index in IMAGE_RIGHT_EYEBROW_INDICES -> Pair(imageRightEyebrowPaint, 4f)
-                    drawKeyPoints && index in IMAGE_LEFT_EYEBROW_INDICES -> Pair(imageLeftEyebrowPaint, 4f)
-                    
-                    // 鼻子
-                    drawKeyPoints && index in NOSE_INDICES -> Pair(nosePaint, 4f)
-                    
-                    // 嘴巴
-                    drawKeyPoints && index in MOUTH_OUTER_INDICES -> Pair(mouthOuterPaint, 4f)
-                    drawKeyPoints && index in MOUTH_INNER_INDICES && drawKeyPoints && index == FaceLandmarkIndices.Mouth.INNER_FULL[0] -> Pair(mouthInnerKeyPaint, 3f)
-                    drawKeyPoints && index in MOUTH_INNER_INDICES && drawKeyPoints && index == FaceLandmarkIndices.Mouth.INNER_FULL[10] -> Pair(mouthInnerKeyPaint, 3f)
-                    drawKeyPoints && index in MOUTH_INNER_INDICES && drawKeyPoints && index == FaceLandmarkIndices.Mouth.INNER_FULL[5] -> Pair(mouthInnerKeyPaint, 3f)
-                    drawKeyPoints && index in MOUTH_INNER_INDICES -> Pair(mouthInnerPaint, 3f)
 
-                    // 脸部轮廓
-                    drawKeyPoints && index in FACE_OVAL_INDICES -> Pair(faceOvalPaint, 3f)
-                    
-                    // 普通点
-                    else -> Pair(landmarkPaint, 2f)
-                }
-                
-                canvas.drawCircle(x, y, radius, paint)
+        // Landmarks：LUT + 下标循环，全程零分配
+        // （旧实现每点 2 个 Pair + 最多 9 次 Set<Int> 装箱查找 + withIndex 的 IndexedValue）
+        if (drawLandmarks && data.landmarks.isNotEmpty()) {
+            ensureLandmarkLut()
+            val landmarks = data.landmarks
+            val count = minOf(landmarks.size, LANDMARK_LUT_SIZE)
+            for (index in 0 until count) {
+                val paint = lutPaint[index] ?: continue
+                val landmark = landmarks[index]
+                var tx = landmark.x
+                if (mirror) tx = 1f - tx
+                canvas.drawCircle(
+                    offsetX + tx * scaleX,
+                    offsetY + landmark.y * scaleY,
+                    lutRadius[index],
+                    paint,
+                )
             }
         }
-        
-        // Mesh
+
+        // Mesh（drawMesh 默认 false；打开时也不再分配 Path / Paint / 函数引用）
         if (drawMesh && data.landmarks.size >= 468) {
             // 眉毛连线
-            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.ImageRightEyebrow.ALL, ::transformPoint, imageRightEyebrowPaint)
-            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.ImageLeftEyebrow.ALL, ::transformPoint, imageLeftEyebrowPaint)
-            
+            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.ImageRightEyebrow.ALL, offsetX, offsetY, scaleX, scaleY, mirror, imageRightEyebrowStrokePaint)
+            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.ImageLeftEyebrow.ALL, offsetX, offsetY, scaleX, scaleY, mirror, imageLeftEyebrowStrokePaint)
+
             // 脸部轮廓连线
-            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.FaceOval.ALL, ::transformPoint, meshLinePaint)
+            drawLandmarkPath(canvas, data.landmarks, FaceLandmarkIndices.FaceOval.ALL, offsetX, offsetY, scaleX, scaleY, mirror, meshStrokePaint)
         }
     }
     
     /**
-     * 绘制点位连线
+     * 绘制点位连线（复用 Path + 预建画笔，onDraw 零分配）。
+     *
+     * 旧实现每次调用都会 `Path()`、`Paint(paint).apply{...}`，并借 `::transformPoint`
+     * 生成函数引用对象；drawMesh 打开时每帧 3 套。
      */
     private fun drawLandmarkPath(
         canvas: Canvas,
         landmarks: List<Point3D>,
         indices: List<Int>,
-        transformPoint: (Float, Float) -> Pair<Float, Float>,
-        paint: Paint
+        offsetX: Float,
+        offsetY: Float,
+        scaleX: Float,
+        scaleY: Float,
+        mirror: Boolean,
+        paint: Paint,
     ) {
-        val path = Path()
+        val path = meshPath
+        path.reset()
         var first = true
-        for (index in indices) {
+        val count = indices.size
+        for (k in 0 until count) {
+            val index = indices[k]
             if (index >= landmarks.size) continue
-            val (x, y) = transformPoint(landmarks[index].x, landmarks[index].y)
+            val landmark = landmarks[index]
+            var tx = landmark.x
+            if (mirror) tx = 1f - tx
+            val x = offsetX + tx * scaleX
+            val y = offsetY + landmark.y * scaleY
             if (first) {
                 path.moveTo(x, y)
                 first = false
@@ -599,28 +664,95 @@ class CameraPreviewView @JvmOverloads constructor(
                 path.lineTo(x, y)
             }
         }
-        
-        val linePaint = Paint(paint).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 2f
-            alpha = 150
-        }
-        canvas.drawPath(path, linePaint)
+        canvas.drawPath(path, paint)
     }
-    
+
     private fun drawPoseInfo(canvas: Canvas, pose: HeadPoseData) {
         val padding = 16f
         val lineHeight = 40f
         val x = padding
         var y = height - padding - lineHeight * 3
-        
-        canvas.drawRoundRect(RectF(x - 8, y - lineHeight, x + 280, y + lineHeight * 3 + 8), 8f, 8f, textBackgroundPaint)
-        
-        canvas.drawText(String.format("Pitch: %+6.1f°", pose.pitch), x, y, textPaint)
+
+        refreshPoseText(pose)
+        poseBackgroundRect.set(x - 8, y - lineHeight, x + 280, y + lineHeight * 3 + 8)
+        canvas.drawRoundRect(poseBackgroundRect, 8f, 8f, textBackgroundPaint)
+
+        canvas.drawText(posePitchText, x, y, textPaint)
         y += lineHeight
-        canvas.drawText(String.format("Yaw:   %+6.1f°", pose.yaw), x, y, textPaint)
+        canvas.drawText(poseYawText, x, y, textPaint)
         y += lineHeight
-        canvas.drawText(String.format("Roll:  %+6.1f°", pose.roll), x, y, textPaint)
+        canvas.drawText(poseRollText, x, y, textPaint)
+    }
+
+    /**
+     * 姿态文本最多 10 Hz 重新格式化：String.format 单次 5~10 µs，60 fps 下纯属浪费。
+     */
+    private fun refreshPoseText(pose: HeadPoseData) {
+        val now = System.nanoTime()
+        if (now - poseTextNs < TEXT_REFRESH_INTERVAL_NS) return
+        poseTextNs = now
+        posePitchText = String.format("Pitch: %+6.1f°", pose.pitch)
+        poseYawText = String.format("Yaw:   %+6.1f°", pose.yaw)
+        poseRollText = String.format("Roll:  %+6.1f°", pose.roll)
+    }
+
+    /** 检测框分数文本同样限到 10 Hz（返回缓存值，首帧立即生成）。 */
+    private fun refreshBoxScoreText(score: Float): String {
+        val now = System.nanoTime()
+        if (now - boxTextNs >= TEXT_REFRESH_INTERVAL_NS) {
+            boxTextNs = now
+            boxScoreText = String.format("%.2f", score)
+        }
+        return boxScoreText
+    }
+
+    /**
+     * 构建 / 刷新 landmark 的 LUT：索引 → (Paint, 半径)。
+     *
+     * 旧实现每个点都要走一遍 `when` + 最多 9 次 `Set<Int>.contains`（每次装箱一个
+     * `Integer`），478 点 ⇒ 每帧约 2,900 次哈希查找 + 装箱。这里只在
+     * [drawKeyPoints] / [drawIris] 变化时重建一次（478 次循环），onDraw 里退化成
+     * 「一次数组下标 + 一次判空」，零分配、零哈希。
+     */
+    private fun ensureLandmarkLut() {
+        val flagsKey = (if (drawKeyPoints) 1 else 0) or (if (drawIris) 2 else 0)
+        if (flagsKey == lutFlagsKey) return
+        lutFlagsKey = flagsKey
+        val keyPoints = drawKeyPoints
+        val iris = drawIris
+        for (index in 0 until LANDMARK_LUT_SIZE) {
+            // 默认就是「普通点」；命中某个部位再覆盖，省掉 when 的 else 分支
+            var paint = landmarkPaint
+            var radius = 2f
+            when {
+                // 虹膜（最高优先级）
+                iris && index in IRIS_CENTER_INDICES -> { paint = irisCenterPaint; radius = 6f }
+                iris && index in IRIS_ALL_INDICES -> { paint = irisEdgePaint; radius = 4f }
+
+                // 眼睛
+                keyPoints && index in IMAGE_RIGHT_EYE_INDICES -> { paint = imageRightEyePaint; radius = 4f }
+                keyPoints && index in IMAGE_LEFT_EYE_INDICES -> { paint = imageLeftEyePaint; radius = 4f }
+
+                // 眉毛
+                keyPoints && index in IMAGE_RIGHT_EYEBROW_INDICES -> { paint = imageRightEyebrowPaint; radius = 4f }
+                keyPoints && index in IMAGE_LEFT_EYEBROW_INDICES -> { paint = imageLeftEyebrowPaint; radius = 4f }
+
+                // 鼻子
+                keyPoints && index in NOSE_INDICES -> { paint = nosePaint; radius = 4f }
+
+                // 嘴巴（三个关键点的亮绿标记保持原逻辑）
+                keyPoints && index in MOUTH_OUTER_INDICES -> { paint = mouthOuterPaint; radius = 4f }
+                keyPoints && index in MOUTH_INNER_INDICES && index == FaceLandmarkIndices.Mouth.INNER_FULL[0] -> { paint = mouthInnerKeyPaint; radius = 3f }
+                keyPoints && index in MOUTH_INNER_INDICES && index == FaceLandmarkIndices.Mouth.INNER_FULL[10] -> { paint = mouthInnerKeyPaint; radius = 3f }
+                keyPoints && index in MOUTH_INNER_INDICES && index == FaceLandmarkIndices.Mouth.INNER_FULL[5] -> { paint = mouthInnerKeyPaint; radius = 3f }
+                keyPoints && index in MOUTH_INNER_INDICES -> { paint = mouthInnerPaint; radius = 3f }
+
+                // 脸部轮廓
+                keyPoints && index in FACE_OVAL_INDICES -> { paint = faceOvalPaint; radius = 3f }
+            }
+            lutPaint[index] = paint
+            lutRadius[index] = radius
+        }
     }
     
     override fun onDetachedFromWindow() {

@@ -108,6 +108,15 @@ public:
     
     [[nodiscard]] std::string lastError() const { return last_error_; }
 
+    /**
+     * @brief 当前 session **真实**跑在 Vulkan 上吗？
+     *
+     * 由 loadModel() 在 createSession 之后用 MNN getSessionInfo(BACKENDS) 探测，
+     * 而不是「请求了什么」。设备上装不到 Vulkan 后端时 createSession(VULKAN)
+     * 会静默退到 CPU（backupType 默认 CPU），所以必须看这个值。
+     */
+    [[nodiscard]] bool isVulkanActive() const { return vulkan_active_; }
+
     // ========== Debug ==========
     
     static void setDumpDirectory(const std::string& dir);
@@ -120,6 +129,12 @@ private:
     void decodeBoxes(const float* raw_boxes, const float* raw_scores,
                      std::vector<FaceDetection>& detections,
                      float score_threshold);
+
+    // 先用 scores（896 × 4B）判断是否存在过阈值的候选：没有就跳过 57 KB 的
+    // regressor 回读与整个 decode/NMS。sigmoid 单调，这里用反解出的 logit 阈值
+    // 比较，避免 num_scores 次 exp。
+    static bool hasDetectionCandidate(const float* raw_scores, int num_scores,
+                                      float score_threshold);
 
     // Non-maximum suppression (weighted NMS like MediaPipe)
     static void nms(std::vector<FaceDetection>& input,
@@ -152,6 +167,9 @@ private:
     int input_h_ = 128;
     int input_w_ = 128;
     int input_c_ = 3;
+
+    // createSession 之后探测到的真实后端（true = 确实跑在 Vulkan 上）。
+    bool vulkan_active_ = false;
 
     // SSD anchors
     std::vector<Anchor> anchors_;

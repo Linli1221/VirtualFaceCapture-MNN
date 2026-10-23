@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 #ifdef __ARM_NEON__
 #include <arm_neon.h>
@@ -101,6 +102,136 @@ extern "C" void convertYuvToRgbRotated(
         }
     }
 }
+
+/**
+ * YUV420 -> **BGRA** (little-endian ARGB_8888: B,G,R,A) with rotation and
+ * optional nearest-neighbour down-scale.
+ *
+ * 语义与 convertYuvToRgbRotated() 逐像素一致：旋转映射关系完全相同，只是
+ * 1) 输出改成 4 字节 BGRA（A 固定 255）；
+ * 2) 允许输出尺寸小于旋转后的全尺寸：dst 像素 (x,y) 先映射回 rotated 空间
+ *    (x*sx, y*sy)，sx = rotatedW/outWidth、sy = rotatedH/outHeight，再做同样的
+ *    旋转反查。outW/outH 等于 rotated 尺寸时与旧函数完全等价。
+ *
+ * 用途：预览路径。Kotlin 那份逐像素实现（Camera2Manager.yuv420ToRgbRotatedKotlin）
+ * 在 720p 上要跑 92 万次循环 + 3 次 ByteBuffer.get，这里换成一趟 C++ 循环，
+ * 并且把每个 dstX / dstY 的源坐标预计算成表，内层循环只剩查表 + 整数乘加。
+ */
+extern "C" void convertYuvToBgraRotated(
+    const uint8_t* yData,
+    const uint8_t* uData,
+    const uint8_t* vData,
+    int yRowStride,
+    int uvRowStride,
+    int uvPixelStride,
+    int srcWidth,
+    int srcHeight,
+    int rotation,
+    uint8_t* bgraOut,
+    int outWidth,
+    int outHeight
+) {
+    if (yData == nullptr || uData == nullptr || vData == nullptr || bgraOut == nullptr) {
+        return;
+    }
+    if (srcWidth <= 0 || srcHeight <= 0 || outWidth <= 0 || outHeight <= 0) {
+        return;
+    }
+
+    const bool swapSides = (rotation == 90 || rotation == 270);
+    // 旋转后（全尺寸）的画布尺寸。
+    const int rotatedW = swapSides ? srcHeight : srcWidth;
+    const int rotatedH = swapSides ? srcWidth : srcHeight;
+
+    // 每个 dstX / dstY 只需要算一次源坐标，内层循环查表。
+    static thread_local std::vector<int32_t> s_mapX;
+    static thread_local std::vector<int32_t> s_mapY;
+    s_mapX.resize(static_cast<size_t>(outWidth));
+    s_mapY.resize(static_cast<size_t>(outHeight));
+
+    for (int x = 0; x < outWidth; ++x) {
+        // rotated 空间的最近邻坐标（整数运算，避免浮点）。
+        int rx = static_cast<int>((static_cast<int64_t>(x) * rotatedW) / outWidth);
+        if (rx >= rotatedW) rx = rotatedW - 1;
+        if (rx < 0) rx = 0;
+
+        int coord;
+        switch (rotation) {
+            case 90:
+                coord = rotatedW - 1 - rx;        // = srcY
+                break;
+            case 180:
+                coord = srcWidth - 1 - rx;        // = srcX
+                break;
+            case 270:
+                coord = rx;                       // = srcY
+                break;
+            default: // 0
+                coord = rx;                       // = srcX
+                break;
+        }
+        s_mapX[x] = coord;
+    }
+
+    for (int y = 0; y < outHeight; ++y) {
+        int ry = static_cast<int>((static_cast<int64_t>(y) * rotatedH) / outHeight);
+        if (ry >= rotatedH) ry = rotatedH - 1;
+        if (ry < 0) ry = 0;
+
+        int coord;
+        switch (rotation) {
+            case 90:
+                coord = ry;                       // = srcX
+                break;
+            case 180:
+                coord = srcHeight - 1 - ry;       // = srcY
+                break;
+            case 270:
+                coord = rotatedH - 1 - ry;        // = srcX
+                break;
+            default: // 0
+                coord = ry;                       // = srcY
+                break;
+        }
+        s_mapY[y] = coord;
+    }
+
+    for (int dstY = 0; dstY < outHeight; ++dstY) {
+        // 90/270 时 x 轴贡献的是 srcY、y 轴贡献的是 srcX，这里统一成 swap。
+        const int srcXBase = swapSides ? s_mapY[dstY] : 0;
+        const int srcYBase = swapSides ? 0 : s_mapY[dstY];
+
+        for (int dstX = 0; dstX < outWidth; ++dstX) {
+            int srcX = swapSides ? srcXBase : s_mapX[dstX];
+            int srcY = swapSides ? s_mapX[dstX] : srcYBase;
+
+            // 表已经保证在 rotated 范围内，这里只做一次防御性 clamp。
+            if (srcX < 0) srcX = 0;
+            if (srcX >= srcWidth) srcX = srcWidth - 1;
+            if (srcY < 0) srcY = 0;
+            if (srcY >= srcHeight) srcY = srcHeight - 1;
+
+            const int yIndex = srcY * yRowStride + srcX;
+            const int yVal = yData[yIndex];
+
+            const int uvIndex = (srcY / 2) * uvRowStride + (srcX / 2) * uvPixelStride;
+            const int u = uData[uvIndex] - 128;
+            const int v = vData[uvIndex] - 128;
+
+            // 与 convertYuvToRgbRotated 相同的定点系数。
+            const int r = yVal + ((351 * v) >> 8);
+            const int g = yVal - ((86 * u + 179 * v) >> 8);
+            const int b = yVal + ((443 * u) >> 8);
+
+            const int outIndex = (dstY * outWidth + dstX) * 4;
+            bgraOut[outIndex + 0] = clamp(b);
+            bgraOut[outIndex + 1] = clamp(g);
+            bgraOut[outIndex + 2] = clamp(r);
+            bgraOut[outIndex + 3] = 255;
+        }
+    }
+}
+
 
 #if defined(__ARM_NEON__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -446,6 +577,59 @@ Java_com_example_mediapipefacelandmark_YuvConverter_nativeConvertYuvToRgb(
     // Fallback to scalar with rotation
     convertYuvToRgbRotated(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
                           srcWidth, srcHeight, rotation, rgbOut, outWidth, outHeight);
+}
+
+/**
+ * JNI method for YUV to BGRA conversion with rotation (preview path)
+ *
+ * 对应 Kotlin: YuvConverter.nativeConvertYuvToBgra(...)
+ * 输出缓冲必须是 direct ByteBuffer，容量 >= outWidth * outHeight * 4。
+ * 小端 ARGB_8888 的内存布局即 B,G,R,A。
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_mediapipefacelandmark_YuvConverter_nativeConvertYuvToBgra(
+    JNIEnv* env,
+    jobject clazz,
+    jobject yBuffer,
+    jobject uBuffer,
+    jobject vBuffer,
+    jint yRowStride,
+    jint uvRowStride,
+    jint uvPixelStride,
+    jint srcWidth,
+    jint srcHeight,
+    jint rotation,
+    jobject bgraBuffer,
+    jint outWidth,
+    jint outHeight
+) {
+    auto* yData = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuffer));
+    auto* uData = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuffer));
+    auto* vData = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuffer));
+    auto* bgraOut = static_cast<uint8_t*>(env->GetDirectBufferAddress(bgraBuffer));
+
+    if (!yData || !uData || !vData || !bgraOut) {
+        LOGE("Failed to get buffer addresses (BGRA)");
+        return;
+    }
+
+    if (outWidth <= 0 || outHeight <= 0 || srcWidth <= 0 || srcHeight <= 0) {
+        LOGE("Invalid dimensions (BGRA): src=%dx%d out=%dx%d",
+             srcWidth, srcHeight, outWidth, outHeight);
+        return;
+    }
+
+    // 输出容量兜底：容量不足时直接返回，避免写越界（真机上这类越界极难定位）。
+    const jlong capacity = env->GetDirectBufferCapacity(bgraBuffer);
+    const jlong required = static_cast<jlong>(outWidth) * static_cast<jlong>(outHeight) * 4;
+    if (capacity >= 0 && capacity < required) {
+        LOGE("BGRA output buffer too small: capacity=%lld < required=%lld",
+             static_cast<long long>(capacity), static_cast<long long>(required));
+        return;
+    }
+
+    convertYuvToBgraRotated(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
+                            srcWidth, srcHeight, rotation, bgraOut, outWidth, outHeight);
 }
 
 /**

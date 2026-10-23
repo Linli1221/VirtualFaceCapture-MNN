@@ -17,6 +17,9 @@
 #undef FACE_LOG_TAG
 #define FACE_LOG_TAG "FaceLandmarker"
 
+// MNN 会话配置 + 真实后端探测（必须在 FACE_LOG_TAG 之后包含，日志才会用本模块 tag）
+#include "common/mnn_session_util.h"
+
 // Use filter types from mnncv namespace
 using mnncv::UnifiedLandmarksSmoothingFilter;
 using mnncv::SmoothingFilterType;
@@ -129,6 +132,7 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads,
     input_host_tensor_.reset();
     landmarks_output_host_.reset();
     flag_output_host_.reset();
+    vulkan_active_ = false;
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -137,17 +141,35 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads,
         return false;
     }
     
+    // 只保留会话本身，不留 op 级回调信息（setSessionMode 必须在 createSession 之前调）。
+    interpreter_->setSessionMode(MNN::Interpreter::Session_Release);
+
     MNN::ScheduleConfig config;
-    config.numThread = num_threads;
-    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
-    backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
-    config.backendConfig = &backendCfg;
+    applyScheduleConfig(config, backendCfg, use_vulkan, num_threads);
     
     session_ = interpreter_->createSession(config);
     if (!session_) {
         last_error_ = "createSession failed";
         return false;
+    }
+    
+    // 请求的后端不等于真实后端：createSession(VULKAN) 在设备上装不到 Vulkan 时会
+    // 静默退到 CPU，所以这里必须探测一次真实 backend 并记到成员里。
+    int raw_backends[4] = {-1, -1, -1, -1};
+    vulkan_active_ = sessionVulkanActive(interpreter_.get(), session_, raw_backends);
+    if (use_vulkan && !vulkan_active_) {
+        FACE_LOGE("MNN backend[landmarker]: request=Vulkan actual=%s backends=[%d,%d,%d,%d] mnn=%s "
+                  "- requested Vulkan but the real backend is NOT Vulkan "
+                  "(libMNN_Vulkan.so not loaded, or the device/driver does not support it)",
+                  backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
+    } else {
+        FACE_LOGI("MNN backend[landmarker]: request=%s actual=%s backends=[%d,%d,%d,%d] mnn=%s",
+                  backendLabel(use_vulkan), backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
     }
     
     input_tensor_ = interpreter_->getSessionInput(session_, nullptr);
@@ -174,7 +196,7 @@ bool FaceLandmarker::loadModel(const std::string& mnn_path, int num_threads,
     
     FACE_LOGI("Face landmarker model loaded: %dx%dx%d (backend=%s, threads=%d)",
               input_w_, input_h_, input_c_,
-              use_vulkan ? "Vulkan" : "CPU", num_threads);
+              vulkan_active_ ? "Vulkan" : "CPU", num_threads);
     return true;
 }
 
@@ -441,12 +463,21 @@ FaceLandmarksResult FaceLandmarker::detect(const uint8_t* img_data, int img_widt
     preprocessImage(img_data, img_width, img_height,
                     center_x, center_y, width, height, rotation,
                     input_host_tensor_.get());
+    PERF_START(upload_timer);
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
+    PERF_END(upload_timer, s_perf_profiler.upload);
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
     PERF_START(inference_timer);
-    interpreter_->runSession(session_);
+    {
+        // runSession 的返回码以前被忽略：Vulkan OOM / 后端不可用时会被当成「有输出」。
+        const MNN::ErrorCode code = interpreter_->runSession(session_);
+        if (code != MNN::NO_ERROR) {
+            FACE_LOGE("runSession failed: code=%d (backend=%s)",
+                      static_cast<int>(code), vulkan_active_ ? "Vulkan" : "CPU");
+        }
+    }
     PERF_END(inference_timer, s_perf_profiler.inference);
     
     PERF_START(postprocess_timer);
@@ -469,12 +500,18 @@ FaceLandmarksResult FaceLandmarker::detect(const uint8_t* img_data, int img_widt
         flag_output_host_ = std::unique_ptr<MNN::Tensor>(
             new MNN::Tensor(face_flag_tensor, MNN::Tensor::CAFFE));
     }
-    landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+
+    // ---- Readback（条件化）----
+    // 先只回读 presence（4 B）：没脸时不必回读 5.7 KB 关键点，也少一次同步点。
+    PERF_START(readback_timer);
     face_flag_tensor->copyToHostTensor(flag_output_host_.get());
     float raw_score = flag_output_host_->host<float>()[0];
     result.presence_score = 1.0f / (1.0f + std::exp(-raw_score));
-
     result.presence = result.presence_score >= presence_threshold;
+    if (result.presence) {
+        landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+    }
+    PERF_END(readback_timer, s_perf_profiler.readback);
     
     if (result.presence) {
         decodeLandmarks(landmarks_output_host_->host<float>(), center_x, center_y, 
@@ -579,6 +616,7 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
     }
 
     // ---- Pack YUV: face ROI when it is clearly cheaper, whole frame otherwise ----
+    PERF_START(pack_timer);
     const uint8_t* yuvSrc = nullptr;
     bool roiPacked = false;
 
@@ -624,6 +662,7 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
                       fastHit ? "zero-copy NV12/NV21" : "repacked", srcWidth, srcHeight);
         }
     }
+    PERF_END(pack_timer, s_perf_profiler.pack);
 
     PERF_START(preprocess_timer);
 
@@ -639,12 +678,21 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
                                center_x, center_y, width, height, face_rotation,
                                input_host_tensor_.get());
     }
+    PERF_START(upload_timer);
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
+    PERF_END(upload_timer, s_perf_profiler.upload);
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
     PERF_START(inference_timer);
-    interpreter_->runSession(session_);
+    {
+        // runSession 的返回码以前被忽略：Vulkan OOM / 后端不可用时会被当成「有输出」。
+        const MNN::ErrorCode code = interpreter_->runSession(session_);
+        if (code != MNN::NO_ERROR) {
+            FACE_LOGE("runSession failed: code=%d (backend=%s)",
+                      static_cast<int>(code), vulkan_active_ ? "Vulkan" : "CPU");
+        }
+    }
     PERF_END(inference_timer, s_perf_profiler.inference);
     
     PERF_START(postprocess_timer);
@@ -667,12 +715,18 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
         flag_output_host_ = std::unique_ptr<MNN::Tensor>(
             new MNN::Tensor(face_flag_tensor, MNN::Tensor::CAFFE));
     }
-    landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+
+    // ---- Readback（条件化）----
+    // 先只回读 presence（4 B）：没脸时不必回读 5.7 KB 关键点，也少一次同步点。
+    PERF_START(readback_timer);
     face_flag_tensor->copyToHostTensor(flag_output_host_.get());
     float raw_score = flag_output_host_->host<float>()[0];
     result.presence_score = 1.0f / (1.0f + std::exp(-raw_score));
-
     result.presence = result.presence_score >= presence_threshold;
+    if (result.presence) {
+        landmarks_tensor->copyToHostTensor(landmarks_output_host_.get());
+    }
+    PERF_END(readback_timer, s_perf_profiler.readback);
     
     if (result.presence) {
         decodeLandmarks(landmarks_output_host_->host<float>(), center_x, center_y,

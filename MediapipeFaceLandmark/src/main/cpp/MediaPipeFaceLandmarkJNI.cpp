@@ -178,11 +178,17 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInit(
     g_hasHeadPose = false;
     
     // Create detector + landmarker (+ optional blendshape) on the current backend.
-    // If Vulkan cannot be created on this device, fall back to the CPU backend
-    // instead of failing initialization outright.
-    bool ok = createModelsLocked(g_use_vulkan.load());
-    if (!ok && g_use_vulkan.load()) {
-        LOGI("Vulkan backend unavailable, falling back to MNN CPU backend");
+    // 「请求了 Vulkan」不等于「真的跑在 Vulkan 上」：设备上装不到 Vulkan 后端时
+    // createSession() 会静默退到 CPU（backupType 默认 CPU）。所以这里以 detector
+    // 的**真实**后端为准，不匹配就当作失败，显式回退到 MNN CPU 后端。
+    const bool want_vulkan = g_use_vulkan.load();
+    bool ok = createModelsLocked(want_vulkan);
+    if (ok && want_vulkan && g_faceDetector && !g_faceDetector->isVulkanActive()) {
+        LOGE("Requested Vulkan but the real backend is CPU "
+             "(libMNN_Vulkan.so missing or unsupported); falling back to CPU");
+        ok = false;
+    }
+    if (!ok && want_vulkan) {
         ok = createModelsLocked(false);
         if (ok) {
             g_use_vulkan.store(false);
@@ -195,7 +201,8 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInit(
     }
     
     LOGI("MediaPipe face models initialized (backend=%s, threads=%d)",
-         g_use_vulkan.load() ? "Vulkan" : "CPU", g_num_threads);
+         (g_faceDetector && g_faceDetector->isVulkanActive()) ? "Vulkan" : "CPU",
+         g_num_threads);
     return JNI_TRUE;
 }
 
@@ -272,8 +279,31 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetBackend(
         }
     }
     
+    // 三个模型都按请求的后端重载完了，但「请求」不等于「成功」：
+    // createSession(VULKAN) 在装不到 Vulkan 时会静默退到 CPU。以 detector 的
+    // **真实**后端做最终判定，不一致就回滚三个模型并返回 JNI_FALSE，
+    // 这样 Kotlin 侧的 getBackend() / 并行度 / UI 才不会被骗。
+    const bool actual_vulkan = g_faceDetector->isVulkanActive();
+    if (actual_vulkan != want_vulkan) {
+        LOGE("Backend switch rejected: requested %s but actual is %s; rolling back",
+             want_vulkan ? "Vulkan" : "CPU", actual_vulkan ? "Vulkan" : "CPU");
+        g_faceDetector->loadModel(g_detector_model_path, g_num_threads, previous_vulkan);
+        g_faceLandmarker->loadModel(g_landmarker_model_path, g_num_threads, previous_vulkan);
+        if (g_blendshapePredictor && !g_blendshape_model_path.empty()) {
+            if (!g_blendshapePredictor->loadModel(g_blendshape_model_path, g_num_threads,
+                                                  previous_vulkan)) {
+                LOGE("BlendShape rollback failed, blendshape prediction disabled");
+                g_blendshapePredictor.reset();
+            }
+        }
+        g_use_vulkan.store(previous_vulkan);
+        LOGI("Rolled back to %s", previous_vulkan ? "Vulkan" : "CPU");
+        return JNI_FALSE;
+    }
+    
     g_use_vulkan.store(want_vulkan);
-    LOGI("MNN backend switched to %s", want_vulkan ? "Vulkan" : "CPU");
+    LOGI("MNN backend switched to %s (actual=%s)",
+         want_vulkan ? "Vulkan" : "CPU", actual_vulkan ? "Vulkan" : "CPU");
     return JNI_TRUE;
 }
 
@@ -286,7 +316,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(
         JNIEnv* env,
         jobject /* this */) {
     
-    return g_use_vulkan.load() ? JNI_TRUE : JNI_FALSE;
+    // 返回**真实**后端，而不是「请求过的」后端：g_use_vulkan 只是意图，
+    // 设备上装不到 Vulkan 时 session 实际跑在 CPU 上。以 slot 0 的 detector 为准。
+    const EngineSlot& slot = g_engines[0];
+    if (!slot.detector) {
+        return JNI_FALSE;
+    }
+    return slot.detector->isVulkanActive() ? JNI_TRUE : JNI_FALSE;
 }
 
 // ===========================================================================
@@ -368,8 +404,7 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInitEngine(
     const bool want_vulkan = (useVulkan == JNI_TRUE);
 
     auto landmarker = std::make_unique<FaceLandmarker>();
-    bool backend = want_vulkan;
-    if (!landmarker->loadModel(g_landmarker_model_path, threads, backend)) {
+    if (!landmarker->loadModel(g_landmarker_model_path, threads, want_vulkan)) {
         // 不做「Vulkan 失败就退 CPU」的回退：这一路存在的意义就是吃 GPU，
         // 退成 CPU 会去和重排 / 后处理抢核。交给 Kotlin 侧把并行度降一级即可。
         LOGE("Extra engine %d landmarker load failed (want=%s): %s",
@@ -378,13 +413,22 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeInitEngine(
         return JNI_FALSE;
     }
 
+    // 同上：请求 Vulkan 但实际不是 Vulkan（静默落 CPU）的槽位不能接受，
+    // 否则这一路会悄悄变成一条 CPU 推理线程，和主引擎抢核。
+    const bool actual_vulkan = landmarker->isVulkanActive();
+    if (want_vulkan && !actual_vulkan) {
+        LOGE("Extra engine %d requested Vulkan but the real backend is CPU; rejecting",
+             static_cast<int>(slotIndex));
+        return JNI_FALSE;
+    }
+
     slot.landmarker = std::move(landmarker);
-    slot.useVulkan.store(backend);
+    slot.useVulkan.store(actual_vulkan);
 
     // 相机 FOV / 滤波配置在 FaceLandmarker 里是静态（全局）状态，额外引擎自动共享，
     // 不需要像 session 那样再复制一份。
     LOGI("Extra engine %d ready: backend=%s, threads=%d",
-         static_cast<int>(slotIndex), backend ? "Vulkan" : "CPU", threads);
+         static_cast<int>(slotIndex), actual_vulkan ? "Vulkan" : "CPU", threads);
     return JNI_TRUE;
 }
 

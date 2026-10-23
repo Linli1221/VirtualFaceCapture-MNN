@@ -151,6 +151,15 @@ public:
     
     [[nodiscard]] std::string lastError() const { return last_error_; }
 
+    /**
+     * @brief 当前 session **真实**跑在 Vulkan 上吗？
+     *
+     * 由 loadModel() 在 createSession 之后用 MNN getSessionInfo(BACKENDS) 探测，
+     * 而不是「请求了什么」。设备上装不到 Vulkan 后端时 createSession(VULKAN)
+     * 会静默退到 CPU（backupType 默认 CPU），所以必须看这个值。
+     */
+    [[nodiscard]] bool isVulkanActive() const { return vulkan_active_; }
+
 private:
     // Transform face detection rect to landmarker input rect
     static void transformFaceRect(const FaceDetection& detection,
@@ -229,6 +238,9 @@ private:
     int input_h_ = 192;
     int input_w_ = 192;
     int input_c_ = 3;
+
+    // createSession 之后探测到的真实后端（true = 确实跑在 Vulkan 上）。
+    bool vulkan_active_ = false;
 
     // Number of landmarks (468 mesh + 10 iris)
     static constexpr int kNumLandmarks = 478;

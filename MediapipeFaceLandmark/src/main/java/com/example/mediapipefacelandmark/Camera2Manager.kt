@@ -208,6 +208,14 @@ class Camera2Manager(private val context: Context) {
         private const val PREVIEW_INTERVAL_NS = 33_000_000L
 
         /**
+         * native BGRA 预览连续失败多少次就**永久**降级到纯 Kotlin 回退。
+         *
+         * 每帧进一次 JNI 抛异常比回退本身还贵，所以失败几次之后就不再尝试；
+         * 下一次 startCamera() 会重置计数（见 [startCameraInternal]）。
+         */
+        private const val MAX_PREVIEW_BGRA_FAILURES = 5
+
+        /**
          * 判定「相机没在跑 60fps」的交付帧率下限。
          *
          * 58fps 这类读数属于正常抖动，不触发降档；低于 50fps 才认为相机侧确实
@@ -481,8 +489,17 @@ class Camera2Manager(private val context: Context) {
     }
 
     /**
-     * Set callback for frame processing (legacy RGB mode)
-     * The callback receives rotated RGB data
+     * Set callback for frame processing.
+     *
+     * **格式契约（2026-10 起，注意区别）**：
+     *  - `useDirectYuvMode = true`（默认，面捕主路径）：本回调只用于**调试预览**，
+     *    收到的是**旋转 + 1/2 降采样后的 BGRA_8888**（`Bitmap.Config.ARGB_8888`
+     *    在小端设备上的内存布局，每像素 4 字节 B,G,R,A），尺寸见回调的 width/height；
+     *  - `useDirectYuvMode = false`（legacy RGB 模式）：仍按旧约定收到**旋转后的整帧
+     *    RGB888**（每像素 3 字节），并同时驱动检测 / 关键点。
+     *
+     * 上层渲染请按 `width * height * 4` / `width * height * 3` 的容量区分这两种帧，
+     * 参考 `CameraPreviewView.updateCameraFrame`。
      */
     fun setFrameCallback(callback: (ByteBuffer, Int, Int) -> Unit) {
         this.frameCallback = callback
@@ -547,6 +564,11 @@ class Camera2Manager(private val context: Context) {
         activeFpsRange = null
         lastCaptureResultKey = null
         lastPreviewFrameNs = 0L
+        // 重开相机时给 native BGRA 预览一次全新的机会（上次失败可能是会话/尺寸导致的）
+        previewBgraFailures = 0
+        reusableBgraBuffer = null
+        previewOutWidth = 0
+        previewOutHeight = 0
         // 上一轮若因 HAL 拒绝 SENSOR_FRAME_DURATION 关了钉帧率，重开时重新尝试，
         // 否则一次回退会让之后每次采集都停在 30fps。
         pinFrameRate = true
@@ -1370,6 +1392,19 @@ class Camera2Manager(private val context: Context) {
     private var reusableRgbBuffer: ByteBuffer? = null
     private var cachedRotation: Int = -1
 
+    // ---- 预览专用 BGRA 输出（复用；尺寸变化才重建）---------------------------
+    //
+    // 与 [reusableRgbBuffer] 刻意分开：RGB 缓冲留给旧的 RGB 路径，预览这条
+    // BGRA 快路径自己独占一块，两条路径不会互相踩内容。
+    private var reusableBgraBuffer: ByteBuffer? = null
+
+    /** 最近一次 BGRA 预览输出的尺寸（有效字节数 = w * h * 4）。 */
+    private var previewOutWidth = 0
+    private var previewOutHeight = 0
+
+    /** native BGRA 预览连续失败次数；超过 [MAX_PREVIEW_BGRA_FAILURES] 后只走 Kotlin 回退。 */
+    private var previewBgraFailures = 0
+
     // Check if native YUV converter is available
     private val useNativeConverter: Boolean by lazy {
         try {
@@ -1492,12 +1527,12 @@ class Camera2Manager(private val context: Context) {
     }
 
     /**
-     * 预览 RGB 限速：同一时间窗口内最多转换一帧。
+     * 预览限速：同一时间窗口内最多生成一帧（[PREVIEW_INTERVAL_NS] = 33 ms ⇒ 30 fps）。
      *
-     * 预览是相机线程上最重的一段（整帧 YUV→RGB + RGB→ARGB + Bitmap 上传），
-     * 720p 60fps 时每帧要处理约 2.7MB。预览只要看着不卡即可，30fps 足够；
-     * 把它减半后，相机回调能稳定在 16.7ms 预算内，ImageReader 不再因为回调慢
-     * 而丢帧，`cameraDeliveredFps` 才能真的跑满 60。
+     * 改造前这里是相机线程上最重的一段（整帧 YUV→RGB 2.7 MB + Kotlin 逐像素打包
+     * + setPixels，单帧 6~11 ms）。现在只做「旋转 + 1/2 降采样 + YUV→BGRA」一次
+     * native 转换（640×360 量级），再交给 [CameraPreviewView] 直接
+     * `copyPixelsFromBuffer`。限速保留：预览 30 fps 足够，把预算留给面捕。
      */
     private fun maybeConvertPreviewFrame(image: android.media.Image) {
         val now = System.nanoTime()
@@ -1721,13 +1756,210 @@ class Camera2Manager(private val context: Context) {
     }
     
     /**
-     * Convert YUV to RGB for preview display only (used in YUV direct mode)
-     * This is separate from main processing - just for debug visualization
+     * 生成预览帧（**BGRA_8888**，供 `Bitmap.copyPixelsFromBuffer` 直接消费）。
+     *
+     * 与旧实现的区别：这里不再产出「旋转后的整帧 RGB」，而是让 native 一次性完成
+     * 「旋转 + 1/2 降采样 + YUV→BGRA」，Kotlin 侧只算尺寸、复用一块 direct
+     * ByteBuffer —— 相机线程上不再有 2.7 MB 的 RGB 中转，也没有 92 万次逐像素打包。
+     *
+     * 回退：native 不可用 / 连续失败 [MAX_PREVIEW_BGRA_FAILURES] 次后，改用纯 Kotlin
+     * 直接写 BGRA（同样是 1/2 降采样）。两条路都保证「有画面、不崩、不黑屏」。
      */
     private fun processYuvToRgbForPreview(image: android.media.Image) {
-        val (rgbBuffer, outWidth, outHeight) = yuv420ToRgbRotated(image)
-        // Call preview callback without performance tracking
-        frameCallback?.invoke(rgbBuffer, outWidth, outHeight)
+        val tryNative = useNativeConverter && previewBgraFailures < MAX_PREVIEW_BGRA_FAILURES
+        val ok = try {
+            convertPreviewToBgra(image, tryNative)
+        } catch (t: Throwable) {
+            // 任何意外都只丢这一帧预览，绝不让相机线程挂掉（面捕还在这条线程上）
+            Log.e(TAG, "Preview BGRA conversion failed, dropping frame", t)
+            false
+        }
+        if (!ok) return
+        val buffer = reusableBgraBuffer ?: return
+        frameCallback?.invoke(buffer, previewOutWidth, previewOutHeight)
+    }
+
+    /**
+     * YUV_420_888 → 1/2 降采样的 BGRA，写进复用的 [reusableBgraBuffer]。
+     *
+     * 输出尺寸推导（[rotation] 为顺时针旋转角，与 [processYuvDirect] 同口径）：
+     * ```
+     * rotatedW/H = if (rotation == 90 || rotation == 270) (srcH, srcW) else (srcW, srcH)
+     * outW = max(2, (rotatedW / 2) and -2)   // 向下取到 2 的倍数
+     * outH = max(2, (rotatedH / 2) and -2)
+     * required = outW * outH * 4
+     * ```
+     * 取 2 的倍数是为了让每个输出像素都落在完整的 UV 2×2 块上（最近邻采样不会出现
+     * 半像素错位），同时让 Bitmap 的每行字节数 4 字节对齐。
+     *
+     * @param tryNative false = 直接走纯 Kotlin 回退（native 已被判定不可用）
+     * @return true = [reusableBgraBuffer] 里已经是本帧的 BGRA，可以回调给上层
+     */
+    private fun convertPreviewToBgra(image: android.media.Image, tryNative: Boolean): Boolean {
+        val srcWidth = image.width
+        val srcHeight = image.height
+        if (srcWidth <= 0 || srcHeight <= 0) return false
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val rotation = getRotationDegrees()
+
+        val rotatedWidth: Int
+        val rotatedHeight: Int
+        if (rotation == 90 || rotation == 270) {
+            rotatedWidth = srcHeight
+            rotatedHeight = srcWidth
+        } else {
+            rotatedWidth = srcWidth
+            rotatedHeight = srcHeight
+        }
+
+        var outWidth = (rotatedWidth / 2) and 1.inv()
+        var outHeight = (rotatedHeight / 2) and 1.inv()
+        if (outWidth < 2) outWidth = 2
+        if (outHeight < 2) outHeight = 2
+
+        val required = outWidth * outHeight * 4
+        val buffer = reusableBgraBuffer?.takeIf { it.capacity() >= required }
+            ?: ByteBuffer.allocateDirect(required).also { fresh ->
+                reusableBgraBuffer = fresh
+                Log.i(
+                    TAG,
+                    "Preview BGRA buffer ${outWidth}x${outHeight} ($required B), " +
+                        "src=${srcWidth}x$srcHeight rotation=$rotation",
+                )
+            }
+        buffer.clear()
+        previewOutWidth = outWidth
+        previewOutHeight = outHeight
+
+        if (tryNative) {
+            try {
+                YuvConverter.convertYuvToBgra(
+                    yPlane.buffer, uPlane.buffer, vPlane.buffer,
+                    yPlane.rowStride, uPlane.rowStride, uPlane.pixelStride,
+                    srcWidth, srcHeight, rotation,
+                    buffer, outWidth, outHeight,
+                )
+                buffer.position(0)
+                buffer.limit(required)
+                return true
+            } catch (t: Throwable) {
+                previewBgraFailures++
+                if (previewBgraFailures == 1 || previewBgraFailures % 60 == 0) {
+                    Log.w(
+                        TAG,
+                        "Preview BGRA (native) failed #$previewBgraFailures, " +
+                            "using Kotlin fallback: ${t.message}",
+                    )
+                }
+                buffer.clear()
+            }
+        }
+
+        return fillPreviewBgraKotlin(
+            yPlane.buffer, uPlane.buffer, vPlane.buffer,
+            yPlane.rowStride, uPlane.rowStride, uPlane.pixelStride,
+            srcWidth, srcHeight, rotation,
+            buffer, outWidth, outHeight,
+        )
+    }
+
+    /**
+     * 纯 Kotlin 回退：YUV → 1/2 降采样 BGRA。
+     *
+     * 映射与 [yuv420ToRgbRotatedKotlin] 逐位一致（先「输出坐标 → 旋转后坐标」的最近邻
+     * 反查，再按旋转角映射回源图），只是输出从 3 字节 RGB 换成 4 字节 BGRA
+     * （A 恒为 255），这样上层 [CameraPreviewView.updateCameraFrame] 只需要一条路径。
+     *
+     * 只在 native 转换不可用时执行，量级约 23 万像素 × 30 fps。
+     */
+    private fun fillPreviewBgraKotlin(
+        yBuffer: ByteBuffer,
+        uBuffer: ByteBuffer,
+        vBuffer: ByteBuffer,
+        yRowStride: Int,
+        uvRowStride: Int,
+        uvPixelStride: Int,
+        srcWidth: Int,
+        srcHeight: Int,
+        rotation: Int,
+        out: ByteBuffer,
+        outWidth: Int,
+        outHeight: Int,
+    ): Boolean {
+        val rotatedWidth = if (rotation == 90 || rotation == 270) srcHeight else srcWidth
+        val rotatedHeight = if (rotation == 90 || rotation == 270) srcWidth else srcHeight
+        if (rotatedWidth <= 0 || rotatedHeight <= 0) return false
+
+        val yLimit = yBuffer.limit()
+        val uLimit = uBuffer.limit()
+        val vLimit = vBuffer.limit()
+
+        for (outY in 0 until outHeight) {
+            val rotatedY = outY * rotatedHeight / outHeight
+            for (outX in 0 until outWidth) {
+                val rotatedX = outX * rotatedWidth / outWidth
+                val srcX: Int
+                val srcY: Int
+                when (rotation) {
+                    90 -> {
+                        // 与 yuv420ToRgbRotatedKotlin 一致：dstWidth = srcHeight，
+                        // 因此 srcY 的上界是 rotatedWidth（= srcHeight），不是 rotatedHeight
+                        srcX = rotatedY
+                        srcY = rotatedWidth - 1 - rotatedX
+                    }
+                    180 -> {
+                        srcX = srcWidth - 1 - rotatedX
+                        srcY = srcHeight - 1 - rotatedY
+                    }
+                    270 -> {
+                        srcX = rotatedHeight - 1 - rotatedY
+                        srcY = rotatedX
+                    }
+                    else -> {
+                        srcX = rotatedX
+                        srcY = rotatedY
+                    }
+                }
+
+                val yIndex = srcY * yRowStride + srcX
+                val uvIndex = (srcY / 2) * uvRowStride + (srcX / 2) * uvPixelStride
+                // 用显式比较而不是 `in 0 until limit`：后者在内层循环里会构造 IntRange 对象
+                val luma = if (yIndex >= 0 && yIndex < yLimit) {
+                    yBuffer.get(yIndex).toInt() and 0xFF
+                } else {
+                    16
+                }
+                val cb = if (uvIndex >= 0 && uvIndex < uLimit) {
+                    uBuffer.get(uvIndex).toInt() and 0xFF
+                } else {
+                    128
+                }
+                val cr = if (uvIndex >= 0 && uvIndex < vLimit) {
+                    vBuffer.get(uvIndex).toInt() and 0xFF
+                } else {
+                    128
+                }
+
+                // BT.601 limited range → RGB（整数系数，与 YuvBitmapConverter 同口径）
+                val c = luma - 16
+                val d = cb - 128
+                val e = cr - 128
+                val r = ((298 * c + 409 * e + 128) shr 8).coerceIn(0, 255)
+                val g = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
+                val b = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
+
+                out.put(b.toByte())
+                out.put(g.toByte())
+                out.put(r.toByte())
+                out.put(0xFF.toByte())
+            }
+        }
+        out.position(0)
+        out.limit(outWidth * outHeight * 4)
+        return true
     }
     
     /**

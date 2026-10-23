@@ -172,6 +172,25 @@ class MediaPipeFaceDetector(private val context: Context) {
         const val BS_COUNT = 52
         
         init {
+            // ⚠️ 加载顺序很重要。
+            //
+            // MNN 的 Vulkan 后端是**独立的插件 .so**（libMNN_Vulkan.so），它靠自己的
+            // .init_array 调 MNNInsertExtraRuntimeCreator 把 Vulkan runtime 注册进
+            // libMNN.so 的注册表里；libMNN.so 本身既不含 Vulkan 代码，也没有任何
+            // dlopen 插件的路径。所以**没人 loadLibrary("MNN_Vulkan") 时，
+            // createSession(MNN_FORWARD_VULKAN) 只会静默退回 CPU** —— 症状正是
+            // 「推理帧率上不去 + CPU 跑满 + GPU 显存几乎不动」。
+            //
+            // 插件依赖 libMNN.so，链加载时会自动带起来，因此先加载它、再加载 JNI 库。
+            // 裁剪过的包 / 旧包里没有这个 so 时只告警，退回 CPU（与修复前行为一致）。
+            try {
+                System.loadLibrary("MNN_Vulkan")
+            } catch (t: Throwable) {
+                android.util.Log.w(
+                    "MediaPipeFaceDetector",
+                    "libMNN_Vulkan.so 不可用，MNN 将只能跑 CPU 后端: ${t.message}",
+                )
+            }
             System.loadLibrary("mediapipefacelandmark")
         }
     }

@@ -19,6 +19,9 @@
 #undef FACE_LOG_TAG
 #define FACE_LOG_TAG "FaceDetector"
 
+// MNN 会话配置 + 真实后端探测（必须在 FACE_LOG_TAG 之后包含，日志才会用本模块 tag）
+#include "common/mnn_session_util.h"
+
 // Use filter types from mnncv namespace
 using mnncv::UnifiedDetectionSmoothingFilter;
 using mnncv::SmoothingFilterType;
@@ -196,6 +199,7 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads,
     input_host_tensor_.reset();
     bbox_host_tensor_.reset();
     score_host_tensor_.reset();
+    vulkan_active_ = false;
     
     interpreter_ = std::shared_ptr<MNN::Interpreter>(
         MNN::Interpreter::createFromFile(mnn_path.c_str()));
@@ -204,17 +208,35 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads,
         return false;
     }
     
+    // 只保留会话本身，不留 op 级回调信息（setSessionMode 必须在 createSession 之前调）。
+    interpreter_->setSessionMode(MNN::Interpreter::Session_Release);
+
     MNN::ScheduleConfig config;
-    config.numThread = num_threads;
-    config.type = use_vulkan ? MNN_FORWARD_VULKAN : MNN_FORWARD_CPU;
     MNN::BackendConfig backendCfg;
-    backendCfg.precision = MNN::BackendConfig::Precision_Low_BF16;
-    config.backendConfig = &backendCfg;
+    applyScheduleConfig(config, backendCfg, use_vulkan, num_threads);
     
     session_ = interpreter_->createSession(config);
     if (!session_) {
         last_error_ = "createSession failed";
         return false;
+    }
+    
+    // 请求的后端不等于真实后端：createSession(VULKAN) 在设备上装不到 Vulkan 时会
+    // 静默退到 CPU，所以这里必须探测一次真实 backend 并记到成员里。
+    int raw_backends[4] = {-1, -1, -1, -1};
+    vulkan_active_ = sessionVulkanActive(interpreter_.get(), session_, raw_backends);
+    if (use_vulkan && !vulkan_active_) {
+        FACE_LOGE("MNN backend[detector]: request=Vulkan actual=%s backends=[%d,%d,%d,%d] mnn=%s "
+                  "- requested Vulkan but the real backend is NOT Vulkan "
+                  "(libMNN_Vulkan.so not loaded, or the device/driver does not support it)",
+                  backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
+    } else {
+        FACE_LOGI("MNN backend[detector]: request=%s actual=%s backends=[%d,%d,%d,%d] mnn=%s",
+                  backendLabel(use_vulkan), backendLabel(vulkan_active_),
+                  raw_backends[0], raw_backends[1], raw_backends[2], raw_backends[3],
+                  MNN::getVersion());
     }
     
     input_tensor_ = interpreter_->getSessionInput(session_, nullptr);
@@ -245,7 +267,7 @@ bool FaceDetector::loadModel(const std::string& mnn_path, int num_threads,
     
     FACE_LOGI("Face detector model loaded: %dx%dx%d (backend=%s, threads=%d)",
               input_w_, input_h_, input_c_,
-              use_vulkan ? "Vulkan" : "CPU", num_threads);
+              vulkan_active_ ? "Vulkan" : "CPU", num_threads);
     
     // Generate anchors for the model
     generateAnchors();
@@ -326,6 +348,33 @@ void FaceDetector::generateAnchors() {
     }
     
     FACE_LOGI("Generated %zu anchors for face detection", anchors_.size());
+}
+
+bool FaceDetector::hasDetectionCandidate(const float* raw_scores, int num_scores,
+                                         float score_threshold) {
+    if (raw_scores == nullptr || num_scores <= 0) {
+        return false;
+    }
+    // 阈值不在 (0,1) 内时退化为「总是回读」，保证与改动前的行为一致。
+    if (!(score_threshold > 0.0f && score_threshold < 1.0f)) {
+        return true;
+    }
+    // decodeBoxes 里的判定是 sigmoid(clamp(raw)) >= threshold，而 sigmoid 单调
+    // 递增，所以等价于 clamp(raw) >= logit(threshold)。这样只做浮点比较，
+    // 不需要为 896 个 anchor 各算一次 exp。
+    // 减 1e-4 是保守偏置：宁可多回读一次 57 KB，也不要因为浮点边界把恰好等于
+    // 阈值的框判成「没有候选」（否则会少一次检测）。
+    const float logit_threshold =
+        std::log(score_threshold / (1.0f - score_threshold)) - 1e-4f;
+    for (int i = 0; i < num_scores; ++i) {
+        float score = raw_scores[i];
+        if (score < -kScoreClippingThresh) score = -kScoreClippingThresh;
+        if (score > kScoreClippingThresh) score = kScoreClippingThresh;
+        if (score >= logit_threshold) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void FaceDetector::decodeBoxes(const float* raw_boxes, const float* raw_scores,
@@ -529,13 +578,23 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
     image_process_->convert(img_data, width, height, width * 3,
                             input_host_tensor_.get());
     
+    // 上传单独计时（RGB 路径没有 YUV 打包，所以不记 pack）。
+    PERF_START(upload_timer);
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
+    PERF_END(upload_timer, s_perf_profiler.upload);
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
     // ---- Inference ----
     PERF_START(inference_timer);
-    interpreter_->runSession(session_);
+    {
+        // runSession 的返回码以前被忽略：Vulkan OOM / 后端不可用时会被当成「有输出」。
+        const MNN::ErrorCode code = interpreter_->runSession(session_);
+        if (code != MNN::NO_ERROR) {
+            FACE_LOGE("runSession failed: code=%d (backend=%s)",
+                      static_cast<int>(code), vulkan_active_ ? "Vulkan" : "CPU");
+        }
+    }
     PERF_END(inference_timer, s_perf_profiler.inference);
     
     // ---- Postprocessing ----
@@ -573,14 +632,29 @@ std::vector<FaceDetection> FaceDetector::detect(const uint8_t* img_data,
         score_host_tensor_ = std::unique_ptr<MNN::Tensor>(
             new MNN::Tensor(score_tensor, score_tensor->getDimensionType()));
     }
-    bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+
+    // ---- Readback（条件化）----
+    // 先只回读 scores（896 × 4B = 3.5 KB）：没有任何 anchor 过阈值时，57 KB 的
+    // regressor 回读 + 两次 decode/NMS 全是白做。sigmoid 单调，所以可以直接把
+    // 阈值反解成 logit 比较，省掉 896 次 exp。
+    PERF_START(readback_timer);
     score_tensor->copyToHostTensor(score_host_tensor_.get());
+
+    const float* raw_scores = score_host_tensor_->host<float>();
+    const int num_scores = static_cast<int>(score_host_tensor_->elementSize());
+    const bool any_candidate =
+        hasDetectionCandidate(raw_scores, num_scores, score_threshold);
+    if (any_candidate) {
+        bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+    }
+    PERF_END(readback_timer, s_perf_profiler.readback);
     
     const float* raw_boxes = bbox_host_tensor_->host<float>();
-    const float* raw_scores = score_host_tensor_->host<float>();
     
     std::vector<FaceDetection> detections;
-    decodeBoxes(raw_boxes, raw_scores, detections, score_threshold);
+    if (any_candidate) {
+        decodeBoxes(raw_boxes, raw_scores, detections, score_threshold);
+    }
     nms(detections, results, iou_threshold);
     
     PERF_END(postprocess_timer, s_perf_profiler.postprocess);
@@ -663,6 +737,7 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     // Prepare the YUV input: use the zero-copy view when the camera hands us a
     // contiguous NV12/NV21 buffer, otherwise repack (reuses the member buffer:
     // resize only, no re-alloc). Detection always needs the full frame.
+    PERF_START(pack_timer);
     auto yuvFormat = yuv::detectFormat(uvPixelStride, uData, vData);
     const uint8_t* yuvSrc = nullptr;
     yuv::YuvFastView fastView;
@@ -675,6 +750,7 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
                            width, height, yuvFormat, yuv_buffer_);
         yuvSrc = yuv_buffer_.data();
     }
+    PERF_END(pack_timer, s_perf_profiler.pack);
     
     // Calculate output dimensions after rotation
     int srcWidth = width;
@@ -737,13 +813,22 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     image_process_->setMatrix(trans);
     image_process_->convert(yuvSrc, srcWidth, srcHeight, 0,
                             input_host_tensor_.get());
+    PERF_START(upload_timer);
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
+    PERF_END(upload_timer, s_perf_profiler.upload);
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);
     
     // ---- Inference ----
     PERF_START(inference_timer);
-    interpreter_->runSession(session_);
+    {
+        // runSession 的返回码以前被忽略：Vulkan OOM / 后端不可用时会被当成「有输出」。
+        const MNN::ErrorCode code = interpreter_->runSession(session_);
+        if (code != MNN::NO_ERROR) {
+            FACE_LOGE("runSession failed: code=%d (backend=%s)",
+                      static_cast<int>(code), vulkan_active_ ? "Vulkan" : "CPU");
+        }
+    }
     PERF_END(inference_timer, s_perf_profiler.inference);
     
     // ---- Postprocessing ----
@@ -781,12 +866,26 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
         score_host_tensor_ = std::unique_ptr<MNN::Tensor>(
             new MNN::Tensor(score_tensor, score_tensor->getDimensionType()));
     }
-    bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+    // ---- Readback（条件化）----
+    // 先只回读 scores（896 × 4B = 3.5 KB）：没有任何 anchor 过阈值时，57 KB 的
+    // regressor 回读 + 一次 decode/NMS 全是白做。
+    PERF_START(readback_timer);
     score_tensor->copyToHostTensor(score_host_tensor_.get());
+
+    const float* raw_scores = score_host_tensor_->host<float>();
+    const int num_scores = static_cast<int>(score_host_tensor_->elementSize());
+    const bool any_candidate =
+        hasDetectionCandidate(raw_scores, num_scores, score_threshold);
+    if (any_candidate) {
+        bbox_tensor->copyToHostTensor(bbox_host_tensor_.get());
+    }
+    PERF_END(readback_timer, s_perf_profiler.readback);
     
     std::vector<FaceDetection> detections;
-    decodeBoxes(bbox_host_tensor_->host<float>(), score_host_tensor_->host<float>(), 
-                detections, score_threshold);
+    if (any_candidate) {
+        decodeBoxes(bbox_host_tensor_->host<float>(), raw_scores,
+                    detections, score_threshold);
+    }
     nms(detections, results, iou_threshold);
     
     PERF_END(postprocess_timer, s_perf_profiler.postprocess);

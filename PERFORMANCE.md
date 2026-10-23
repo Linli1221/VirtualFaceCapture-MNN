@@ -611,3 +611,59 @@ delivered_fps ≈ min(传感器实际帧率, 1000 / 单次回调耗时)
 - 上半身转换仍在相机线程同步执行；ROI 限制了采样量，但峰值仍会进 `callback max`。
 - 本轮的 128p 检测分支**没有**新增 YUV→128p 预下采样：检测输入本来就是 128×128，
   MNN 只按输出像素采样，先下采样反而多读整帧（见 round2 文档 §4）。
+
+---
+
+## 13. 第三轮：Vulkan 从未真正启用（2026-10）
+
+现象：**面捕帧率低、CPU 占用极高、GPU 显存明显空闲**。
+
+### 13.1 根因（二进制级证据）
+
+MNN 的 Vulkan 后端不在 `libMNN.so` 里，而在**独立插件** `libMNN_Vulkan.so` 里，靠它自己的
+`.init_array` 调 `MNNInsertExtraRuntimeCreator` 完成注册。本工程：
+
+- `CMakeLists.txt` 只链接 `MNN` + `mnn_Express`，**没有** `MNN_Vulkan`；
+- Kotlin 侧只有 `System.loadLibrary("mediapipefacelandmark")`，**从没加载过插件**；
+- `libMNN.so` 里 `Vulkan` / `libMNN_Vulkan` / `glsl_*` 字符串与符号全是 0，也没有任何
+  `dlopen` 插件的路径 —— 它不会自己去加载。
+
+于是 `createSession(MNN_FORWARD_VULKAN)` 找不到 creator，MNN 会打印
+`Can't Find type=.. backend, use .. instead` 并**静默改用 CPU**、而且 `createSession` 仍返回成功。
+因此 `nativeGetBackend()`（旧实现返回"请求值"）和日志里的 `MNN backend: VULKAN` **一直是假的**；
+三个模型的每一帧都在 CPU 上跑。再叠加 `GPU_CHANNEL_DEFAULT = 2`（两路关键点引擎在 CPU 上抢核），
+就得到「CPU 极高 + GPU 显存空闲」。
+
+第二个与推理无关的大头：**手机预览**每帧在相机线程上做整帧 YUV→RGB（2.76 MB）+
+92 万次 Kotlin 逐像素打包 + `Bitmap.setPixels`，估算 6~11 ms/帧且常开（30 fps），
+把相机线程的 16.67 ms 预算吃掉一大半。
+
+### 13.2 改动
+
+| 层 | 改动 |
+|---|---|
+| 加载插件 | `MediaPipeFaceDetector` companion init 里**先** `System.loadLibrary("MNN_Vulkan")` 再加载 JNI 库；缺失时只告警、退回 CPU |
+| 真实后端断言 | 新增 `include/common/mnn_session_util.h`：`applyScheduleConfig()`（Vulkan 只写 `mode = MNN_GPU_TUNING_WIDE`，不再把 `numThread` 写进 union）+ `sessionVulkanActive()`（`getSessionInfo(BACKENDS)` 扫 4 个 int） |
+| 三个模型 | `setSessionMode(Session_Release)` → `createSession` → 探测真实后端 → 每个模型一行 `MNN backend[xxx]: request=.. actual=..`；`runSession` 检查 `ErrorCode` |
+| JNI / SDK | `nativeGetBackend` 返回真实值；`nativeInit` / `nativeSetBackend` / `nativeInitEngine` 以真实后端判定；只有实际在 Vulkan 上才开额外引擎（`PipelineFaceTracker`） |
+| 预览 | 新 native `convertYuvToBgraRotated()`（旋转 + 1/2 降采样 + YUV→BGRA，坐标表复用）；`CameraPreviewView` 只做一次 `Bitmap.copyPixelsFromBuffer()`，删除逐像素打包；叠加层 478 项 LUT + 文本 10 Hz 缓存 + 重绘 30 Hz 节流 |
+| 减法 | 关掉**从未被调用**的原生 blendshape 模型加载；首帧 PPM dump 只在 debug 包开；单路时跳过重排阶段；关键点/检测回读条件化；原生新增 `Pack/Upload/Readback` 三段计时 |
+
+### 13.3 验证状态
+
+**本机没有 JDK / Android SDK / NDK / 真机，未编译、未跑单测、未实测。** 全部改动只做了
+静态审查（括号/包含/JNI 符号名逐字核对；BGRA 旋转映射用 Python 与旧实现逐像素比对；
+logit 剪枝 20 万次随机试验 0 假阴性）。完整验证步骤见
+[`docs/perf/round3.md`](docs/perf/round3.md) §4，最短路径：
+
+1. `./gradlew :MediapipeFaceLandmark:assembleDebug :app:assembleDebug`；
+2. logcat 里确认三行 `MNN backend[...]: actual=Vulkan`（或明确的 `NOT Vulkan` + 回退日志）；
+3. 对比 `Camera callback: avg .. ms`（预期 6~11 → 1~2.5）与 `Landmark Detection`（唯一能证明
+   Vulkan 生效的数字）；
+4. 目视回归：0°/90°/270° 预览方向、镜像、颜色（BGRA 不得红蓝互换）。预览固定 1/2 降采样，
+   比改前软是**预期行为**。
+
+三份只读审计：[`docs/perf/round3-gpu.md`](docs/perf/round3-gpu.md)、
+[`docs/perf/round3-native.md`](docs/perf/round3-native.md)、
+[`docs/perf/round3-kotlin.md`](docs/perf/round3-kotlin.md)；本轮实现说明见
+[`docs/perf/round3.md`](docs/perf/round3.md)。

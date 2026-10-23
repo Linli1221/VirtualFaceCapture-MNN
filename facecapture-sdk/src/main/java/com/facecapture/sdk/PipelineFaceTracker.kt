@@ -1,6 +1,7 @@
 package com.facecapture.sdk
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
@@ -498,24 +499,48 @@ class PipelineFaceTracker(private val context: Context) {
         // 一旦切到 CPU 后端，它直接决定 landmark 推理耗时（也就是能不能上 60fps）。
         // 上限 4，避免长时间跑满大核之后触发降频、反而让帧率抖动。
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-        if (!faceDetector.initialize(numThreads = threads)) {
+        // enableBlendshape = false：原生侧的 blendShape MNN 模型在本工程里**没有任何
+        // 调用点**（52 维表情实际由 OpenSeeFaceProcess 的 Kotlin 几何启发式算出）。
+        // 之前它会被加载并建一个 Vulkan session 常驻，既占显存/内存又拉长启动时间，
+        // 对帧率零贡献，所以这里显式关掉。
+        if (!faceDetector.initialize(numThreads = threads, enableBlendshape = false)) {
             Log.e(TAG, "Failed to initialize face detector")
             return false
         }
         mnnThreadCount = threads
         Log.i(TAG, "MNN inference threads: $threads")
 
-        val dumpDir = context.cacheDir.absolutePath
-        faceDetector.setDumpDirectory(dumpDir)
+        // 首帧 PPM dump 只在可调试包里开：它会在检测线程上做 921,600 次像素循环
+        // 并写 2.7 MB 文件，正式包里属于白做功（还会和首帧推理抢核）。
+        val debuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (debuggable) {
+            faceDetector.setDumpDirectory(context.cacheDir.absolutePath)
+        } else {
+            faceDetector.setDumpDirectory(null)
+        }
 
         // 额外的 GPU 关键点引擎（并行推理用）：只加载 landmarker，跑 Vulkan。
         // 这里失败不影响主通道，start() 会自动少开一路。
-        if (gpuChannelCount > 1) {
+        //
+        // 只有**主引擎真的跑在 Vulkan 上**才去开：如果主引擎实际是 CPU 后端
+        // （比如 libMNN_Vulkan.so 没加载 / 设备不支持），多开一路只会多占一份
+        // 模型内存、在 CPU 上和主通道抢核，对帧率是负收益。
+        if (gpuChannelCount > 1 && faceDetector.getBackend() == MnnBackend.VULKAN) {
             ensureExtraEngines(gpuChannelCount)
+        } else if (gpuChannelCount > 1) {
+            Log.w(
+                TAG,
+                "Skip extra GPU engines: main engine is running on " +
+                    "${faceDetector.getBackend()} (Vulkan unavailable)",
+            )
         }
         // 初始化阶段就把「实际能跑几路」算出来：UI 在追踪开始前也能显示真实并行度。
         activeChannelCount = resolveActiveChannelCount()
-        Log.i(TAG, "GPU parallel channels: $activeChannelCount / $gpuChannelCount requested")
+        Log.i(
+            TAG,
+            "MNN backend in use: ${faceDetector.getBackend()} " +
+                "(requested Vulkan), GPU parallel channels: $activeChannelCount / $gpuChannelCount",
+        )
 
         isInitialized = true
         Log.i(TAG, "Pipeline face tracker initialized with parallel stages")
@@ -573,7 +598,13 @@ class PipelineFaceTracker(private val context: Context) {
             startFaceDetectionStage()
             startLandmarkStage()
         }
-        startLandmarkReorderStage()
+        // 单路时关键点结果是天然有序的，重排阶段属于纯开销（每帧多一次通道唤醒 +
+        // TreeMap 维护，并且它的 60ms 缺口超时是「永久丢一帧 → 输出定格」的来源）。
+        // 只有多路并行才需要按 frameId 还原顺序。
+        val needsReorder = useDirectYuvMode && activeChannelCount > 1
+        if (needsReorder) {
+            startLandmarkReorderStage()
+        }
         startProcessingStage()
         startOutputStage()
 
@@ -841,11 +872,15 @@ class PipelineFaceTracker(private val context: Context) {
 
         // 主引擎都跑 CPU 时并行 GPU 引擎没有意义，把它们的模型放掉省内存；
         // 切回 Vulkan 时再按需重建，并行才能继续生效。
+        //
+        // 注意判据用 **实际** 后端（getBackend 读的是原生侧真实 session 类型）：
+        // 有些设备上 Vulkan 请求会静默落 CPU，此时再开一路只会抢核。
         if (switched) {
-            if (backend == MnnBackend.CPU) {
-                faceDetector.releaseExtraEngines()
-            } else {
+            if (faceDetector.getBackend() == MnnBackend.VULKAN) {
                 ensureExtraEngines(gpuChannelCount)
+            } else {
+                faceDetector.releaseExtraEngines()
+                Log.w(TAG, "Backend is actually CPU; extra GPU engines released")
             }
         }
 
@@ -891,7 +926,12 @@ class PipelineFaceTracker(private val context: Context) {
 
         val target = count.coerceIn(1, MAX_GPU_CHANNELS)
         gpuChannelCount = target
-        ensureExtraEngines(target)
+        // 与 initialize() 一致：主引擎不在 Vulkan 上时不开额外引擎（纯浪费内存与 CPU）。
+        if (target > 1 && faceDetector.getBackend() == MnnBackend.VULKAN) {
+            ensureExtraEngines(target)
+        } else {
+            ensureExtraEngines(1)
+        }
 
         val wasRunning = isRunning.get()
         val stopsBefore = stopRequestCount.get()
@@ -1160,6 +1200,8 @@ class PipelineFaceTracker(private val context: Context) {
      */
     private fun startYuvLandmarkStages() {
         val count = activeChannelCount.coerceIn(1, MAX_GPU_CHANNELS)
+        // 单路直达后处理通道（跳过重排）；多路才走 merge + reorder。
+        val directToProcessing = count <= 1
         for (index in 0 until count) {
             startYuvLandmarkWorker(
                 label = if (count == 1) "single" else "gpu$index",
@@ -1168,6 +1210,7 @@ class PipelineFaceTracker(private val context: Context) {
                 // 追踪置信度检测是有状态的（连续低置信度才触发重检），多路都更新
                 // 会把它的判定节奏打乱，所以只让主通道负责。
                 runConfidenceCheck = index == 0,
+                directToProcessing = directToProcessing,
             )
         }
     }
@@ -1177,6 +1220,7 @@ class PipelineFaceTracker(private val context: Context) {
         engineIndex: Int,
         dispatcher: CoroutineDispatcher,
         runConfidenceCheck: Boolean,
+        directToProcessing: Boolean = false,
     ) {
         pipelineScope.launch(dispatcher) {
             // 把当前线程绑定到对应的原生引擎槽位（线程本地状态，绑一次即可）。
@@ -1186,6 +1230,9 @@ class PipelineFaceTracker(private val context: Context) {
             // 也不会把上一轮的帧塞进新一轮的通道里。
             val inputChannel = yuvLandmarkFrameChannel
             val mergeChannel = landmarkMergeChannel
+            // 单路：直接投后处理通道（结果本来就有序，不经过重排）；
+            // 多路：先投 merge 通道，由重排阶段按 frameId 还原顺序。
+            val outChannel = if (directToProcessing) landmarkChannel else mergeChannel
             for (frame in inputChannel) {
                 if (!isRunning.get()) break
                 try {
@@ -1244,7 +1291,7 @@ class PipelineFaceTracker(private val context: Context) {
                             lastLandmarkFpsTime = now
                         }
                         // 结果先交给重排阶段：多路并行下到达顺序不等于采集顺序。
-                        mergeChannel.trySend(landmarkData)
+                        outChannel.trySend(landmarkData)
                     }
                     if (ENABLE_PERF_PROFILING) {
                         synchronized(perfLock) {
