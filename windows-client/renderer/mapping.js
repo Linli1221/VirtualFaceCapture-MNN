@@ -96,6 +96,21 @@ export function clamp(v, lo, hi) {
 }
 
 /**
+ * AdaptiveAngleNormalizer 的旋钮默认值（任务 M4：可写进角色 profile）。
+ *
+ * 「向外快、向内慢」的数值基线：
+ *   - 向外扩张系数 adaptationRate = 0.1；
+ *   - 向内收缩 = contractAlpha(前 100 帧 0.05 / 之后 0.01) × contractScale(0.1)。
+ * 默认值与历史行为**逐位一致**：不改这组数，行为就和旧版完全一样（M4 验收清单）。
+ */
+export const NORMALIZER_KNOB_DEFAULTS = Object.freeze({
+  adaptationRate: 0.1,
+  contractAlphaEarly: 0.05,
+  contractAlphaLate: 0.01,
+  contractScale: 0.1,
+});
+
+/**
  * 非对称自适应归一化器（协议 §8.2 伪码的直译）。
  *
  * 负向 / 正向各自维护一个「观测到的动作幅度」pctNeg / pctPos；量程随实际动作自适应，
@@ -108,8 +123,10 @@ export class AdaptiveAngleNormalizer {
    * @param {number} defaultPositiveRange 默认正向满量程（度）
    * @param {number} [minRange=5] 最小量程（度），避免幅度过小时除零 / 放大噪声
    * @param {number} [adaptationRate=0.1] 向外扩展方向的跟随速率
+   * @param {object} [knobs] 可选旋钮（M4 角色 profile）：{adaptationRate, contractAlphaEarly,
+   *                        contractAlphaLate, contractScale}，缺省 = NORMALIZER_KNOB_DEFAULTS（旧行为）
    */
-  constructor(defaultNegativeRange, defaultPositiveRange, minRange = 5, adaptationRate = 0.1) {
+  constructor(defaultNegativeRange, defaultPositiveRange, minRange = 5, adaptationRate = 0.1, knobs = null) {
     this.defaultNeg = defaultNegativeRange;
     this.defaultPos = defaultPositiveRange;
     /** 未缩放的基准量程（角色 profile 的量程偏好只乘在基准上，1 = 与协议默认一致）。 */
@@ -118,10 +135,45 @@ export class AdaptiveAngleNormalizer {
     /** 当前量程偏好倍率（0.5~2，1 = 不缩放）。 */
     this.scale = 1;
     this.minRange = minRange;
+    /** 向外扩展方向的跟随速率（「向外快」，默认 0.1）。 */
     this.rate = adaptationRate;
+    this._defaultRate = adaptationRate;
     this._pctNeg = 0;
     this._pctPos = 0;
     this._samples = 0;
+    // 收缩（「向内慢」）旋钮：默认 = alpha(前 100 帧 0.05 / 之后 0.01) × 0.1，与历史行为逐位一致
+    this._contractAlphaEarly = NORMALIZER_KNOB_DEFAULTS.contractAlphaEarly;
+    this._contractAlphaLate = NORMALIZER_KNOB_DEFAULTS.contractAlphaLate;
+    this._contractScale = NORMALIZER_KNOB_DEFAULTS.contractScale;
+    if (knobs) this.configure(knobs);
+  }
+
+  /**
+   * 套用滤波 profile 里的归一化旋钮（M4：可按角色保存）。传 null / 缺省恢复默认。
+   * 默认值 = 向外扩张 0.1、收缩 alpha 0.05(前 100 帧)/0.01(之后) × 0.1 —— 与旧行为逐位一致。
+   */
+  configure(knobs = null) {
+    const k = knobs && typeof knobs === "object" ? knobs : {};
+    const rate = Number(k.adaptationRate);
+    this.rate = Number.isFinite(rate) && rate > 0 ? Math.min(1, rate) : this._defaultRate;
+    const clamp01 = (value, fallback) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : fallback;
+    };
+    this._contractAlphaEarly = clamp01(k.contractAlphaEarly, NORMALIZER_KNOB_DEFAULTS.contractAlphaEarly);
+    this._contractAlphaLate = clamp01(k.contractAlphaLate, NORMALIZER_KNOB_DEFAULTS.contractAlphaLate);
+    this._contractScale = clamp01(k.contractScale, NORMALIZER_KNOB_DEFAULTS.contractScale);
+    return this.knobs;
+  }
+
+  /** 当前旋钮快照（写回角色 profile / 调试用）。 */
+  get knobs() {
+    return {
+      adaptationRate: this.rate,
+      contractAlphaEarly: this._contractAlphaEarly,
+      contractAlphaLate: this._contractAlphaLate,
+      contractScale: this._contractScale,
+    };
   }
 
   /**
@@ -161,12 +213,13 @@ export class AdaptiveAngleNormalizer {
   /** 只更新自适应幅度，不返回值（供需要自适应的其它用途）。 */
   update(v) {
     this._samples++;
-    const alpha = this._samples < 100 ? 0.05 : 0.01;
+    // 收缩 alpha = 0.05(前 100 帧) / 0.01(之后)，再乘 contractScale(0.1) —— 默认与历史行为逐位一致
+    const alpha = this._samples < 100 ? this._contractAlphaEarly : this._contractAlphaLate;
     if (v < 0) {
       const a = -v;
-      this._pctNeg += a > this._pctNeg ? (a - this._pctNeg) * this.rate : (a - this._pctNeg) * alpha * 0.1;
+      this._pctNeg += a > this._pctNeg ? (a - this._pctNeg) * this.rate : (a - this._pctNeg) * alpha * this._contractScale;
     } else {
-      this._pctPos += v > this._pctPos ? (v - this._pctPos) * this.rate : (v - this._pctPos) * alpha * 0.1;
+      this._pctPos += v > this._pctPos ? (v - this._pctPos) * this.rate : (v - this._pctPos) * alpha * this._contractScale;
     }
   }
 
@@ -189,16 +242,16 @@ export class AdaptiveAngleNormalizer {
 }
 
 /** 协议 §8.2：低头 ~20°、抬头 ~40°。rangeScale = 角色量程偏好（可选，1 = 默认）。 */
-export function createPitchNormalizer(rangeScale = 1) {
-  return withScale(new AdaptiveAngleNormalizer(20, 40, 10), rangeScale);
+export function createPitchNormalizer(rangeScale = 1, knobs = null) {
+  return withScale(new AdaptiveAngleNormalizer(20, 40, 10, 0.1, knobs), rangeScale);
 }
 /** 协议 §8.2：左右各 45°。 */
-export function createYawNormalizer(rangeScale = 1) {
-  return withScale(new AdaptiveAngleNormalizer(45, 45, 15), rangeScale);
+export function createYawNormalizer(rangeScale = 1, knobs = null) {
+  return withScale(new AdaptiveAngleNormalizer(45, 45, 15, 0.1, knobs), rangeScale);
 }
 /** 协议 §8.2：左右各 30°。 */
-export function createRollNormalizer(rangeScale = 1) {
-  return withScale(new AdaptiveAngleNormalizer(30, 30, 10), rangeScale);
+export function createRollNormalizer(rangeScale = 1, knobs = null) {
+  return withScale(new AdaptiveAngleNormalizer(30, 30, 10, 0.1, knobs), rangeScale);
 }
 
 /** 工厂内部：建好归一化器后套用量程偏好（scale=1 时与协议默认完全一致）。 */
@@ -210,13 +263,14 @@ function withScale(normalizer, rangeScale) {
 /**
  * 三个归一化器（pitch / yaw / roll）。
  * @param {number} [rangeScale=1] 角色量程偏好（0.5~2，1 = 协议默认量程，行为不变）
+ * @param {object} [knobs] 归一化旋钮（M4 角色 profile；缺省 = 旧行为）
  * @returns {{pitch:AdaptiveAngleNormalizer,yaw:AdaptiveAngleNormalizer,roll:AdaptiveAngleNormalizer}}
  */
-export function createNormalizers(rangeScale = 1) {
+export function createNormalizers(rangeScale = 1, knobs = null) {
   return {
-    pitch: createPitchNormalizer(rangeScale),
-    yaw: createYawNormalizer(rangeScale),
-    roll: createRollNormalizer(rangeScale),
+    pitch: createPitchNormalizer(rangeScale, knobs),
+    yaw: createYawNormalizer(rangeScale, knobs),
+    roll: createRollNormalizer(rangeScale, knobs),
   };
 }
 
@@ -310,11 +364,12 @@ function emptyResult() {
  *     normalized: { pitch, yaw, roll },
  *     raw: { pitch, yaw, roll } }
  *
- * @param {{invertPitch?:boolean,invertYaw?:boolean,invertRoll?:boolean,angleScale?:number,bodyScale?:number}} [opts]
+ * @param {{invertPitch?:boolean,invertYaw?:boolean,invertRoll?:boolean,angleScale?:number,bodyScale?:number,normalizer?:object}} [opts]
+ *   normalizer = AdaptiveAngleNormalizer 旋钮（M4 角色 profile，缺省 = 旧行为）
  */
 export function createMapper(opts = {}) {
   const o = { ...DEFAULT_OPTIONS, ...opts };
-  const norms = createNormalizers(o.rangeScale);
+  const norms = createNormalizers(o.rangeScale, o.normalizer);
 
   const mapper = {
     options: o,
@@ -345,6 +400,16 @@ export function createMapper(opts = {}) {
       norms.roll.setScale(o.rangeScale);
       mapper.reset();
       return o.rangeScale;
+    },
+    /**
+     * 套用滤波 profile 的归一化旋钮（M4）：传 null 恢复默认（旧行为）。
+     * 只改「向外快、向内慢」的速率，不动量程与符号约定。
+     */
+    configureNormalizers(knobs = null) {
+      o.normalizer = norms.pitch.configure(knobs);
+      norms.yaw.configure(knobs);
+      norms.roll.configure(knobs);
+      return o.normalizer;
     },
     /**
      * @param {ArrayLike<number>} bs 52 项权重
@@ -929,7 +994,11 @@ export function combineBodyAngleX(headBodyAngleX, torsoBodyAngleX, limit = BODY_
  *   - `ubT`   手机采集时间（ms）。⚠️ 两端时钟不同步，**不能**和本机 now 直接比较；
  *              这里只用它判断「是不是新采集的一帧」，过期用**本地到达时间**的 age 量：
  *              同一个 ubT 连续出现（手机还在发面捕、但上半身停了）→ age 一直涨 → 1.5s 后 stale。
- *   - `body`  [roll, yaw]（相对基线躯干角，度；缺省 = [0,0]）
+ *   - `body`  [roll, yaw]（度；缺省 = [0,0]）。**语义由 `ubRaw` 显式声明**：
+ *              ubRaw 缺省 = 手机端平滑 + 基线后的相对角（旧语义，逐字节不变）；
+ *              ubRaw:true = 原始角（未 One-Euro、未减基线），由 PC 端后处理链负责
+ *              平滑 / 减基线（见 UpperBodyPostProcessor）。
+ *   - `ubRaw` / `ubRawBody`（upperBodyPostV1 协商成功后手机才会发，协议 §4.1 / §4.2）
  *
  * @param {object} track
  * @param {number} now 本机单调时钟（performance.now() 口径）
@@ -948,6 +1017,17 @@ export function readUpperBodyTrack(track, now = 0, prev = null) {
     isNumericArray(rawTorso) && rawTorso.length >= 2
       ? [finiteOr(rawTorso[0]), finiteOr(rawTorso[1])]
       : [0, 0];
+
+  // upperBodyPostV1（协议 §4.1 / §4.2）：`ubRaw:true` 显式声明本帧 ub 是**原始点**
+  //（未 One-Euro、未减基线），且 body / ubRawBody 是**原始躯干角**（未平滑未减基线）。
+  // 语义由 ubRaw 显式声明，不存在「字段名没变但语义变了」；ubRaw 缺省时 body 仍是
+  // 旧语义（手机端平滑 + 基线后的相对角），老报文行为完全不变。
+  const rawDeclared = message.ubRaw === true;
+  const rawBody = message.ubRawBody;
+  const phoneRawTorso =
+    isNumericArray(rawBody) && rawBody.length >= 2
+      ? [finiteOr(rawBody[0]), finiteOr(rawBody[1])]
+      : null;
 
   let receivedAt = typeof last.receivedAt === "number" && Number.isFinite(last.receivedAt) ? last.receivedAt : null;
   if (hasUb) {
@@ -974,8 +1054,12 @@ export function readUpperBodyTrack(track, now = 0, prev = null) {
     ageMs,
     /** 13 个点；本帧没有就保留上一帧（调试骨架画最后一帧，配 ok=false 灰显）。 */
     points: points ?? (Array.isArray(last.points) ? last.points : null),
-    /** [roll, yaw] */
+    /** [roll, yaw]：ubRaw 缺省 = 相对基线角（旧语义）；ubRaw:true = 原始角（未平滑未减基线）。 */
     torso,
+    /** ubRaw：本帧是否声明为原始点 + 原始角模式（协议 upperBodyPostV1）。 */
+    raw: rawDeclared,
+    /** ubRawBody：手机端算出的原始躯干角（可选字段，缺省 null；与 torso 同值，用于对拍/调试）。 */
+    phoneRawTorso,
     /** 手机采集时间戳（没有就是 null）。 */
     t: hasStamp ? ubT : hasUb ? null : typeof last.t === "number" ? last.t : null,
     /** 本机到达时间（age 的基准）。 */
@@ -1025,5 +1109,469 @@ export function smoothBodyParams(current, target, opts = {}) {
     for (const id of Object.keys(out)) if (out[id] === 0) delete out[id];
   }
   return out;
+}
+
+// ---------------------------------------------------------------- 上半身后处理链（任务 M2：upperBodyPostV1）
+//
+// 协商成功（hello 里 upperBodyPostV1）后，手机端只发**原始** 13 点 + 原始躯干角
+//（ubRaw:true），One-Euro 平滑、躯干角计算、TorsoBaseline 全部迁到本模块：
+//
+//   原始 13 点 ──One-Euro(1.2/0.02)──▶ 平滑点 ──computeTorsoAngles──▶ 原始角
+//                                        │                            │
+//                                        ▼                            ▼
+//                              mapBody(点链)                  One-Euro(0.6/0.01)
+//                                                                     │
+//                                                             TorsoBaseline(10 帧)
+//                                                                     │
+//                                                          相对角 ──▶ mapBody(躯干)
+//
+// 与 Kotlin（UpperBodySmoother / UpperBodyGeometry.torso / TorsoBaseline /
+// UpperBodyPoseDetector.buildFrame）**逐行等价**，参数一致，由
+// tools/verify/ub-post-test.mjs 与 Android 端 UpperBodyPostEquivalenceTest 对同一份
+// 夹具（MediapipeUpperBody/src/test/resources/ub_post_fixture.txt）对拍。
+//
+// 滤波责任归属（总时间常数估算见 docs/upper-body.md §3.2）：
+//   - 信号调理（去抖动）= 本模块 One-Euro，唯一的一层；
+//   - 观感层（渲染低通 / 速度自适应）= live2d.js / filter.js，只允许**一层**轻量低通，
+//     原始模式建议 ≤ 60ms（RAW_BODY_RENDER_TAU_MS），避免 One-Euro + 160ms 双重过度平滑；
+//   - 三层回退（1500ms 过期 / ×0.85 按帧衰减 / 从输出删除）不变，仍由
+//     readUpperBodyTrack + smoothBodyParams 负责。
+
+/** 13 点 One-Euro 参数（与 Kotlin OneEuroFilter.DEFAULT_* 一致）。 */
+export const BODY_ONE_EURO_DEFAULTS = Object.freeze({
+  minCutoff: 1.2,
+  beta: 0.02,
+  derivativeCutoff: 1.0,
+});
+
+/** 躯干角 One-Euro 参数（与 Kotlin UpperBodySmoother.DEFAULT_TORSO_* 一致）。 */
+export const TORSO_ONE_EURO_DEFAULTS = Object.freeze({
+  minCutoff: 0.6,
+  beta: 0.01,
+  derivativeCutoff: 1.0,
+});
+
+/** 归一化坐标下水平基准的最小值（与 Kotlin UpperBodyGeometry.MIN_REFERENCE_SPAN 一致）。 */
+export const TORSO_MIN_REFERENCE_SPAN = 0.02;
+
+/** 躯干线可用所需的最低可见度（与 Kotlin MIN_TORSO_VISIBILITY 一致）。 */
+export const TORSO_MIN_VISIBILITY = 0.3;
+
+/** 单点可信的可见度阈值（与 Kotlin RELIABLE_VISIBILITY 一致）。 */
+export const BODY_TRACKING_MIN_VISIBILITY = 0.5;
+
+/** 至少几个可信点才算 tracking（与 Kotlin MIN_TRACKING_POINTS 一致）。 */
+export const BODY_TRACKING_MIN_POINTS = 7;
+
+/** TorsoBaseline 校准帧数（与 Kotlin TorsoBaseline.DEFAULT_CALIBRATION_FRAMES 一致）。 */
+export const BODY_BASELINE_CALIBRATION_FRAMES = 10;
+
+/** 后处理管线参数默认值（与 Kotlin UpperBodyPoseDetector 的 dt 规则一致）。 */
+export const BODY_POST_DEFAULTS = Object.freeze({
+  minCutoff: BODY_ONE_EURO_DEFAULTS.minCutoff,
+  beta: BODY_ONE_EURO_DEFAULTS.beta,
+  pointDerivativeCutoff: BODY_ONE_EURO_DEFAULTS.derivativeCutoff,
+  torsoMinCutoff: TORSO_ONE_EURO_DEFAULTS.minCutoff,
+  torsoBeta: TORSO_ONE_EURO_DEFAULTS.beta,
+  torsoDerivativeCutoff: TORSO_ONE_EURO_DEFAULTS.derivativeCutoff,
+  calibrationFrames: BODY_BASELINE_CALIBRATION_FRAMES,
+  /** 首帧（平滑器重置后）的 dt：1 / 15fps（Kotlin 用 targetFps=15）。 */
+  defaultDtSeconds: 1 / 15,
+  /** 相邻帧 dt 的上限（与 Kotlin MAX_PIPELINE_GAP_MS 一致）。 */
+  maxPipelineGapMs: 500,
+});
+
+/**
+ * 原始模式下**渲染层**低通时间常数的建议上限（ms）：One-Euro 已负责信号调理，
+ * 渲染层只留一层轻量观感平滑。与 M4 filter.js 的 body 组 slowTauMs 对接用；
+ * 未协商（旧链）保持旧的 160ms 逐位不变。
+ */
+export const RAW_BODY_RENDER_TAU_MS = 60;
+
+/**
+ * One-Euro 低通（Kotlin OneEuroFilter 的逐行移植；双精度，误差由对拍容差吸收）。
+ *
+ * cutoff = minCutoff + beta * |edx|，tau = 1/(2π·cutoff)，alpha = 1/(1+tau/dt)。
+ * dt ≤ 0 / NaN 按 1ms，dt > 0.5s 截断到 0.5s（与 Kotlin MIN/MAX_DT_SECONDS 一致）。
+ */
+export class OneEuroFilter {
+  constructor(
+    minCutoff = BODY_ONE_EURO_DEFAULTS.minCutoff,
+    beta = BODY_ONE_EURO_DEFAULTS.beta,
+    derivativeCutoff = BODY_ONE_EURO_DEFAULTS.derivativeCutoff,
+  ) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.derivativeCutoff = derivativeCutoff;
+    this.lastValue = NaN;
+    this.lastDerivative = 0;
+  }
+
+  /** 是否已经收到过一个有效输入。 */
+  get hasValue() {
+    return Number.isFinite(this.lastValue);
+  }
+
+  /** 清空状态（丢帧 / 重新捕获目标时调用，避免把旧位置拖过来）。 */
+  reset() {
+    this.lastValue = NaN;
+    this.lastDerivative = 0;
+  }
+
+  /**
+   * 过滤一个采样点。
+   * @param {number} value 新采样值
+   * @param {number} dtSeconds 与上一次采样的时间差（秒）
+   * @returns {number} 平滑后的值；输入非有限时返回上一次有效值（从未有效则 0）
+   */
+  filter(value, dtSeconds) {
+    const v = Number(value);
+    if (!Number.isFinite(v)) return Number.isFinite(this.lastValue) ? this.lastValue : 0;
+    if (!Number.isFinite(this.lastValue)) {
+      this.lastValue = v;
+      this.lastDerivative = 0;
+      return v;
+    }
+    const rawDt = Number(dtSeconds);
+    const dt = Number.isFinite(rawDt) && rawDt > 0 ? Math.min(rawDt, 0.5) : 0.001;
+    const rawDerivative = (v - this.lastValue) / dt;
+    const derivativeAlpha = this.alpha(this.derivativeCutoff, dt);
+    this.lastDerivative += derivativeAlpha * (rawDerivative - this.lastDerivative);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.lastDerivative);
+    const valueAlpha = this.alpha(cutoff, dt);
+    const filtered = this.lastValue + valueAlpha * (v - this.lastValue);
+    this.lastValue = filtered;
+    return filtered;
+  }
+
+  alpha(cutoff, dt) {
+    if (!(cutoff > 0)) return 1;
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+}
+
+/** 13 点里至少几个可见度 > 0.5 才算 tracking（Kotlin UpperBodyGeometry.isTracking）。 */
+export function isUpperBodyTracking(points) {
+  const list = toBodyPoints(points);
+  if (!list) return false;
+  let reliable = 0;
+  for (const p of list) {
+    if (p.v > BODY_TRACKING_MIN_VISIBILITY) reliable += 1;
+  }
+  return reliable >= BODY_TRACKING_MIN_POINTS;
+}
+
+/**
+ * 13 点 → 原始躯干角 [roll, yaw]（度，未平滑未减基线）。
+ *
+ * 与 Kotlin UpperBodyGeometry.torso **逐行等价**，符号约定（协议 §5.3）：
+ *   horizontal = max(|right.x - left.x|, 0.02)   ← 0.02 下限，禁止直接除 dx
+ *   roll = deg(atan2(right.y - left.y, horizontal))   // 右肩下沉为正
+ *   yaw  = deg(atan2(-(right.z - left.z), horizontal)) // 本人左侧转为正
+ *
+ * 肩线不可见时按「肩 → 肘 → 胯」退化；两肩在画面中重合时靠 0.02 下限兜住，
+ * 不会出现几十度假角度。z 是相对深度（非米制），只进 atan2。
+ *
+ * @param {ArrayLike<number>|{x,y,z,v}[]} ub
+ * @returns {[number, number]} [roll, yaw]
+ */
+export function computeTorsoAngles(ub) {
+  const points = toBodyPoints(ub);
+  if (!points) return [0, 0];
+  const pairs = [
+    [BODY_LANDMARK_ORDER.shoulder_left, BODY_LANDMARK_ORDER.shoulder_right],
+    [BODY_LANDMARK_ORDER.elbow_left, BODY_LANDMARK_ORDER.elbow_right],
+    [BODY_LANDMARK_ORDER.hip_left, BODY_LANDMARK_ORDER.hip_right],
+  ];
+  for (const [li, ri] of pairs) {
+    const l = points[li];
+    const r = points[ri];
+    if (!Number.isFinite(l.v) || !Number.isFinite(r.v)) continue;
+    if (Math.min(l.v, r.v) < TORSO_MIN_VISIBILITY) continue;
+    if (![l.x, l.y, l.z, r.x, r.y, r.z].every(Number.isFinite)) continue;
+    const dx = r.x - l.x;
+    const dy = r.y - l.y;
+    const dz = r.z - l.z;
+    const horizontal = Math.max(Math.abs(dx), TORSO_MIN_REFERENCE_SPAN);
+    const roll = (Math.atan2(dy, horizontal) * 180) / Math.PI;
+    const yaw = (Math.atan2(-dz, horizontal) * 180) / Math.PI;
+    if (!Number.isFinite(roll) || !Number.isFinite(yaw)) continue;
+    return [roll, yaw];
+  }
+  return [0, 0];
+}
+
+/**
+ * 躯干角「相对基线」（Kotlin TorsoBaseline 的逐行移植）。
+ *
+ * [reset] 之后先收集 calibrationFrames 个有效帧，用均值作中性姿态：
+ *   - 校准期间输出 = (当前值 − 已收集帧均值) × collected/calibrationFrames（0→1 渐入，
+ *     起播 10 帧内不会从 0 突跳到基线）；
+ *   - 校准完成后输出 = 当前值 − 基线。
+ *
+ * 基线可持久化（按角色 profile 区分，见 serialize/deserialize：app.js 把它存进
+ * `vfc.bodyBaseline.<profileKey>`，换角色各存各的、手动重置即清掉重采）。
+ */
+export class TorsoBaseline {
+  constructor(calibrationFrames = BODY_BASELINE_CALIBRATION_FRAMES) {
+    this.calibrationFrames = calibrationFrames > 0 ? calibrationFrames : 1;
+    this.reset();
+  }
+
+  /** 是否已用满校准帧数、基线固定下来了。 */
+  get isCalibrated() {
+    return this.collected >= this.calibrationFrames;
+  }
+
+  /** 重置：下一次 apply 开始重新收集中性姿态。 */
+  reset() {
+    this.collected = 0;
+    this.sumRoll = 0;
+    this.sumYaw = 0;
+    this.baselineRoll = 0;
+    this.baselineYaw = 0;
+  }
+
+  /**
+   * 原始躯干角 → 相对基线角。
+   * @param {[number, number]} angles [roll, yaw]（未减基线）
+   * @returns {[number, number]} 相对角；非法输入返回 [0,0] 且不污染校准均值
+   */
+  apply(angles) {
+    const roll = Number(angles?.[0]);
+    const yaw = Number(angles?.[1]);
+    if (!Number.isFinite(roll) || !Number.isFinite(yaw)) return [0, 0];
+    if (this.isCalibrated) return [roll - this.baselineRoll, yaw - this.baselineYaw];
+    this.collected += 1;
+    this.sumRoll += roll;
+    this.sumYaw += yaw;
+    const meanRoll = this.sumRoll / this.collected;
+    const meanYaw = this.sumYaw / this.collected;
+    if (this.collected >= this.calibrationFrames) {
+      this.baselineRoll = meanRoll;
+      this.baselineYaw = meanYaw;
+    }
+    const weight = Math.min(1, this.collected / this.calibrationFrames);
+    return [(roll - meanRoll) * weight, (yaw - meanYaw) * weight];
+  }
+
+  /** 持久化快照（JSON 可序列化）。 */
+  serialize() {
+    return {
+      version: 1,
+      calibrationFrames: this.calibrationFrames,
+      collected: this.collected,
+      sumRoll: this.sumRoll,
+      sumYaw: this.sumYaw,
+      baselineRoll: this.baselineRoll,
+      baselineYaw: this.baselineYaw,
+    };
+  }
+
+  /**
+   * 从持久化快照恢复（坏数据返回 null，调用方按「无基线」处理）。
+   * 已校准的快照恢复后 isCalibrated=true，基线原样生效；未校准的快照继续收集。
+   */
+  static deserialize(raw) {
+    const data = raw && typeof raw === "object" ? raw : null;
+    if (!data || data.version !== 1) return null;
+    const frames = Number(data.calibrationFrames);
+    const collected = Number(data.collected);
+    const sumRoll = Number(data.sumRoll);
+    const sumYaw = Number(data.sumYaw);
+    const baselineRoll = Number(data.baselineRoll);
+    const baselineYaw = Number(data.baselineYaw);
+    if (![frames, collected, sumRoll, sumYaw, baselineRoll, baselineYaw].every(Number.isFinite)) return null;
+    if (collected < 0 || frames <= 0) return null;
+    const baseline = new TorsoBaseline(frames);
+    baseline.collected = Math.floor(collected);
+    baseline.sumRoll = sumRoll;
+    baseline.sumYaw = sumYaw;
+    baseline.baselineRoll = baselineRoll;
+    baseline.baselineYaw = baselineYaw;
+    return baseline;
+  }
+}
+
+/**
+ * 上半身后处理管线（原始点 → 平滑点 + 相对躯干角）。
+ *
+ * 与 Kotlin UpperBodyPoseDetector.buildFrame 的平滑段逐行等价：
+ *   dt 规则：无锚点 → defaultDtSeconds（1/15s）；否则 clamp(t−lastT, 1, maxPipelineGapMs)/1000；
+ *   tracking 丢失（isTracking 不满足）→ 平滑器全重置 + dt 锚点清零，**基线不动**；
+ *   坏点（x=y=z=v=0）透传不参与平滑，避免坏帧把该点拖向原点。
+ */
+export class UpperBodyPostProcessor {
+  /** @param {Partial<typeof BODY_POST_DEFAULTS>} [options] */
+  constructor(options = {}) {
+    this.options = { ...BODY_POST_DEFAULTS, ...options };
+    const o = this.options;
+    this.pointFilters = Array.from({ length: BODY_COUNT }, () => [
+      new OneEuroFilter(o.minCutoff, o.beta, o.pointDerivativeCutoff),
+      new OneEuroFilter(o.minCutoff, o.beta, o.pointDerivativeCutoff),
+      new OneEuroFilter(o.minCutoff, o.beta, o.pointDerivativeCutoff),
+    ]);
+    this.torsoFilters = [
+      new OneEuroFilter(o.torsoMinCutoff, o.torsoBeta, o.torsoDerivativeCutoff),
+      new OneEuroFilter(o.torsoMinCutoff, o.torsoBeta, o.torsoDerivativeCutoff),
+    ];
+    this.baseline = new TorsoBaseline(o.calibrationFrames);
+    this._lastT = null;
+  }
+
+  /** 平滑器 + dt 锚点重置（tracking 丢失 / 上报 ubOk=false）；基线不动。 */
+  resetSmoothers() {
+    for (const triple of this.pointFilters) {
+      triple[0].reset();
+      triple[1].reset();
+      triple[2].reset();
+    }
+    this.torsoFilters[0].reset();
+    this.torsoFilters[1].reset();
+    this._lastT = null;
+  }
+
+  /** 手动重置基线（UI「重置上半身基线」/ 换人重新校准）：下次开始重新收集 10 帧均值。 */
+  resetBaseline() {
+    this.baseline.reset();
+  }
+
+  /** 基线持久化快照。 */
+  serializeBaseline() {
+    return this.baseline.serialize();
+  }
+
+  /** 恢复持久化的基线；坏数据静默忽略（保持冷启动行为）。 */
+  loadBaseline(raw) {
+    const restored = TorsoBaseline.deserialize(raw);
+    if (restored) this.baseline = restored;
+    return restored != null;
+  }
+
+  /**
+   * 处理一帧原始 13 点。
+   * @param {ArrayLike<number>|{x,y,z,v}[]} ub 原始 13 点（parseUpperBody 的输出即可）
+   * @param {number} tMs 本帧采集时间（ubT；缺采集戳时传本地到达时间）
+   * @returns {{tracking:boolean, points:object[]|null, torso:[number,number],
+   *            torsoRaw:[number,number], torsoSmoothed:[number,number], dtSeconds:number}}
+   *   points = 平滑后的 13 点（喂 mapBody 的点链）；torso = 相对基线角（喂 mapBody 的躯干）。
+   */
+  process(ub, tMs) {
+    const points = toBodyPoints(ub);
+    if (!points || !isUpperBodyTracking(points)) {
+      this.resetSmoothers();
+      return { tracking: false, points: null, torso: [0, 0], torsoRaw: [0, 0], torsoSmoothed: [0, 0], dtSeconds: 0 };
+    }
+    const t = Number(tMs);
+    let dtSeconds;
+    if (this._lastT != null && Number.isFinite(t)) {
+      dtSeconds = Math.min(Math.max(t - this._lastT, 1), this.options.maxPipelineGapMs) / 1000;
+    } else {
+      dtSeconds = this.options.defaultDtSeconds;
+    }
+    if (Number.isFinite(t)) this._lastT = t;
+
+    const smoothed = points.map((p, i) => {
+      // 缺失 / 非法坐标（extract 置为全 0）直接透传、不参与平滑（与 Kotlin 一致）
+      if (p.x === 0 && p.y === 0 && p.z === 0 && p.v === 0) return { ...p };
+      const [fx, fy, fz] = this.pointFilters[i];
+      return {
+        x: fx.filter(p.x, dtSeconds),
+        y: fy.filter(p.y, dtSeconds),
+        z: fz.filter(p.z, dtSeconds),
+        v: p.v,
+      };
+    });
+
+    const torsoRaw = computeTorsoAngles(smoothed);
+    const torsoSmoothed = [
+      this.torsoFilters[0].filter(torsoRaw[0], dtSeconds),
+      this.torsoFilters[1].filter(torsoRaw[1], dtSeconds),
+    ];
+    const torso = this.baseline.apply(torsoSmoothed);
+    return {
+      tracking: true,
+      points: smoothed,
+      torso: [finiteOr(torso[0]), finiteOr(torso[1])],
+      torsoRaw,
+      torsoSmoothed,
+      dtSeconds,
+    };
+  }
+}
+
+/**
+ * 上半身状态机初始值（连接 / 重连 / 断线时复位）——app.js 的 createBodyState 即本函数。
+ *
+ * points / torso 保留最后一帧给调试骨架灰显；ok=false 时所有 body 参数按帧回 0。
+ */
+export function createBodyState() {
+  return {
+    /** 本帧上半身数据是否可用（有 ub + 长度对 + ubOk + 未过期）。 */
+    ok: false,
+    /** 报文里出现过 ub 字段（老手机的 track 没有）。 */
+    present: false,
+    ubOk: true,
+    stale: false,
+    ageMs: null,
+    points: null,
+    torso: [0, 0],
+    /** ubRaw：本帧是否为原始点 + 原始角模式（upperBodyPostV1）。 */
+    raw: false,
+    /** ubRawBody：手机端原始角（对拍 / 调试；缺省 null）。 */
+    phoneRawTorso: null,
+    t: null,
+    receivedAt: null,
+    metrics: null,
+    /** 本帧实际写给 live2d 的上半身参数（smoothBodyParams 的结果）。 */
+    current: {},
+    /** 下一帧直接落到目标（__vfc.applyUpperBody 截图 / 自测用）。 */
+    snap: false,
+  };
+}
+
+/**
+ * 解析 track 的上半身字段并算出这一帧要驱动的上半身参数（app.js updateBodyState 的纯函数版）。
+ *
+ * 与旧链唯一差别：`raw:true`（ubRaw）时先过 [UpperBodyPostProcessor]（One-Euro 平滑 +
+ * 躯干角 + 基线），再把**平滑点 + 相对角**喂给 mapBody —— mapBody / smoothBodyParams
+ * 与三层回退（1500ms 过期 / ×0.85 按帧衰减 / 从输出删除）完全不变。
+ *
+ * @param {object} track 一条 track 报文
+ * @param {number} now 本机单调时钟（performance.now() 口径）
+ * @param {object|null} prev 上一帧的返回值
+ * @param {{pipeline?:UpperBodyPostProcessor|null, decay?:number, epsilon?:number}} [options]
+ *   pipeline = 原始模式的后处理管线（老手机 / 未协商时为 null，走原链）
+ * @returns {object} 新的 body 状态（含 metrics / current）
+ */
+export function updateBodyStateFromTrack(track, now, prev, options = {}) {
+  const before = prev && typeof prev === "object" ? prev : createBodyState();
+  const next = readUpperBodyTrack(track, now, before);
+  const pipeline = options.pipeline ?? null;
+  let torso = next.torso;
+  let points = next.points;
+  if (next.ok && next.raw && pipeline) {
+    const out = pipeline.process(points, Number.isFinite(Number(next.t)) ? next.t : finiteOr(now));
+    if (out.tracking) {
+      points = out.points;
+      torso = out.torso;
+    } else {
+      // 手机说 ok 但点质量不过关：按不可用处理（映射不出去），平滑器已由 process 重置
+      next.ok = false;
+    }
+  } else if (pipeline && !next.ok) {
+    // 丢失 / 过期：与手机端 tracking 丢失一致，重置平滑器与 dt 锚点（基线不动）
+    pipeline.resetSmoothers();
+  }
+  const mapped = next.ok ? mapBody(torso, points) : null;
+  next.metrics = mapped ? mapped.metrics : before.metrics;
+  next.current = smoothBodyParams(before.current, mapped ? mapped.params : null, {
+    decay: finiteOr(options.decay, BODY_DECAY_PER_FRAME),
+    snap: Boolean(before.snap),
+    epsilon: options.epsilon,
+  });
+  next.snap = false; // snap 只作用于本帧
+  return next;
 }
 

@@ -29,6 +29,7 @@
  *
  * 这个模块是纯函数 / 纯数据（不碰 DOM），Node 端可以直接 import 做数值单测。
  */
+import { FILTER_DEFAULTS, sanitizeFilterProfile } from "./filter.js";
 
 /** 各轴偏移的绝对值上限（度）。超出这个范围基本不是「镜头偏移」，而是姿态解算坏了。 */
 export const POSE_OFFSET_LIMIT_DEG = 45;
@@ -297,7 +298,8 @@ export class PoseOffsetCollector {
  *     "profiles": {
  *       "<模型名>": {
  *         "pitchOffset": 0, "yawOffset": 0, "rollOffset": 0,   // 三轴偏移（度）
- *         "rangeScale": 1                                       // 可选：量程偏好（0.5~2.0）
+ *         "rangeScale": 1,                                      // 可选：量程偏好（0.5~2.0）
+ *         "filter": { "enabled": false, "head": {...}, "body": {...}, "normalizer": {...} }  // M4 最终滤波
  *       } } }
  *
  * 与旧版全局 `POSE_OFFSET_STORAGE_KEY`（vfc.poseOffset）的关系：
@@ -316,12 +318,13 @@ export const RANGE_SCALE_MIN = 0.5;
 export const RANGE_SCALE_MAX = 2;
 export const DEFAULT_RANGE_SCALE = 1;
 
-/** 中性角色 profile：三轴偏移 0、量程偏好 1。 */
+/** 中性角色 profile：三轴偏移 0、量程偏好 1、最终滤波默认（总开关关 = 行为与旧版一致）。 */
 export const DEFAULT_POSE_PROFILE = Object.freeze({
   pitchOffset: 0,
   yawOffset: 0,
   rollOffset: 0,
   rangeScale: DEFAULT_RANGE_SCALE,
+  filter: FILTER_DEFAULTS,
 });
 
 /** 量程偏好：有限数字，截断到 [0.5, 2]，坏数据回落 1。 */
@@ -348,6 +351,8 @@ export function sanitizePoseProfile(profile) {
     yawOffset: offset.yaw,
     rollOffset: offset.roll,
     rangeScale: sanitizeRangeScale(source.rangeScale),
+    // M4：最终观感滤波参数（含总开关）随角色 profile 一起保存
+    filter: sanitizeFilterProfile(source.filter),
   };
 }
 
@@ -357,14 +362,15 @@ export function profileToOffset(profile) {
   return { pitch: p.pitchOffset, yaw: p.yawOffset, roll: p.rollOffset };
 }
 
-/** offset 对象 → profile（保留原量程偏好）。 */
-export function offsetToProfile(offset, rangeScale = DEFAULT_RANGE_SCALE) {
+/** offset 对象 → profile（保留原量程偏好与最终滤波参数：filter 传原 profile.filter）。 */
+export function offsetToProfile(offset, rangeScale = DEFAULT_RANGE_SCALE, filter = null) {
   const o = sanitizePoseOffset(offset);
   return {
     pitchOffset: o.pitch,
     yawOffset: o.yaw,
     rollOffset: o.roll,
     rangeScale: sanitizeRangeScale(rangeScale),
+    filter: sanitizeFilterProfile(filter),
   };
 }
 

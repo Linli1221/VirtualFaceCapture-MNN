@@ -75,11 +75,48 @@
           </div>
           <div class="calib-actions">
             <button id="btn-recalib" title="让手机重做中性脸基线（表情 + 头姿）">手机重做基线</button>
-            <button id="btn-calib-reset" title="把三轴偏移清零">清零</button>
+            <button id="btn-calib-reset" title="把三轴偏移清零（平滑过渡，不瞬移）">清零</button>
+            <label class="toggle" title="只在低运动、低表情变化时极慢微调偏移（每帧 0.001~0.005）；默认关闭">
+              <input id="tg-pose-adaptive" type="checkbox" />缓慢自适应（默认关）
+            </label>
           </div>
           <div class="hint" id="calib-hint">
             手机摄像头没正对你（斜着架 / 放在屏幕旁边 / 换了座位）时，模型会一直朝一个方向歪。
-            点「一键校准」保持自然坐姿 3 秒即可；还差一点就拖上面的滑块，直到模型正对镜头。偏移自动保存。
+            点「一键校准」保持自然坐姿 3 秒即可；还差一点就拖上面的滑块，直到模型正对镜头。
+            偏移按角色自动保存，换角色各用各的。
+          </div>
+        </details>
+
+        <details id="filter-box" class="debug">
+          <summary>最终观感滤波（PC · 默认关）</summary>
+          <div class="toggles">
+            <label class="toggle" title="打开后 PC 端用速度自适应低通替换现有低通（不叠加）；关闭时行为与旧版完全一致">
+              <input id="tg-final-filter" type="checkbox" />启用速度自适应滤波
+            </label>
+          </div>
+          <div class="calib-grid">
+            <label for="fl-head-slow" title="慢速转头时的平滑强度（越大越稳，也越肉）">头/脸 慢速</label>
+            <input id="fl-head-slow" type="range" min="0" max="200" step="5" />
+            <b id="fl-head-slow-val">90 ms</b>
+
+            <label for="fl-head-fast" title="快速甩头时的平滑强度（越小越跟手）">头/脸 快速</label>
+            <input id="fl-head-fast" type="range" min="0" max="60" step="1" />
+            <b id="fl-head-fast-val">6 ms</b>
+
+            <label for="fl-body-slow" title="上半身慢速平滑（比头/脸更稳）">上半身 慢速</label>
+            <input id="fl-body-slow" type="range" min="0" max="500" step="10" />
+            <b id="fl-body-slow-val">260 ms</b>
+
+            <label for="fl-body-fast" title="上半身快速动作时的平滑强度">上半身 快速</label>
+            <input id="fl-body-fast" type="range" min="0" max="200" step="5" />
+            <b id="fl-body-fast-val">30 ms</b>
+          </div>
+          <div class="calib-actions">
+            <button id="btn-filter-reset" title="恢复默认滤波参数（含关闭总开关）">恢复默认</button>
+          </div>
+          <div class="hint" id="filter-hint">
+            慢速动作强滤波去抖、快速动作弱滤波跟手（快升慢降，不抖不肉）；头/脸更跟手、上半身更稳。
+            参数按角色自动保存，换角色各用各的；关闭总开关即完全回到旧滤波行为。手机端滤波不受影响。
           </div>
         </details>
 

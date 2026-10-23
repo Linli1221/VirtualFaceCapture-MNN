@@ -29,10 +29,20 @@ import {
   mapBshapes,
   mapBody,
   mapTrackToParams,
+  NORMALIZER_KNOB_DEFAULTS,
   parseUpperBody,
   readUpperBodyTrack,
   smoothBodyParams,
 } from "../renderer/mapping.js";
+import {
+  ParamFilterBank,
+  VelocityAdaptiveFilter,
+  decodeFilterProfiles,
+  encodeFilterProfiles,
+  filterGroupOf,
+  isDefaultFilterProfile,
+  sanitizeFilterProfile,
+} from "../renderer/filter.js";
 import { Live2DStage, toModelRange } from "../renderer/live2d.js";
 import { buildUpperBody } from "./mock-body.js";
 import {
@@ -1677,6 +1687,188 @@ await test("上半身链路（mock → readUpperBodyTrack → mapBody → smooth
     frame += 1;
   }
   assert.equal("ParamArmLA" in current, false, "1s 后应把手臂参数交还给 idle motion");
+});
+
+console.log("[selftest] filter.js / live2d.js · M4 最终表现层滤波（速度自适应、分组、总开关、角色 profile）");
+
+await test("M4 总开关默认关闭：滤波层不改变任何值（行为与现状一致）", () => {
+  const bank = new ParamFilterBank();
+  assert.equal(bank.enabled, false, "总开关默认必须是关");
+  for (const id of PARAM_IDS) assert.equal(bank.step(id, 12.3, 1000 / 60), 12.3);
+  assert.equal(bank.stepGroup("body", "torsoX", -7.5, 1000 / 60), -7.5);
+  const profile = sanitizeFilterProfile(null);
+  assert.equal(profile.enabled, false);
+  assert.equal(isDefaultFilterProfile(profile), true);
+});
+
+await test("M4 速度自适应：慢动作强滤波（慢速转头无可见抖动的量化替身）", () => {
+  const filter = new VelocityAdaptiveFilter(sanitizeFilterProfile({ enabled: true }).head, 30);
+  const dt = 1000 / 60;
+  let goal = 0;
+  let value = filter.step(goal, dt);
+  for (let i = 0; i < 20; i++) {
+    goal += 0.05; // 每帧 0.05 ≈ 0.18 量程/s：远低于 speedLow，应走强滤波档
+    value = filter.step(goal, dt);
+  }
+  assert.ok(goal - value > 0.15, `慢动作应被明显平滑（滞后 ${goal - value}）`);
+  assert.ok(filter.tauMs > 50, `慢动作 τ 应保持强滤波档（${filter.tauMs}）`);
+});
+
+await test("M4 速度自适应：快动作弱滤波（快速甩头更跟手）", () => {
+  const filter = new VelocityAdaptiveFilter(sanitizeFilterProfile({ enabled: true }).head, 30);
+  const dt = 1000 / 60;
+  let goal = 0;
+  let value = filter.step(goal, dt);
+  for (let i = 0; i < 8; i++) {
+    goal += 3; // 每帧 3 ≈ 6 量程/s：远高于 speedHigh，应走弱滤波档
+    value = filter.step(goal, dt);
+  }
+  assert.ok(Math.abs(goal - value) < 0.5, `快动作应几乎直通（误差 ${goal - value}）`);
+  assert.ok(filter.tauMs < 12, `快动作 τ 应降到弱滤波档（${filter.tauMs}）`);
+});
+
+await test("M4 快升慢降：动作一快马上弱滤波，停住后慢慢恢复强滤波（不抖不肉）", () => {
+  const profile = sanitizeFilterProfile({ enabled: true });
+  assert.ok(profile.head.attackMs < profile.head.releaseMs, "配置层面必须快升慢降");
+  const filter = new VelocityAdaptiveFilter(profile.head, 30);
+  const dt = 1000 / 60;
+  let goal = 0;
+  filter.step(goal, dt);
+  for (let i = 0; i < 8; i++) {
+    goal += 3;
+    filter.step(goal, dt);
+  }
+  const weakTau = filter.tauMs;
+  assert.ok(weakTau < 12, `快动作后 τ 应已降到弱档（${weakTau}）`);
+  for (let i = 0; i < Math.round(300 / dt); i++) filter.step(goal, dt); // 停住 300 ms
+  const recoveredTau = filter.tauMs;
+  assert.ok(recoveredTau > weakTau + 5, `停止后 τ 应缓慢回升（${weakTau} → ${recoveredTau}）`);
+  assert.ok(recoveredTau < profile.head.slowTauMs - 10, `300 ms 内不应完全恢复强滤波（${recoveredTau}）`);
+});
+
+await test("M4 头/脸与上半身分开配置：头更跟手、上半身更稳", () => {
+  assert.equal(filterGroupOf("ParamAngleX"), "head");
+  assert.equal(filterGroupOf("ParamEyeLOpen"), "head");
+  assert.equal(filterGroupOf("ParamMouthOpenY"), "head");
+  assert.equal(filterGroupOf("ParamBodyAngleX"), "body");
+  assert.equal(filterGroupOf("ParamArmLA"), "body");
+  const bank = new ParamFilterBank(sanitizeFilterProfile({ enabled: true }));
+  const dt = 1000 / 60;
+  bank.step("ParamAngleX", 0, dt);
+  bank.step("ParamBodyAngleY", 0, dt);
+  let goal = 0;
+  let head = 0;
+  let body = 0;
+  for (let i = 0; i < 30; i++) {
+    goal += 0.05;
+    head = bank.step("ParamAngleX", goal, dt);
+    body = bank.step("ParamBodyAngleY", goal, dt);
+  }
+  assert.ok(goal - head > 0.1, `头/脸慢速仍应有平滑（滞后 ${goal - head}）`);
+  assert.ok(goal - body > goal - head + 0.1, `上半身应比头/脸更稳（头 ${goal - head} / 身 ${goal - body}）`);
+});
+
+await test("M4 AdaptiveAngleNormalizer 保持「向外快、向内慢」：扩张 0.1、收缩 0.05/0.01（默认逐位一致）", () => {
+  assert.deepEqual({ ...NORMALIZER_KNOB_DEFAULTS }, {
+    adaptationRate: 0.1,
+    contractAlphaEarly: 0.05,
+    contractAlphaLate: 0.01,
+    contractScale: 0.1,
+  });
+  const n = new AdaptiveAngleNormalizer(20, 40, 10);
+  assert.deepEqual(n.knobs, { ...NORMALIZER_KNOB_DEFAULTS });
+  // 与旧公式逐位对照：向外 (a-pct)*0.1（快）；向内 (a-pct)*alpha*0.1（慢）
+  let legacy = 0;
+  for (let i = 1; i <= 60; i++) {
+    n.update(10);
+    legacy += (10 - legacy) * 0.1;
+  }
+  near(n.pctPos, legacy, 1e-12);
+  for (let i = 1; i <= 60; i++) {
+    n.update(2);
+    const alpha = 60 + i < 100 ? 0.05 : 0.01; // 收缩 alpha：前 100 帧 0.05 / 之后 0.01
+    legacy += (2 - legacy) * alpha * 0.1;
+  }
+  near(n.pctPos, legacy, 1e-12);
+  assert.ok(n.pctPos > 2, "向内收缩要慢：120 帧后观测量程仍应远离 2");
+  // 旋钮可按角色 profile 覆盖；恢复默认后与旧行为逐位一致
+  n.configure({ adaptationRate: 0.2, contractScale: 0.5 });
+  assert.equal(n.rate, 0.2);
+  assert.equal(n.knobs.contractScale, 0.5);
+  n.configure(null);
+  assert.deepEqual(n.knobs, { ...NORMALIZER_KNOB_DEFAULTS });
+});
+
+await test("M4 滤波 profile：坏数据容忍 + 序列化往返（可按角色保存）", () => {
+  const raw = { enabled: 1, head: { slowTauMs: 5000, fastTauMs: -3, speedLow: "x" }, body: { attackMs: 0.5 }, junk: 1 };
+  const profile = sanitizeFilterProfile(raw);
+  assert.equal(profile.enabled, true);
+  assert.equal(profile.head.slowTauMs, 600); // clamp 上限
+  assert.equal(profile.head.fastTauMs, 0); // clamp 下限
+  assert.equal(profile.head.speedLow, 0.35); // 坏值回落默认
+  assert.equal(profile.body.attackMs, 1); // clamp 到 ≥1 ms
+  assert.equal("junk" in profile, false, "未知字段应丢弃");
+  assert.deepEqual(decodeFilterProfiles(encodeFilterProfiles({ ATRI: raw })), { ATRI: profile });
+  assert.deepEqual(decodeFilterProfiles("{ 坏 JSON"), {});
+});
+
+await test("M4 滤波参数随角色 profile 保存：不同角色各用各的，没存过的角色默认关闭", () => {
+  let store = decodePoseProfileStore(null);
+  store = setProfileFor(store, "ATRI", {
+    ...getProfileFor(store, "ATRI"),
+    filter: sanitizeFilterProfile({ enabled: true, head: { slowTauMs: 45, fastTauMs: 2 } }),
+  });
+  const round = decodePoseProfileStore(encodePoseProfileStore(store));
+  const filter = getProfileFor(round, "ATRI").filter;
+  assert.equal(filter.enabled, true);
+  assert.equal(filter.head.slowTauMs, 45);
+  assert.equal(filter.head.fastTauMs, 2);
+  assert.equal(getProfileFor(round, "Yuuka").filter.enabled, false, "没存过的角色默认关闭（旧行为）");
+});
+
+await test("M4 输入侧速度（interp.js feed-forward）：快推帧速度高、慢推帧速度低", () => {
+  const fast = new ParamTimeline({ jitterBuffer: false });
+  const slow = new ParamTimeline({ jitterBuffer: false });
+  let t = 0;
+  for (let i = 0; i < 5; i++) {
+    fast.push({ ParamAngleX: (i + 1) * 10 }, t); // 10 单位 / 33 ms ≈ 10 量程/s
+    slow.push({ ParamAngleX: (i + 1) * 0.3 }, t); // 0.3 单位 / 33 ms ≈ 0.3 量程/s
+    t += 33;
+  }
+  assert.ok(fast.speedOf("ParamAngleX") > 5, `快推帧速度应高（${fast.speedOf("ParamAngleX")}）`);
+  assert.ok(slow.speedOf("ParamAngleX") < 1, `慢推帧速度应低（${slow.speedOf("ParamAngleX")}）`);
+  assert.ok(fast.motionSpeed >= fast.speedOf("ParamAngleX"));
+});
+
+await test("M4 Live2DStage：开关关闭时与现状一致；打开后慢速平滑、快速跟手；单步/截图不受滤波影响", () => {
+  const dt = 1000 / 60;
+  // 关（默认）：smoothing=1 = 旧行为「立即落位」
+  const plain = new Live2DStage({ interpolate: false, smoothing: 1 });
+  plain.setTargetParams({ ParamAngleX: 12 });
+  near(plain._computeFrameValues(1000, false).ParamAngleX, 12);
+  assert.equal(plain.finalFilterEnabled, false);
+
+  // 开：慢速位移被平滑（滞后明显）
+  const stage = new Live2DStage({ interpolate: false, smoothing: 1 });
+  stage.setFilterProfile(sanitizeFilterProfile({ enabled: true }));
+  assert.equal(stage.finalFilterEnabled, true);
+  let goal = 0;
+  let value = 0;
+  stage.setTargetParams({ ParamAngleX: 0 });
+  stage._computeFrameValues(1000, false);
+  for (let i = 1; i <= 20; i++) {
+    goal += 0.05;
+    stage.setTargetParams({ ParamAngleX: goal });
+    value = stage._computeFrameValues(1000 + i * dt, false).ParamAngleX;
+  }
+  assert.ok(goal - value > 0.15, `滤波打开后慢速应有平滑（滞后 ${goal - value}）`);
+  // 单步 / 截图（immediate）：直接落位，不受滤波拖累
+  stage.setTargetParams({ ParamAngleX: 30 });
+  near(stage._computeFrameValues(3000, true).ParamAngleX, 30);
+  // 关闭总开关：完全回到现有滤波参数（smoothing=1 → 立即落位）
+  stage.setFinalFilter(false);
+  stage.setTargetParams({ ParamAngleX: 5 });
+  near(stage._computeFrameValues(4000, false).ParamAngleX, 5);
 });
 
 const failed = results.filter((r) => !r.ok);
