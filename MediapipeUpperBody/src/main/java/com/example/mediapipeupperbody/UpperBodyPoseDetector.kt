@@ -28,7 +28,7 @@ import kotlin.math.max
  *   → 只裁 ROI + 旋转 + 镜像 + 采样缩放到长边上限 320（只缩不放）的 ARGB Bitmap
  *   → detectAsync()（异步，同一时刻最多一个在飞）
  *   → MediaPipe 回调线程：33 点 → mapLocalToPreview 回映到整帧 → 13 点
- *     → One-Euro 平滑 → 相对基线躯干角
+ *     → One-Euro 平滑 → 相对基线躯干角（[rawOutput] = true 时跳过平滑 / 基线，产出原始点）
  *   → onResult(UpperBodyPoseFrame)
  * ```
  *
@@ -175,6 +175,29 @@ class UpperBodyPoseDetector(context: Context) {
     private var inFlightBitmap: Bitmap? = null
 
     private var lastPipelineTimestampMs: Long = 0L
+
+    /**
+     * 「原始输出」模式（任务 M2，协议 `ubRaw`）：true 时 [buildFrame] 跳过 One-Euro 平滑 /
+     * 躯干角平滑 / [TorsoBaseline]，直接产出原始 13 点与**未平滑、未减基线**的原始躯干角，
+     * 供 PC 侧做后处理（One-Euro / 躯干角 / 基线迁到 PC）。
+     *
+     * 切换时在 [pipelineLock] 里清掉 smoother / 基线 / dt 锚点，保证切换干净：
+     * 两种模式的滤波状态互不污染，切回来也不会把旧位置拖过来。
+     * false（默认）时走 M1 的原有链路，任何数值与改动前完全一致。
+     *
+     * 由 TrackingServer 的协商聚合（所有客户端都声明 upperBodyPostV1）驱动。
+     */
+    @Volatile
+    var rawOutput: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            synchronized(pipelineLock) {
+                smoother.reset()
+                lastPipelineTimestampMs = 0L
+                baseline.reset()
+            }
+        }
 
     // ------------------------------ 查询 ------------------------------
 
@@ -596,7 +619,9 @@ class UpperBodyPoseDetector(context: Context) {
                 smoother.reset()
                 lastPipelineTimestampMs = 0L
             }
-            return UpperBodyPoseFrame.empty(frameTimestampMs)
+            // 空帧也带上当前模式标记（ubOk=false 时协议的 ubRaw 仍逐帧出现，语义不来回跳）
+            val empty = UpperBodyPoseFrame.empty(frameTimestampMs)
+            return if (rawOutput) empty.copy(rawMode = true) else empty
         }
 
         // ROI 帧成功：清掉可能残留的回退窗口（回退窗口内的帧一定不是 ROI 帧，
@@ -605,28 +630,38 @@ class UpperBodyPoseDetector(context: Context) {
             fallbackUntilMs = 0L
         }
 
+        // 任务 M2：rawOutput = true 时跳过 One-Euro / smoothTorso / TorsoBaseline，
+        // points / torso 直接来自原始提取点（未平滑、未减基线），由 PC 侧做后处理；
+        // rawOutput = false 时走 M1 的原有链路，计算过程逐行保持不变。
+        val useRaw = rawOutput
         val smoothed: List<BodyPoint>
-        val relativeTorso: TorsoAngles
-        synchronized(pipelineLock) {
-            val dtSeconds = if (lastPipelineTimestampMs > 0L) {
-                ((frameTimestampMs - lastPipelineTimestampMs).coerceIn(1L, MAX_PIPELINE_GAP_MS)) / 1000f
-            } else {
-                1f / targetFps.coerceIn(1, 60)
-            }
-            lastPipelineTimestampMs = frameTimestampMs
+        val frameTorso: TorsoAngles
+        if (useRaw) {
+            smoothed = points
+            frameTorso = UpperBodyGeometry.torso(points)
+        } else {
+            synchronized(pipelineLock) {
+                val dtSeconds = if (lastPipelineTimestampMs > 0L) {
+                    ((frameTimestampMs - lastPipelineTimestampMs).coerceIn(1L, MAX_PIPELINE_GAP_MS)) / 1000f
+                } else {
+                    1f / targetFps.coerceIn(1, 60)
+                }
+                lastPipelineTimestampMs = frameTimestampMs
 
-            smoothed = smoother.smooth(points, dtSeconds)
-            val rawTorso = UpperBodyGeometry.torso(smoothed)
-            val smoothTorso = smoother.smoothTorso(rawTorso, dtSeconds)
-            relativeTorso = baseline.apply(smoothTorso)
+                smoothed = smoother.smooth(points, dtSeconds)
+                val rawTorso = UpperBodyGeometry.torso(smoothed)
+                val smoothTorso = smoother.smoothTorso(rawTorso, dtSeconds)
+                frameTorso = baseline.apply(smoothTorso)
+            }
         }
 
         return UpperBodyPoseFrame(
             points = smoothed,
-            torso = if (relativeTorso.isValid) relativeTorso else TorsoAngles.ZERO,
+            torso = if (frameTorso.isValid) frameTorso else TorsoAngles.ZERO,
             tracking = true,
             quality = UpperBodyGeometry.quality(points),
             timestampMs = frameTimestampMs,
+            rawMode = useRaw,
         )
     }
 

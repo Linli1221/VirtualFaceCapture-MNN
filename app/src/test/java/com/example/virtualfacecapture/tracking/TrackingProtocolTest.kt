@@ -9,6 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -23,6 +24,8 @@ import org.junit.Test
  *  5. 上半身增量字段（hello.upperBody、track.ubOk/ub/ubT/body）的开关、边界与数值清洗
  *  6. 客户端 hello 协商（§4.5）：CLIENT_HELLO 归类与 features 解析（宽容、纯函数）
  *  7. send.bufferMs 配置归一化与生效缓冲回落规则（§7.1 的纯函数）
+ *  8. 任务 M2：upperBodyPostV1 协商（features 数组 / 顶层布尔兜底）与 ubRaw / ubRawBody
+ *     报文语义（未协商逐字节不变、raw 帧 body 与 ubRawBody 同值、ubOk=false 结构稳定）
  */
 class TrackingProtocolTest {
 
@@ -709,5 +712,211 @@ class TrackingProtocolTest {
         assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 2, 1))
         assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 1, 0))
         assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(0L, 4, 3))
+    }
+
+    // -------------------------- 任务 M2：upperBodyPostV1 协商与 ubRaw / ubRawBody
+
+    /**
+     * 13 个点全是 (0.25, 0.5, -0.25, 0.75)、躯干角 (3.5, -2.25) 的样例帧。
+     * 数值都是二进制精确小数（decimal4 后逐字节可预期），且 roll / yaw 非对称，
+     * 能抓住 roll / yaw 写反之类的错误。
+     */
+    private fun exactUpperBody(rawMode: Boolean = false): UpperBodyPoseFrame = UpperBodyPoseFrame(
+        points = List(UpperBodyLandmarkIndex.COUNT) { BodyPoint(0.25f, 0.5f, -0.25f, 0.75f) },
+        torso = TorsoAngles(roll = 3.5f, yaw = -2.25f),
+        tracking = true,
+        quality = 1f,
+        timestampMs = 100L,
+        rawMode = rawMode,
+    )
+
+    /** 用 [exactUpperBody] 帧 + 全 0 bs / pose 构造 track（参数完全确定，输出可逐字节对比）。 */
+    private fun exactTrack(
+        upperBody: UpperBodyPoseFrame? = null,
+        upperBodyOk: Boolean = upperBody != null && upperBody.isUsable(),
+        upperBodyPostV1: Boolean = false,
+    ): String = TrackingProtocol.buildTrack(
+        seq = 7L,
+        timestampMs = 9L,
+        bs = FloatArray(52),
+        pose = floatArrayOf(0f, 0f, 0f),
+        face = false,
+        score = 0f,
+        fps = 0f,
+        calibrating = false,
+        upperBody = upperBody,
+        upperBodyOk = upperBodyOk,
+        upperBodyPostV1 = upperBodyPostV1,
+    )
+
+    /** [exactTrack] 在未协商（无 ubRaw）时的金样报文。 */
+    private fun exactGoldenTrack(): String {
+        val zeros = (0 until 52).joinToString(",") { "0" }
+        val point = "0.25,0.5,-0.25,0.75"
+        val ub = (0 until 13).joinToString(",") { point }
+        return "{\"type\":\"track\",\"seq\":7,\"t\":9,\"bs\":[$zeros]," +
+            "\"pose\":[0,0,0],\"face\":false,\"score\":0,\"fps\":0,\"calibrating\":false," +
+            "\"ubOk\":true,\"ub\":[$ub],\"ubT\":100,\"body\":[3.5,-2.25]}"
+    }
+
+    @Test
+    fun helloAdvertisesUpperBodyPostV1OnlyWhenRequested() {
+        val enabled = TrackingProtocol.buildHello(
+            device = "Pixel 8 Pro",
+            app = "app",
+            upperBody = true,
+            upperBodyPostV1 = true,
+        )
+        assertTrue(JSONObject(enabled).getBoolean("upperBodyPostV1"))
+        // 字段顺序稳定：upperBody / upperBodyPostV1 之后才是 t（协议 §4.1）
+        assertTrue(
+            "hello 字段顺序必须稳定: " + enabled,
+            enabled.contains("\"upperBody\":true,\"upperBodyPostV1\":true,\"t\":"),
+        )
+
+        val disabled = TrackingProtocol.buildHello(device = "Pixel 8 Pro", app = "app", upperBody = true)
+        assertFalse("未声明 upperBodyPostV1 时 hello 不应带该字段", JSONObject(disabled).has("upperBodyPostV1"))
+        // 默认参数的 hello 与改动前逐字节一致
+        assertEquals(
+            "{\"type\":\"hello\",\"protocol\":\"vfc-tracker\",\"version\":1," +
+                "\"device\":\"Pixel 8 Pro\",\"app\":\"app\",\"decimation\":1,\"targetFps\":60," +
+                "\"upperBody\":true,\"t\":1730000000000}",
+            TrackingProtocol.buildHello(
+                device = "Pixel 8 Pro",
+                app = "app",
+                upperBody = true,
+                timestampMs = 1730000000000L,
+            ),
+        )
+    }
+
+    @Test
+    fun buildTrackIsByteIdenticalWhenNotNegotiated() {
+        val golden = exactGoldenTrack()
+        // 默认参数（未协商）：与金样逐字节一致
+        assertEquals(golden, exactTrack(upperBody = exactUpperBody()))
+        // 显式 false：同样逐字节一致
+        assertEquals(golden, exactTrack(upperBody = exactUpperBody(), upperBodyPostV1 = false))
+        // 已协商但本帧不是 raw（rawMode=false）：raw 判定 = upperBodyPostV1 && rawMode 仍为假，
+        // 报文与金样逐字节一致，ubRaw 不出现
+        assertEquals(golden, exactTrack(upperBody = exactUpperBody(), upperBodyPostV1 = true))
+        assertFalse(JSONObject(exactTrack(upperBody = exactUpperBody(), upperBodyPostV1 = true)).has("ubRaw"))
+    }
+
+    @Test
+    fun rawFrameCarriesUbRawAndAliasUbRawBody() {
+        val raw = exactTrack(upperBody = exactUpperBody(rawMode = true), upperBodyPostV1 = true)
+        // 逐字节：在 body 之后追加 ubRaw / ubRawBody，其余与金样完全一致
+        assertEquals(
+            exactGoldenTrack().dropLast(1) + ",\"ubRaw\":true,\"ubRawBody\":[3.5,-2.25]}",
+            raw,
+        )
+
+        val json = JSONObject(raw)
+        assertTrue(json.getBoolean("ubRaw"))
+        // 非对称值（roll=3.5, yaw=-2.25）：body 与 ubRawBody 同值同义，且顺序不许写反
+        val body = json.getJSONArray("body")
+        val ubRawBody = json.getJSONArray("ubRawBody")
+        assertEquals(3.5, body.getDouble(0), 0.0)
+        assertEquals(-2.25, body.getDouble(1), 0.0)
+        assertEquals(3.5, ubRawBody.getDouble(0), 0.0)
+        assertEquals(-2.25, ubRawBody.getDouble(1), 0.0)
+    }
+
+    @Test
+    fun rawFrameKeepsStableZeroStructureWhenNotOk() {
+        // ubOk=false（tracking=false）时：ub 52 个 0、body [0,0]，但 raw 判定为真则
+        // ubRaw / ubRawBody 照样出现（ubRawBody [0,0]），逐帧语义一致
+        val raw = exactTrack(
+            upperBody = exactUpperBody(rawMode = true).copy(tracking = false),
+            upperBodyPostV1 = true,
+        )
+        val json = JSONObject(raw)
+        assertFalse(json.getBoolean("ubOk"))
+        val ub = json.getJSONArray("ub")
+        assertEquals(52, ub.length())
+        for (index in 0 until 52) {
+            assertEquals("ubOk=false 时 ub 必须全 0（下标 " + index + "）", 0.0, ub.getDouble(index), 0.0)
+        }
+        val body = json.getJSONArray("body")
+        assertEquals(0.0, body.getDouble(0), 0.0)
+        assertEquals(0.0, body.getDouble(1), 0.0)
+        assertTrue("raw 判定为真时 ubRaw 必须仍在", json.getBoolean("ubRaw"))
+        val ubRawBody = json.getJSONArray("ubRawBody")
+        assertEquals(0.0, ubRawBody.getDouble(0), 0.0)
+        assertEquals(0.0, ubRawBody.getDouble(1), 0.0)
+
+        // 未协商时同一帧（含 ubOk=false）不带 ubRaw，回到 M1 的稳定零结构
+        val old = JSONObject(
+            exactTrack(upperBody = exactUpperBody(rawMode = true).copy(tracking = false))
+        )
+        assertFalse("未协商时 ubRaw 绝不能出现", old.has("ubRaw"))
+        assertFalse(old.has("ubRawBody"))
+    }
+
+    @Test
+    fun clientHelloNegotiatesUpperBodyPostV1() {
+        // features 数组形式（PC 真实格式）→ CLIENT_HELLO，且 features 含 upperBodyPostV1
+        val featureHello = "{\"type\":\"hello\",\"protocol\":\"vfc-tracker\",\"version\":1," +
+            "\"features\":[\"jitterBufferV1\",\"upperBodyPostV1\"],\"t\":1730000000123}"
+        assertEquals(
+            TrackingProtocol.ClientMessage.CLIENT_HELLO,
+            TrackingProtocol.classifyClientMessage(featureHello),
+        )
+        assertTrue(
+            TrackingProtocol.parseClientFeatures(featureHello)
+                .contains(TrackingProtocol.FEATURE_UPPER_BODY_POST_V1)
+        )
+
+        // 顶层布尔兜底形式 → CLIENT_HELLO，parseBoolField 能读到 true
+        val boolHello = """{"type":"hello","upperBodyPostV1":true}"""
+        assertEquals(
+            TrackingProtocol.ClientMessage.CLIENT_HELLO,
+            TrackingProtocol.classifyClientMessage(boolHello),
+        )
+        assertEquals(true, TrackingProtocol.parseBoolField(boolHello, "upperBodyPostV1"))
+
+        // 缺字段 / 字段 false 也还是 CLIENT_HELLO（是否协商由调用方看字段值）
+        assertEquals(
+            TrackingProtocol.ClientMessage.CLIENT_HELLO,
+            TrackingProtocol.classifyClientMessage("""{"type":"hello"}"""),
+        )
+        assertEquals(
+            TrackingProtocol.ClientMessage.CLIENT_HELLO,
+            TrackingProtocol.classifyClientMessage("""{"type":"hello","upperBodyPostV1":false}"""),
+        )
+        assertEquals(false, TrackingProtocol.parseBoolField("""{"type":"hello","upperBodyPostV1":false}""", "upperBodyPostV1"))
+
+        // 畸形 hello → IGNORED（不抛异常）
+        for (message in listOf(
+            """{"type":"hello""",
+            """{"type":"hello,"upperBodyPostV1":true}""",
+            """{"type":"hellox","upperBodyPostV1":true}""",
+            """{"upperBodyPostV1":true}""",
+        )) {
+            assertEquals(
+                "畸形 hello 必须被忽略: " + message,
+                TrackingProtocol.ClientMessage.IGNORED,
+                TrackingProtocol.classifyClientMessage(message),
+            )
+        }
+    }
+
+    @Test
+    fun parseBoolFieldReadsOnlyTrueAndFalseLiterals() {
+        assertEquals(true, TrackingProtocol.parseBoolField("""{"a":true}""", "a"))
+        assertEquals(false, TrackingProtocol.parseBoolField("""{"a":false}""", "a"))
+        // 字段序 / 空白不影响
+        assertEquals(true, TrackingProtocol.parseBoolField("""{ "x" : 1 , "a" : true }""", "a"))
+        // 缺字段 / 非布尔字面量一律 null
+        assertNull(TrackingProtocol.parseBoolField("""{"x":1}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("""{"a":1}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("""{"a":"true"}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("""{"a":null}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("""{"a":tru}""", "a"))
+        // 字面量后面紧跟标识符字符的不算
+        assertNull(TrackingProtocol.parseBoolField("""{"a":truex}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("""{"a":falsex}""", "a"))
+        assertNull(TrackingProtocol.parseBoolField("", "a"))
     }
 }

@@ -180,16 +180,21 @@ data class TorsoAngles(
 }
 
 /**
- * 一帧上半身关键点结果（MediaPipe Pose 产出 → 手机端平滑 / 基线后的结果）。
+ * 一帧上半身关键点结果（MediaPipe Pose 产出 → 手机端平滑 / 基线后的结果；[rawMode] = true
+ * 时跳过平滑 / 基线，直接产出原始点与原始躯干角，供 PC 侧做后处理）。
  *
  * 当 [tracking] = false 时 [points] 是长度 [UpperBodyLandmarkIndex.COUNT] 的全 0 占位，
  * [torso] 为 0，调用方（协议 / 客户端）应把形象的手臂平滑回默认姿态，而不是保留旧值。
  *
  * @param points 13 个点，顺序严格按 [UpperBodyLandmarkIndex.ORDER]
- * @param torso 相对躯干角（已减基线）
+ * @param torso 相对躯干角（已减基线）；[rawMode] = true 时是**原始躯干角**（未平滑、未减基线）
  * @param tracking 本帧是否真的检出了上半身
  * @param quality 关键点平均可见度 [0,1]，可以当置信度用
  * @param timestampMs 采集时间（手机本地 Unix 毫秒）
+ * @param rawMode 本帧是否为「原始输出」（任务 M2，协议 `ubRaw`）：true 时 [points] 是
+ *   **未做 One-Euro 的原始点**、[torso] 是**未平滑、未减基线的原始躯干角**（x/y 已镜像、
+ *   z 仍为相对深度）；false（默认）时与 M1 完全一致 = 平滑 + 基线后的结果。
+ *   语义由协议的 `ubRaw` 字段显式声明，两种模式各自写清，不存在「字段名没变但语义变了」。
  */
 data class UpperBodyPoseFrame(
     val points: List<BodyPoint> = emptyList(),
@@ -197,6 +202,7 @@ data class UpperBodyPoseFrame(
     val tracking: Boolean = false,
     val quality: Float = 0f,
     val timestampMs: Long = 0L,
+    val rawMode: Boolean = false,
 ) {
     /** 取第 [protocolIndex] 个点（协议顺序），越界返回 [BodyPoint.ZERO]。 */
     fun point(protocolIndex: Int): BodyPoint =

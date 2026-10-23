@@ -105,6 +105,7 @@
 | `decimation` | int | 每处理 N 帧发 1 帧（1 = 全量；手机端为省电/省带宽时可 >1） |
 | `targetFps` | int | 手机当前的目标输出帧率 |
 | `upperBody` | bool | **可选**：手机端上半身采集已启用。仅开启时下发 `true`，关闭时字段不出现（不是 `false`） |
+| `upperBodyPostV1` | bool | **可选**：手机支持把上半身后处理（One-Euro / 躯干角 / TorsoBaseline）交给客户端。仅支持时下发 `true`。与 §4.5 客户端 `features` 里的 `upperBodyPostV1` **都**出现才启用原始模式（`track.ubRaw`） |
 | `t` | int | 手机本地 Unix 毫秒时间戳 |
 
 > `upperBody` 只是**建连那一刻**的能力声明，**不代表每帧都有结果**；每帧是否有效看
@@ -147,7 +148,9 @@
 | `ubOk` | bool | — | 本帧是否有可用的上半身结果。**开启上半身时每帧都出现**；`false` = 丢失 / 过期，客户端平滑回默认姿态 |
 | `ub` | float[52] | — | 13 点 × `[x, y, z, visibility]`，顺序见 §5.3。`ubOk=false` 时仍是 52 个 `0`（结构稳定） |
 | `ubT` | int | — | 该**关键点帧**的手机采集时间（ms）。`0` = 已启用但还没收到过有效帧 |
-| `body` | float[2] | — | 相对基线的躯干角 `[roll, yaw]`（度），符号见 §5.3；`ubOk=false` 时为 `[0,0]` |
+| `body` | float[2] | — | 躯干角 `[roll, yaw]`（度），符号见 §5.3；`ubOk=false` 时为 `[0,0]`。**语义由 `ubRaw` 显式声明**：`ubRaw` 缺省 = 已减基线的相对角（旧语义，逐字节不变）；`ubRaw:true` = **原始角**（未 One-Euro、未减基线），平滑与基线由客户端负责 |
+| `ubRaw` | bool | — | **可选**（§4.1 / §4.5 协商成功才发）：`true` = 本帧 `ub` 是**原始点**（未 One-Euro、未减基线；x/y 仍已镜像、z 仍为相对深度），`body` / `ubRawBody` 是原始角。字段缺省 = 旧语义，老客户端不受影响 |
+| `ubRawBody` | float[2] | — | **可选**：手机端算出的原始躯干角（未平滑、未减基线）。与 `body`（`ubRaw:true` 时）**同值同义**的显式命名别名，供客户端按名取角 / 对拍；两者万一不一致以 `ubRawBody` 为准 |
 
 数值建议保留 **4 位小数**（`0.1235`），够用且省带宽。
 
@@ -163,6 +166,13 @@
   关键点有多旧（正常 ≤ 66 ms）；**不要**把 `ubT` 和 PC 本机时钟直接相减（两端时钟不同步，§7.8）。
   是否过期仍以 `ubOk` 为准——服务端已经用手机时钟做过 1500 ms 判定。
 - `body` 已减基线：手机端重新打开上半身开关 / 重置基线后归零，客户端应同步把身体参数淡回中位。
+- **`ubRaw` 模式（upperBodyPostV1，M2）**：协商成功后手机只做「推理 → 抽 13 点 → isTracking」，
+  `ub` 发**原始点**、`body` / `ubRawBody` 发**原始角**；One-Euro 平滑、躯干角重算、TorsoBaseline
+  全部由客户端实现（参数与算法见 docs/upper-body.md §3.2），便于按角色个性化与手动重置基线。
+  未协商成功（手机没发 `hello.upperBodyPostV1` 或客户端没声明 `features`）时手机**继续走原有
+  完整后处理链**，报文与 v1 老语义逐字节一致。`ubOk` / `ub` / `ubT` / `body` 的全有或全无规则不变。
+  多客户端时只有**所有**已连接客户端都声明 `upperBodyPostV1` 才启用原始模式（track 是广播同一条，
+  混合客户端时全体回退旧链，保证每个客户端收到的语义与其协商一致）。
 
 ### 4.3 `calib`
 
@@ -194,7 +204,8 @@
 ### 4.5 客户端 `hello`（能力协商，纯增量）
 
 连接建立后客户端**可选**发送一次，声明自己支持的能力。手机收到后据此决定
-`send.bufferMs=0` 的低延迟模式能否真正生效（见 §7.1）；**不发也完全兼容**。
+`send.bufferMs=0` 的低延迟模式能否真正生效（见 §7.1），以及 `track.ubRaw` 原始模式
+（§4.2）能否启用；**不发也完全兼容**。
 
 ```json
 {"type":"hello","protocol":"vfc-tracker","version":1,"features":["jitterBufferV1"],"t":1730000000000}
@@ -210,6 +221,7 @@
 | `features` 标记 | 含义 |
 |------|------|
 | `jitterBufferV1` | 客户端实现了**自适应抖动缓冲**（`windows-client` 侧，见 docs/jitter-buffer.md）：手机可以关闭发送帧缓冲（`send.bufferMs=0`）算完即发，帧间隔抖动由客户端吸收 |
+| `upperBodyPostV1` | 客户端实现了**上半身后处理链**（One-Euro 平滑 / 躯干角 / TorsoBaseline，见 docs/upper-body.md §3.2）：手机可以只发**原始** 13 点与原始角（`track.ubRaw:true` / `ubRawBody`），平滑与基线由客户端按角色个性化、支持持久化与手动重置 |
 
 解析规则（与「未知字段忽略」一致）：
 
@@ -624,5 +636,7 @@ setParam("ParamHandR", clamp(forearmDeg(p(P_RIGHT_ELBOW), p(P_RIGHT_WRIST), "R")
 
 - 每条消息都可能新增字段；**加减字段不需要升 version**，"语义不兼容"才升。
 - `hello.version` 不匹配时：客户端提示"协议版本不一致"，但**仍可尝试只读 `track`**。
+- `ubRaw` / `ubRawBody` 是**显式声明**的语义切换：`body` 的含义只随 `ubRaw` 变化并有独立别名
+  `ubRawBody`，不存在「字段名没变但语义变了」；未协商的客户端永远看不到这两个字段。
 - v0.x 的 WebP / MJPEG / OBS 浏览器源接口已删除；如仍需 OBS 叠加，请用 Windows 客户端的
   「透明置顶窗口」把形象叠在画面最上层。

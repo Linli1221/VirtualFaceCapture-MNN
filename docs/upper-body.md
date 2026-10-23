@@ -40,6 +40,7 @@ app: UpperBodyPoseController                 ← 生命周期 / 开关 / 基线 
    │  ③ 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI → ARGB Bitmap（长边上限 320）
    │     无脸框 / 脸太小 / ROI 太小 → 整帧 320p；ROI miss → 1s 整帧回退
    │  ④ 33 点先回映整帧预览坐标 → 取 13 点 → One-Euro 平滑 → 相对基线 (roll/yaw)
+   │     （upperBodyPostV1 协商成功时 ④ 只到「取 13 点」，平滑/基线在 PC，见 §3.7）
    ▼
 UpperBodyPoseFrame (CommonData)
    ├─► CameraPreviewView.updateUpperBody()     手机预览上的骨架叠加
@@ -137,6 +138,8 @@ class Yuv420Frame(
 6. **平滑 / 基线**：逐点 One-Euro（位置）平滑；`resetBaseline()` 后从接下来 ~10 个有效帧
    取均值作为中性肩线，`TorsoAngles` 输出相对值（肩线 roll、绕竖轴 yaw，单位度）。
    `tracking = false` 的帧 `torso = ZERO`，`points` 用 `UpperBodyPoseFrame.empty()`。
+   ⚠️ **upperBodyPostV1 协商成功时本条整体跳过**（平滑 / 躯干角 / 基线迁到 PC，见 §3.7）；
+   未协商时保持本条不变。
 7. **线程**：`pushFrame` 应在相机线程 / tap 回调里调用（ByteBuffer 只在回调内有效；内部
    立即完成 ROI 采样与 Bitmap 构造）；`onResult` 在 MediaPipe 回调线程；内部状态用锁保护。
    ROI 帧没跟踪到上半身时，接下来 **1000ms** 一律整帧再试（避免 ROI/整帧逐帧交替），
@@ -226,6 +229,84 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
   `tools/verify/mapping-test.mjs`（仓库根，协议契约）新增解析 / 骨骼 / 映射 / 平滑 /
   全链路用例。
 
+### 3.7 上半身后处理迁移（upperBodyPostV1，任务 M2）
+
+**动机**：One-Euro 平滑、躯干角计算、TorsoBaseline 原先在手机端（§3.2 第 6 条），无法按
+角色个性化、不能持久化基线、与 PC 渲染层 160ms 低通形成双重过度平滑。M2 把这三步迁到
+PC，手机只保留「推理 → 抽 13 点 → isTracking」。
+
+**协商**（协议 §4.1 / §4.2 / §4.5）：手机 `hello` 带 `upperBodyPostV1:true`（能力），
+客户端 `hello.features` 含 `"upperBodyPostV1"`（能力）；**两者都出现**才启用原始模式，
+此时 `track.ubRaw:true`、`ubRawBody:[roll,yaw]`，`body` = **原始角**（语义由 `ubRaw` 显式
+声明，不存在「字段名没变但语义变了」）。未协商成功时手机继续走原有完整后处理链，报文
+与 v1 老语义逐字节一致。多客户端时只有**所有**已连接客户端都声明能力才启用（track 是
+广播同一条报文，混合客户端时全体回退旧链）。
+
+**责任划分**：
+
+| 步骤 | 手机（新） | PC（新，`mapping.js`） |
+|---|---|---|
+| YUV→Bitmap、ROI、detectAsync、15fps 限帧、单飞、generation | ✅ 保留（不变） | — |
+| 33 点 → 13 点（extract）、isTracking（>0.5 至少 7 点） | ✅ 保留（不变） | — |
+| One-Euro 平滑 13 点 xyz | ❌ 原始模式跳过 | ✅ `UpperBodyPostProcessor` |
+| 躯干角（roll / yaw） | 算原始角（发 `ubRawBody`，对拍用） | ✅ `computeTorsoAngles`（对平滑点） |
+| 躯干角 One-Euro | ❌ 原始模式跳过 | ✅ `torsoFilters` |
+| TorsoBaseline（10 帧均值 + 渐入） | ❌ 原始模式跳过 | ✅ `TorsoBaseline`（可持久化 / 手动重置） |
+| mapBody / smoothBodyParams / 三层回退 | — | ✅ 不变 |
+
+**算法契约（PC 与 Kotlin 必须逐行等价）**：
+
+- One-Euro：`cutoff = minCutoff + beta·|edx|`，`tau = 1/(2π·cutoff)`，`alpha = 1/(1+tau/dt)`；
+  dt ≤ 0 按 1ms、dt > 0.5s 截断；13 点 xyz 用 `minCutoff=1.2, beta=0.02`，
+  躯干 roll/yaw 用 `minCutoff=0.6, beta=0.01`（derivativeCutoff=1.0）。
+- 躯干角（`computeTorsoAngles`，禁止直接除 dx）：
+  `horizontal = max(|right.x − left.x|, 0.02)`；
+  `roll = deg(atan2(right.y − left.y, horizontal))`（右肩下沉为正）；
+  `yaw = deg(atan2(−(right.z − left.z), horizontal))`（本人左侧转为正）。
+  肩线不可见按 肩→肘→胯 退化；**0.02 分母下限必须保留**（两肩画面重合时不出几十度假角度）。
+  z 是相对深度（非米制、非角度），只进 atan2。
+- TorsoBaseline：10 个有效帧均值为中性姿态；前 10 帧输出 = (当前 − 均值) × collected/10
+  渐入（起播 10 帧内不从 0 突跳到基线）；之后输出 = 当前 − 基线。
+- dt 规则：无锚点（首帧 / tracking 丢失后）→ 1/15 s；否则 `clamp(t − lastT, 1, 500)ms`。
+- tracking 丢失（ubOk=false / 过期）→ 平滑器全重置 + dt 锚点清零，**基线不动**；
+  坏点（x=y=z=v=0）透传不参与平滑。
+- 顺序（与 Kotlin `buildFrame` 一致）：平滑点 → 对**平滑点**算躯干角 → 躯干角平滑 → 基线。
+
+**滤波责任归属与总时间常数估算**（一阶串联 ≈ 时间常数相加）：
+
+| 层 | 归属 | 内容 | τ（低速最坏） |
+|---|---|---|---|
+| 信号调理 | PC `UpperBodyPostProcessor`（One-Euro，全链**唯一**去噪层） | 点 1.2Hz / 躯干 0.6Hz | 点 ≈ **133ms**、躯干 ≈ **265ms** |
+| 观感层 | `live2d.js` / M4 `filter.js`（**只允许一层**轻量低通） | 原始模式建议 ≤60ms（`RAW_BODY_RENDER_TAU_MS`）；未协商保持旧 160ms 不变 | **60ms**（旧链 160ms） |
+| 丢帧处置 | `readUpperBodyTrack` + `smoothBodyParams`（**不是平滑**，不变） | 1500ms 过期 / ×0.85 按帧衰减 / 删参交还 idle | — |
+
+- 迁移前（手机 One-Euro + PC 160ms）：手臂/点 ≈ 133+160 ≈ **293ms**，躯干 ≈ 265+160 ≈ **425ms**；
+- 迁移后（PC One-Euro + 渲染 60ms）：手臂/点 ≈ 133+60 ≈ **193ms**，躯干 ≈ 265+60 ≈ **325ms**；
+- 渲染层 τ 配到 0（直接写）时总 τ = One-Euro 单层：133 / 265ms。
+- 快动作时 cutoff 抬升、τ 自动下降（例：躯干 50°/s → cutoff 1.1Hz → τ ≈ 145ms），
+  One-Euro 的动态响应不慢于上面的低速估值。
+- **禁止**再叠第三层平滑；`app.js` 的 `syncBodySmoothingTau()` 在模式切换时自动把渲染层
+  τ 设为 60ms（原始）/ 160ms（旧链），可配置低通本体由 M4 `filter.js` 统一实现。
+
+**基线持久化与手动重置（按角色 profile 区分）**：
+
+- 存储：`localStorage["vfc.bodyBaseline.<profileKey>"]`（`profileKeyFor(modelName)`，与
+  姿态偏移的 profile 同一套按角色区分语义）；保存时机 = 收齐 10 帧转 calibrated 时一次 +
+  页面卸载；平滑器状态不持久化（冷启动重调，基线保留）。
+- 换角色：`activateBodyBaselineProfile()` 自动载入该角色基线，各存各的、互不干扰。
+- 手动重置：UI「重置上半身基线」按钮（动态创建）或 `__vfc.resetBodyBaseline()`：清掉
+  持久化并重新收 10 帧渐入。`command:recalibrate` 的手机端语义不变（原始模式下手机基线
+  不参与输出，重置操作仍安全）。
+
+**跨语言对拍**（验收：同一份 ub 原始样本，PC 算出的 body 与 Kotlin 原实现误差 ≤ 0.5°）：
+
+- 夹具（单一事实来源）：`MediapipeUpperBody/src/test/resources/ub_post_fixture.txt`，
+  由 `tools/verify/gen-ub-post-fixture.mjs` 生成（内含 Kotlin 数学的**独立参考实现**转写，
+  不复用 mapping.js，避免实现与自测共码的假阳性）；46 个有效帧 + 3 个丢失事件。
+- Kotlin：`MediapipeUpperBody` 的 `UpperBodyPostEquivalenceTest`（CI 跑）；
+- PC：`node tools/verify/ub-post-test.mjs`（对拍容差 0.05°，另含渐入 / 肩重合 /
+  三层回退 / 基线持久化 / 老路径不变等验收用例）。
+
 ## 4. 协议增量（最终以 docs/tracking-protocol.md 为准）
 
 `hello` 新增：
@@ -251,6 +332,9 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 - `ubT`：该关键点帧的手机采集时间（ms），客户端用来判过期 / 插值。
 - `body`：相对基线的躯干角 `[roll, yaw]`（度）。roll > 0 = 右肩下沉，yaw > 0 = 向本人左侧转。
 - `ubOk`：`false` = 本次没有上半身结果（丢失 / 过期），客户端应平滑回默认姿态。
+- `ubRaw` / `ubRawBody`（upperBodyPostV1，见 §3.7）：`ubRaw:true` 声明 `ub` 是**原始点**、
+  `body` 是**原始角**（未 One-Euro、未减基线），`ubRawBody` 是同值的显式命名别名；
+  平滑 / 躯干角 / 基线由客户端负责。未协商时两字段不出现，`body` 保持旧语义。
 - 参数映射参考（客户端实现）：`ParamBodyAngleZ = clamp(roll * 0.5, ±30)`、
   `ParamBodyAngleX = clamp(headX + (-yaw * 0.3), ±30)`、`ParamBodyAngleY = clamp(-roll * 0.2, ±30)`；
   手臂抬起角 = **肩→腕** 与「竖直向下」的夹角（度，0..180），`armUp = clamp(angle / 150, 0, 1)`、
@@ -270,6 +354,12 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 4. PC：mock 手机端（`npm run mock`）→ 形象手臂 / 身体跟着动；`npm run selftest` 通过；
    透明置顶窗口下帧率仍为 60 fps。
 5. 断线 / 关手机上半身开关后，PC 手臂在 ~0.3 s 内平滑回默认，不冻结在最后一帧。
+6. （M2）同一份 ub 原始样本，PC 算出的 body 与 Kotlin 原实现误差 **≤ 0.5°**（夹具对拍：
+   `UpperBodyPostEquivalenceTest` + `tools/verify/ub-post-test.mjs`）。
+7. （M2）起播 10 帧内角度从 0 **连续渐入**，不突跳到基线（TorsoBaseline 的 collected/10）。
+8. （M2）两肩在画面中重合（dx < 0.02）时**不出现几十度假角度**（MIN_REFERENCE_SPAN）。
+9. （M2）掉线后手臂能自然放下并**交还 idle motion**（×0.85 按帧衰减 → 删参，三层回退不变）。
+10. （M2）未协商 `upperBodyPostV1` 时行为与改动前**完全一致**（报文逐字节、数值逐值）。
 
 ## 6. 模型获取（不进 Git 大文件）
 

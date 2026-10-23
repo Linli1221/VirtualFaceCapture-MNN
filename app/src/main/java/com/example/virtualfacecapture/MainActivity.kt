@@ -375,9 +375,15 @@ class MainActivity : ComponentActivity() {
 
         // 网络输出（追踪数据）：默认关闭，用户可在控制面板里开启。
         // PC 端发 command:recalibrate 时回到主线程触发与 UI 相同的「重置基线」逻辑。
-        trackingOutput = TrackingOutputManager(this) {
-            runOnUiThread { faceTracker.resetAdaptiveBaseline() }
-        }
+        // 任务 M2：全体 PC 客户端都协商 upperBodyPostV1 时，把上半身检测器切到原始输出
+        // （One-Euro / 躯干角 / 基线迁到 PC 侧做），否则保持 M1 的手机端后处理链。
+        trackingOutput = TrackingOutputManager(
+            context = this,
+            onUpperBodyPostV1 = { enabled -> upperBody.setRawOutput(enabled) },
+            onRecalibrate = {
+                runOnUiThread { faceTracker.resetAdaptiveBaseline() }
+            },
+        )
 
         // 每处理完一帧就把追踪数据喂给网络输出；服务未开启时 submitFrame 只做一次判空即返回。
         faceTracker.onFaceCaptureResult = { frame ->

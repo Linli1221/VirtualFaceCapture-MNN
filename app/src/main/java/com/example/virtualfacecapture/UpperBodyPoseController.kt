@@ -289,6 +289,19 @@ class UpperBodyPoseController(private val context: Context) {
         }
     }
 
+    /**
+     * 切换「原始输出」模式（任务 M2，协议 `ubRaw`）：true 时检测器跳过 One-Euro / 躯干角
+     * 平滑 / 基线，直接产出原始 13 点与原始躯干角（后处理迁到 PC 侧）；false 回 M1 旧链。
+     *
+     * 由 [com.example.virtualfacecapture.tracking.TrackingOutputManager] 的 upperBodyPostV1
+     * 协商聚合回调驱动（全体客户端都声明支持才为 true）。切换时检测器会清掉平滑 / 基线 /
+     * dt 锚点状态，保证两种模式互不污染。线程安全（内部 synchronized），任意线程可调。
+     */
+    fun setRawOutput(enabled: Boolean) {
+        detector.rawOutput = enabled
+        Log.i(TAG, "上半身输出模式: " + (if (enabled) "raw（原始点 + 原始躯干角，后处理在 PC）" else "M1 旧链（平滑 + 基线）"))
+    }
+
     // ========================================================================
     // 数据入口
     // ========================================================================

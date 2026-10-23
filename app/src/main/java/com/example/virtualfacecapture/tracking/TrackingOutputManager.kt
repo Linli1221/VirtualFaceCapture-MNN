@@ -31,6 +31,12 @@ import kotlin.math.roundToInt
  */
 class TrackingOutputManager(
     private val context: Context,
+    /**
+     * 全局 upperBodyPostV1 协商结果变化时的通知回调（任务 M2，照 [onRecalibrate] 的接线
+     * 模式）：true = 全体客户端都声明支持「上半身后处理迁 PC」，检测器切原始输出
+     * （[com.example.mediapipeupperbody.UpperBodyPoseDetector.rawOutput]）；false = 回 M1 旧链。
+     */
+    private val onUpperBodyPostV1: (Boolean) -> Unit = {},
     private val onRecalibrate: () -> Unit = {},
 ) {
 
@@ -95,6 +101,15 @@ class TrackingOutputManager(
     @Volatile
     private var upperBodyFlag = false
 
+    /**
+     * 全局 upperBodyPostV1 协商结果（任务 M2）：true = 全体客户端都声明了
+     * [TrackingProtocol.FEATURE_UPPER_BODY_POST_V1]，track 带 `ubRaw` / 原始 body。
+     * 只读快照（HUD / 日志用），由 [TrackingServer] 的协商聚合回调更新。
+     */
+    @Volatile
+    var upperBodyPostV1: Boolean = false
+        private set
+
     private val deviceName: String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
 
     private val appName: String = buildString {
@@ -132,6 +147,11 @@ class TrackingOutputManager(
             deviceName = deviceName,
             appName = appName,
             onRecalibrate = onRecalibrate,
+            // 任务 M2：协商聚合（全体客户端 upperBodyPostV1）→ 记录状态 → 通知上层切检测器
+            onUpperBodyPostV1 = { enabled ->
+                upperBodyPostV1 = enabled
+                onUpperBodyPostV1(enabled)
+            },
             frameBufferMs = sendBufferMs.value,
         )
         newServer.trackingActive = trackingFlag

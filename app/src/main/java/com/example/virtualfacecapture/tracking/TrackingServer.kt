@@ -321,6 +321,8 @@ class TrackingServer(
 
         for (client in wsClients) client.close()
         wsClients.clear()
+        // 连接全部清掉：全局 upperBodyPostV1 协商随之失效，通知上层回 M1 旧链（任务 M2）
+        recomputeUpperBodyPostV1()
 
         closeQuietly(serverSocket)
         serverSocket = null
@@ -439,10 +441,11 @@ class TrackingServer(
         val active = wsClients.isNotEmpty() && wsClients.all { it.upperBodyPostV1 }
         if (active == upperBodyPostV1Active) return
         upperBodyPostV1Active = active
+        val negotiated = wsClients.count { it.upperBodyPostV1 }
         Log.i(
             TAG,
             "上半身后处理协商: upperBodyPostV1=" + active +
-                "（" + wsClients.count { it.upperBodyPostV1 } + "/" + wsClients.size +
+                "（" + negotiated + "/" + wsClients.size +
                 " 个客户端已协商；混合客户端时全体回退 M1 旧链）",
         )
         onUpperBodyPostV1(active)
@@ -491,8 +494,10 @@ class TrackingServer(
         // 上半身是可选增量（协议 §4.2）：未启用时一个 ub* 字段都不出现；
         // 启用后即使本帧没结果（从未收到 / 超过 1500 ms 未更新 / tracking=false）也发
         // ubOk:false，ub / body 全 0，保证结构稳定，客户端可安全回默认姿态。
+        // 任务 M2：占位帧跟随当前 raw 模式，协商生效期间 ubRaw 逐帧一致出现。
+        val rawActive = upperBodyPostV1Active
         val upperBodyFrame = if (upperBodyOn) {
-            upperBodySnapshot ?: emptyUpperBodyFrame
+            upperBodySnapshot ?: if (rawActive) emptyRawUpperBodyFrame else emptyUpperBodyFrame
         } else {
             null
         }
@@ -513,6 +518,8 @@ class TrackingServer(
             calibrating = calibrating,
             upperBody = upperBodyFrame,
             upperBodyOk = upperBodyOk,
+            // 广播同一条报文，协商状态只能取全体聚合值（见 [upperBodyPostV1Active]）
+            upperBodyPostV1 = rawActive,
         )
         dispatch(message)
     }
@@ -762,6 +769,8 @@ class TrackingServer(
                     wsClients.remove(connection)
                     // 客户端集合变了（可能影响 jitterBufferV1 协商结果），重算生效发送缓冲
                     recomputeEffectiveBuffer()
+                    // 客户端集合变了也可能改变 upperBodyPostV1 的全体聚合结果（任务 M2）
+                    recomputeUpperBodyPostV1()
                     // 最后一个客户端也走了：清掉缓冲里还没放行的帧，
                     // 否则下一个客户端一连上会先收到 0.5 s 之前的老表情。
                     if (wsClients.isEmpty()) {
@@ -776,6 +785,8 @@ class TrackingServer(
         // 新连接还没发 hello，feature 集合为空 —— 配置为 0 时生效缓冲会先回落保守模式，
         // 收到 hello（下面 handleClientMessage 的 CLIENT_HELLO 分支）协商通过后再切回 0。
         recomputeEffectiveBuffer()
+        // 新连接未协商 upperBodyPostV1，聚合结果必然为 false（任务 M2）
+        recomputeUpperBodyPostV1()
         connection.start()
 
         // §4.1：连接建立后立即发 hello
@@ -786,6 +797,8 @@ class TrackingServer(
                 decimation = decimation,
                 targetFps = targetFps,
                 upperBody = upperBodyOn,
+                // 任务 M2：上半身启用即声明支持（手机端可按 ubRaw 发原始点，后处理迁 PC）
+                upperBodyPostV1 = upperBodyOn,
                 timestampMs = System.currentTimeMillis(),
             )
         )
@@ -816,8 +829,19 @@ class TrackingServer(
                 // 老客户端不发 hello，集合保持为空 —— 配置 send.bufferMs=0 时自动回落保守模式。
                 val features = TrackingProtocol.parseClientFeatures(text)
                 connection.clientFeatures = features
-                Log.i(TAG, "客户端 hello 协商: features=" + features.sorted().joinToString(",", "[", "]"))
+                // 任务 M2：features 含 "upperBodyPostV1" 即协商成功；顶层布尔
+                // "upperBodyPostV1":true 为兜底形式，任一命中都标记该连接「已协商」。
+                val upperBodyPostV1 =
+                    features.contains(TrackingProtocol.FEATURE_UPPER_BODY_POST_V1) ||
+                        TrackingProtocol.parseBoolField(text, "upperBodyPostV1") == true
+                connection.upperBodyPostV1 = upperBodyPostV1
+                Log.i(
+                    TAG,
+                    "客户端 hello 协商: features=" + features.sorted().joinToString(",", "[", "]") +
+                        " upperBodyPostV1=" + upperBodyPostV1,
+                )
                 recomputeEffectiveBuffer()
+                recomputeUpperBodyPostV1()
             }
 
             TrackingProtocol.ClientMessage.IGNORED -> Unit
@@ -1048,6 +1072,17 @@ internal class TrackingWsConnection(
      */
     @Volatile
     var clientFeatures: Set<String> = emptySet()
+
+    /**
+     * 该连接是否已协商 upperBodyPostV1（任务 M2）：收到客户端 hello 且
+     * `features` 含 `upperBodyPostV1` 或顶层布尔 `"upperBodyPostV1":true` 时置 true。
+     *
+     * 老客户端 / 没发过 hello 的连接恒为 false。reader 线程（hello 到达时）写入、
+     * [TrackingServer.recomputeUpperBodyPostV1] 等处读取，用 @Volatile 保证可见性。
+     * 注意：属性 setter 的 JVM 名是 setUpperBodyPostV1 —— 不要再定义同名方法。
+     */
+    @Volatile
+    var upperBodyPostV1: Boolean = false
 
     /**
      * writer 线程的唤醒信号。

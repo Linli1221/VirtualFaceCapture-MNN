@@ -812,11 +812,7 @@ function publishDebug() {
 
 // ---------------------------------------------------------------- 上半身（协议 §4.2）
 
-/**
- * 上半身状态机的初始值（连接 / 重连 / 断线时复位）。
- *
- * points / torso 保留最后一帧给调试骨架灰显；ok=false 时所有 body 参数按帧回 0。
- */
+
 /** 上半身后处理管线（任务 M2 upperBodyPostV1）：原始点 → One-Euro 平滑 → 躯干角 → TorsoBaseline。 */
 const bodyPost = new UpperBodyPostProcessor();
 
