@@ -12,6 +12,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Process
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -88,6 +89,12 @@ class Camera2Manager(private val context: Context) {
     /** Surface handed to the session callback; set right before a session is created. */
     @Volatile private var captureSurface: Surface? = null
 
+    /**
+     * 直出预览 Surface 当前会话实际使用的那份（HAL 拒绝双流后为 null）。
+     * 会话建好后 buildCaptureRequest 用它加第二个输出目标。
+     */
+    @Volatile private var sessionPreviewSurface: Surface? = null
+
     /** Guards the one-time fallback from a rejected physical stream to the logical camera. */
     @Volatile private var physicalFallbackTried: Boolean = false
 
@@ -140,7 +147,78 @@ class Camera2Manager(private val context: Context) {
      * 只有「开关打开」且「确有订阅者」时才转换。
      */
     val willProducePreviewFrames: Boolean
-        get() = enablePreviewInYuvMode && frameCallback != null
+        get() = enablePreviewInYuvMode && frameCallback != null && previewSurface == null
+
+    // ---- 调试预览 RGB 路径的限速 / 尺寸上限（只作用于预览，推理不受影响）----
+
+    /**
+     * 预览 RGB 帧的目标帧率，钳制在 15~30 fps。
+     *
+     * 预览只给人取景 / 调试看，没必要跟满相机的 60fps：限速后被跳过的帧
+     * **连整帧 YUV→RGB 都不做**（不是转完再丢），相机线程负载直接按比例下降。
+     */
+    @Volatile
+    var previewFps: Int = PREVIEW_MAX_FPS
+        set(value) {
+            field = value.coerceIn(PREVIEW_MIN_FPS, PREVIEW_MAX_FPS)
+        }
+
+    /** 上一次真正产出预览帧的时刻（System.nanoTime），限速用。 */
+    private var lastPreviewFrameNs: Long = 0L
+
+    /** 当前采集帧尺寸（未旋转）；预览 Surface 变换矩阵与尺寸上限都以它为基准。 */
+    @Volatile
+    private var activeFrameSize: Size? = null
+
+    /**
+     * 相机直出的预览 Surface（TextureView / SurfaceView）。
+     *
+     * 挂上后预览由相机 HAL 直接送显卡合成，**完全不再产生 YUV→RGB→Bitmap 路径**
+     * （见 [willProducePreviewFrames]）；取下来则回退到限速 / 缩尺寸的 RGB 预览。
+     */
+    @Volatile
+    private var previewSurface: Surface? = null
+
+    /** 预览 Surface 被 HAL 拒绝（双流组合不支持）时通知上层回退位图预览。 */
+    @Volatile
+    var onPreviewSurfaceRejected: (() -> Unit)? = null
+
+    /** 本次会话是否已经试过「去掉预览 Surface 重建会话」的兜底。 */
+    private var previewSurfaceFallbackTried = false
+
+    /**
+     * 挂 / 摘相机直出预览 Surface。
+     *
+     * 相机已开时会重建一次会话（几百毫秒内出帧恢复）；没开时只记住它，
+     * 下次 [startCamera] 建会话时带上。传 null 回退到 RGB 位图预览。
+     */
+    fun setPreviewSurface(surface: Surface?) {
+        if (previewSurface === surface) return
+        previewSurface = surface
+        previewSurfaceFallbackTried = false
+        val handler = backgroundHandler ?: return
+        handler.post {
+            if (cameraDevice == null || imageReader == null) return@post
+            // 会话本来就没带直出 Surface（例如 HAL 刚拒绝过）：不用再重建
+            if (surface == null && sessionPreviewSurface == null) return@post
+            val state = if (surface != null) "attached" else "detached"
+            Log.i(TAG, "Preview surface " + state + ", recreating session")
+            runCatching { captureSession?.close() }
+            captureSession = null
+            createCaptureSession()
+        }
+    }
+
+    /** 当前采集帧尺寸（未旋转），预览端算变换矩阵用；相机没开时为 null。 */
+    val previewFrameSize: Size?
+        get() = activeFrameSize
+
+    /**
+     * 把相机帧转成竖直方向所需的顺时针旋转角（与预览位图路径的语义一致），
+     * 直出预览 Surface 需要用同样的角度摆正画面。
+     */
+    val previewRotationDegrees: Int
+        get() = getRotationDegrees()
     
     // Camera sensor orientation (degrees) - will be set from camera characteristics
     private var sensorOrientation: Int = 0
@@ -183,6 +261,20 @@ class Camera2Manager(private val context: Context) {
 
         /** 面捕管线的目标帧率（用于钉住 SENSOR_FRAME_DURATION）。 */
         private const val PINNED_FPS = 60
+
+        /** 调试预览帧率上限：预览只给人看，30fps 已经够流畅。 */
+        private const val PREVIEW_MAX_FPS = 30
+
+        /** 调试预览帧率下限：再低取景就明显卡顿，也没有再省的意义。 */
+        private const val PREVIEW_MIN_FPS = 15
+
+        /**
+         * 调试预览 RGB 输出的尺寸上限：长边 ≤ 640、短边 ≤ 360（横竖屏等价的
+         * 「640×360」）。采集帧（推理输入）尺寸不变，这里只缩预览转换的输出 ——
+         * YUV→RGB、Kotlin RGB→ARGB 打包、Bitmap.setPixels 三段成本都随像素数下降。
+         */
+        private const val PREVIEW_MAX_LONG_EDGE = 640
+        private const val PREVIEW_MAX_SHORT_EDGE = 360
         
         // Aspect ratio preference (1.0 = perfect square)
         private const val MAX_ASPECT_RATIO = 1.5f  // Allow up to 3:2 ratio
@@ -509,6 +601,7 @@ class Camera2Manager(private val context: Context) {
         captureSession?.close()
         captureSession = null
         captureSurface = null
+        sessionPreviewSurface = null
         
         cameraDevice?.close()
         cameraDevice = null
@@ -520,7 +613,12 @@ class Camera2Manager(private val context: Context) {
     }
     
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        // 相机回调（ImageReader onImageAvailable / 会话 / 打开回调）全部跑在这个线程上。
+        // 默认优先级（nice 0）会被推理阶段线程（fc-* 用 Thread.NORM_PRIORITY+2，约 nice -4）
+        // 抢占，回调一拖长 acquireLatestImage() 就开始丢帧。提到 THREAD_PRIORITY_DISPLAY
+        // （-4）后相机线程与推理线程同级，交付帧率更稳，预览 / 躯干抽帧的输入抖动更小。
+        backgroundThread = HandlerThread("CameraBackground", Process.THREAD_PRIORITY_DISPLAY)
+            .also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
     
@@ -602,6 +700,7 @@ class Camera2Manager(private val context: Context) {
             )
 
             Log.i(TAG, "Selected preview size: ${previewSize.width}x${previewSize.height}")
+            activeFrameSize = previewSize
 
             // Create ImageReader for frame capture.
             // 3 个 buffer：处理端偶尔慢一拍时相机可以继续出帧，配合
@@ -854,16 +953,28 @@ class Camera2Manager(private val context: Context) {
         val reader = imageReader ?: return
         val surface = reader.surface
         captureSurface = surface
+        // 直出预览 Surface（可选）：与 ImageReader 一起进同一个会话，预览由相机 HAL
+        // 直接送显卡合成，不再经过 YUV→RGB→Bitmap。HAL 不支持该双流组合时
+        // onConfigureFailed 会摘掉它重建会话（见 previewSurfaceFallbackTried）。
+        val displaySurface = if (previewSurfaceFallbackTried) null else previewSurface
+        sessionPreviewSurface = displaySurface
 
         val physicalId = selectedCameraInfo?.physicalCameraId
         if (physicalId != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             try {
-                val output = OutputConfiguration(surface).apply {
-                    setPhysicalCameraId(physicalId)
+                val outputs = mutableListOf(
+                    OutputConfiguration(surface).apply {
+                        setPhysicalCameraId(physicalId)
+                    },
+                )
+                if (displaySurface != null) {
+                    outputs += OutputConfiguration(displaySurface).apply {
+                        setPhysicalCameraId(physicalId)
+                    }
                 }
                 val configuration = SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    listOf(output),
+                    outputs,
                     sessionExecutor,
                     sessionStateCallback,
                 )
@@ -905,7 +1016,11 @@ class Camera2Manager(private val context: Context) {
         }
 
         try {
-            camera.createCaptureSession(listOf(surface), sessionStateCallback, backgroundHandler)
+            camera.createCaptureSession(
+                listOfNotNull(surface, displaySurface),
+                sessionStateCallback,
+                backgroundHandler,
+            )
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Error creating capture session", e)
         }
@@ -955,6 +1070,17 @@ class Camera2Manager(private val context: Context) {
         }
 
         override fun onConfigureFailed(session: CameraCaptureSession) {
+            if (sessionPreviewSurface != null && !previewSurfaceFallbackTried) {
+                // 双流组合被 HAL 拒绝：摘掉直出预览 Surface 重建会话，
+                // 上层收到通知后回退到限速 / 缩尺寸的位图预览。
+                previewSurfaceFallbackTried = true
+                sessionPreviewSurface = null
+                Log.w(TAG, "Preview surface stream rejected; falling back to bitmap preview")
+                runCatching { session.close() }
+                createCaptureSession()
+                onPreviewSurfaceRejected?.invoke()
+                return
+            }
             if (selectedCameraInfo?.physicalCameraId != null && !physicalFallbackTried) {
                 physicalFallbackTried = true
                 Log.w(
@@ -982,6 +1108,8 @@ class Camera2Manager(private val context: Context) {
         return try {
             camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
+                // 直出预览 Surface：同一请求双目标，预览帧不经 CPU 转换
+                sessionPreviewSurface?.let { addTarget(it) }
                 applyCaptureRequestTuning(this)
             }.build()
         } catch (e: Exception) {
@@ -1201,8 +1329,9 @@ class Camera2Manager(private val context: Context) {
                 // Direct YUV mode - pass YUV data directly to JNI for zero-copy processing
                 processYuvDirect(image)
                 
-                // Also generate RGB preview if enabled (for debug visualization)
-                if (enablePreviewInYuvMode && frameCallback != null) {
+                // Also generate RGB preview if enabled (for debug visualization).
+                // 挂着直出预览 Surface 时预览由相机送显卡合成，不再生成 RGB 帧。
+                if (willProducePreviewFrames) {
                     processYuvToRgbForPreview(image)
                 }
             } else {
@@ -1305,7 +1434,20 @@ class Camera2Manager(private val context: Context) {
      * This is separate from main processing - just for debug visualization
      */
     private fun processYuvToRgbForPreview(image: android.media.Image) {
-        val (rgbBuffer, outWidth, outHeight) = yuv420ToRgbRotated(image)
+        // 限速 15~30fps：被跳过的帧连整帧 YUV→RGB 都不做（不是转完再丢），
+        // 相机线程的预览开销直接按帧数比例下降。
+        val nowNs = System.nanoTime()
+        val intervalNs = 1_000_000_000L / previewFps
+        if (nowNs - lastPreviewFrameNs < intervalNs) return
+        lastPreviewFrameNs = nowNs
+
+        // 预览输出限制在「640×360」以内：YUV→RGB、RGB→ARGB 打包、setPixels
+        // 三段成本随像素数同步下降；推理用的采集帧尺寸不受影响。
+        val (rgbBuffer, outWidth, outHeight) = yuv420ToRgbRotated(
+            image,
+            maxOutLongEdge = PREVIEW_MAX_LONG_EDGE,
+            maxOutShortEdge = PREVIEW_MAX_SHORT_EDGE,
+        )
         // Call preview callback without performance tracking
         frameCallback?.invoke(rgbBuffer, outWidth, outHeight)
     }
@@ -1342,12 +1484,21 @@ class Camera2Manager(private val context: Context) {
     }
     
     /**
-     * Convert YUV_420_888 image to RGB ByteBuffer with rotation
-     * Uses native converter when available for better performance
-     * Rotates the image to portrait orientation for face detection
-     * Returns: Triple of (RGB buffer, output width, output height)
+     * Convert YUV_420_888 image to RGB ByteBuffer with rotation.
+     * Uses native converter when available for better performance.
+     * Rotates the image to portrait orientation for face detection.
+     * Returns: Triple of (RGB buffer, output width, output height).
+     *
+     *
+     * @param maxOutLongEdge / @param maxOutShortEdge 输出尺寸上限（只缩不放大）：
+     *   长边 ≤ maxOutLongEdge、短边 ≤ maxOutShortEdge；0 = 不限制。推理路径不限制，
+     *   调试预览用它把转换 / 打包 / setPixels 的像素量压到「640×360」以内。
      */
-    private fun yuv420ToRgbRotated(image: android.media.Image): Triple<ByteBuffer, Int, Int> {
+    private fun yuv420ToRgbRotated(
+        image: android.media.Image,
+        maxOutLongEdge: Int = 0,
+        maxOutShortEdge: Int = 0,
+    ): Triple<ByteBuffer, Int, Int> {
         val srcWidth = image.width
         val srcHeight = image.height
         
@@ -1366,10 +1517,13 @@ class Camera2Manager(private val context: Context) {
         val rotation = getRotationDegrees()
         
         // Determine output dimensions based on rotation
-        val (dstWidth, dstHeight) = when (rotation) {
+        val (rotWidth, rotHeight) = when (rotation) {
             90, 270 -> Pair(srcHeight, srcWidth)  // Swap dimensions
             else -> Pair(srcWidth, srcHeight)
         }
+        // 预览路径再按上限等比缩小（推理路径两个上限都是 0，尺寸不变）
+        val (dstWidth, dstHeight) = fitOutSize(rotWidth, rotHeight, maxOutLongEdge, maxOutShortEdge)
+        val scaled = dstWidth != rotWidth || dstHeight != rotHeight
         
         // Reuse buffer if size matches
         val bufferSize = dstWidth * dstHeight * 3
@@ -1397,7 +1551,9 @@ class Camera2Manager(private val context: Context) {
         }
 
         // Try native converter (custom NEON optimized)
-        if (useNativeConverter) {
+        // 自定义 NEON 核只支持 1:1 的旋转映射，不支持缩放：需要缩放时跳过它，
+        // 交给下面同样支持缩放的 Kotlin 回退（预览输出小，代价可控）。
+        if (useNativeConverter && !scaled) {
             try {
                 YuvConverter.convertYuvToRgb(
                     yBuffer, uBuffer, vBuffer,
@@ -1422,6 +1578,31 @@ class Camera2Manager(private val context: Context) {
     }
 
     /**
+     * 按「长边 ≤ maxLongEdge、短边 ≤ maxShortEdge」等比缩小（只缩不放大）。
+     * 两个上限都是 0（或都够大）时原样返回。
+     */
+    private fun fitOutSize(
+        width: Int,
+        height: Int,
+        maxLongEdge: Int,
+        maxShortEdge: Int,
+    ): Pair<Int, Int> {
+        if (maxLongEdge <= 0 && maxShortEdge <= 0) return Pair(width, height)
+        var scale = 1.0
+        if (maxLongEdge > 0 && maxOf(width, height) > maxLongEdge) {
+            scale = minOf(scale, maxLongEdge.toDouble() / maxOf(width, height))
+        }
+        if (maxShortEdge > 0 && minOf(width, height) > maxShortEdge) {
+            scale = minOf(scale, maxShortEdge.toDouble() / minOf(width, height))
+        }
+        if (scale >= 1.0) return Pair(width, height)
+        return Pair(
+            maxOf(1, Math.round(width * scale).toInt()),
+            maxOf(1, Math.round(height * scale).toInt()),
+        )
+    }
+
+    /**
      * Pure Kotlin YUV to RGB conversion with rotation (fallback)
      */
     private fun yuv420ToRgbRotatedKotlin(
@@ -1439,10 +1620,33 @@ class Camera2Manager(private val context: Context) {
         dstHeight: Int
     ): Triple<ByteBuffer, Int, Int> {
 
+        // 旋转后的全尺寸（缩放前）：输出缩小时按它反查回全尺寸坐标
+        val rotWidth: Int
+        val rotHeight: Int
+        if (rotation == 90 || rotation == 270) {
+            rotWidth = srcHeight
+            rotHeight = srcWidth
+        } else {
+            rotWidth = srcWidth
+            rotHeight = srcHeight
+        }
+        val scaled = dstWidth != rotWidth || dstHeight != rotHeight
+
         // Convert with rotation
         // The key is to map destination (dstX, dstY) back to source (srcX, srcY)
         for (dstY in 0 until dstHeight) {
             for (dstX in 0 until dstWidth) {
+                // 输出被缩小时先把目标像素反查回「旋转后全尺寸」坐标（最近邻）
+                val rx: Int
+                val ry: Int
+                if (scaled) {
+                    rx = (dstX.toLong() * rotWidth / dstWidth).toInt()
+                    ry = (dstY.toLong() * rotHeight / dstHeight).toInt()
+                } else {
+                    rx = dstX
+                    ry = dstY
+                }
+
                 // Calculate source coordinates based on rotation
                 // Rotation transforms: where does destination pixel come from in source?
                 val srcX: Int
@@ -1451,29 +1655,25 @@ class Camera2Manager(private val context: Context) {
                 when (rotation) {
                     90 -> {
                         // 90° clockwise rotation
-                        // dst(x, y) <- src(srcHeight-1-y, x)
-                        // But since dimensions are swapped: dstWidth=srcHeight, dstHeight=srcWidth
-                        // So: srcX = dstY, srcY = srcHeight - 1 - dstX = dstWidth - 1 - dstX
-                        srcX = dstY
-                        srcY = dstWidth - 1 - dstX
+                        // rotated(rx, ry) <- src(ry, rotWidth-1-rx)
+                        srcX = ry
+                        srcY = rotWidth - 1 - rx
                     }
                     180 -> {
                         // 180° rotation
-                        srcX = srcWidth - 1 - dstX
-                        srcY = srcHeight - 1 - dstY
+                        srcX = srcWidth - 1 - rx
+                        srcY = srcHeight - 1 - ry
                     }
                     270 -> {
                         // 270° clockwise (= 90° counter-clockwise)
-                        // dst(x, y) <- src(y, srcWidth-1-x)
-                        // But since dimensions are swapped: dstWidth=srcHeight, dstHeight=srcWidth
-                        // So: srcX = dstHeight - 1 - dstY = srcWidth - 1 - dstY, srcY = dstX
-                        srcX = dstHeight - 1 - dstY
-                        srcY = dstX
+                        // rotated(rx, ry) <- src(rotHeight-1-ry, rx)
+                        srcX = rotHeight - 1 - ry
+                        srcY = rx
                     }
                     else -> {
                         // No rotation
-                        srcX = dstX
-                        srcY = dstY
+                        srcX = rx
+                        srcY = ry
                     }
                 }
                 

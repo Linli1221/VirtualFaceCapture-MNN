@@ -34,11 +34,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
@@ -528,6 +531,9 @@ fun FaceCaptureScreen(
 
     var cameraPreviewView by remember { mutableStateOf<CameraPreviewView?>(null) }
 
+    /** 直出预览容器（TextureView 底图 + 叠加层）；null = View 还没建好。 */
+    var previewContainer by remember { mutableStateOf<CameraPreviewSurfaceContainer?>(null) }
+
     // 上半身：初始化（加载模型）期间按钮显示「启动中」；模型缺失 / 出错时显示中文提示
     var upperBodyBusy by remember { mutableStateOf(false) }
     var upperBodyMessage by remember { mutableStateOf("") }
@@ -591,6 +597,14 @@ fun FaceCaptureScreen(
             currentCamera = camera
             // 前置预览习惯性镜像，后置 / 外接相机保持真实方向
             cameraPreviewView?.mirrorHorizontal = camera?.isFrontFacing ?: true
+            // 直出预览的几何同步：旋转角 / 镜像 / 采集尺寸变了都要重算变换
+            previewContainer?.apply {
+                mirrorHorizontal = camera?.isFrontFacing ?: true
+                contentRotationDegrees = faceTracker.previewRotationDegrees
+                faceTracker.previewFrameSize?.let { size ->
+                    setFrameSize(size.width, size.height)
+                }
+            }
             // 上半身：检测器按「镜像后的像素」推理，产出的 x/y 才和预览方向一致（契约 §3.2）
             upperBody.mirrorHorizontal = camera?.isFrontFacing ?: true
             // 相机几何 / FOV 变了，躯干的中性基线跟着重取
@@ -598,6 +612,17 @@ fun FaceCaptureScreen(
             // 管线内部重启（切摄像头 / 切后端 / 改并行度）时 stop() 会清掉 tap，这里按开关补挂
             if (upperBodyEnabled.value) {
                 onAttachBodyTap(true)
+            }
+        }
+
+        // HAL 拒绝「YUV 采集 + 直出预览」双流组合：回退到限速 / 缩尺寸的位图预览
+        faceTracker.setOnPreviewSurfaceRejected {
+            val container = previewContainer
+            if (container != null) {
+                container.surfaceModeEnabled = false
+                container.refreshPreviewPath()
+            } else {
+                faceTracker.setCameraPreviewFramesEnabled(true)
             }
         }
 
@@ -610,14 +635,53 @@ fun FaceCaptureScreen(
 
         // 第一帧之前就把镜像方向同步给上半身
         upperBody.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+
+        // 直出预览几何兜底同步：onCameraChanged 可能在本回调接线之前就触发过
+        // （相机在权限回调里先启动），这里补一次，避免预览旋转角 / 采集尺寸陈旧。
+        previewContainer?.apply {
+            mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+            contentRotationDegrees = faceTracker.previewRotationDegrees
+            faceTracker.previewFrameSize?.let { size ->
+                setFrameSize(size.width, size.height)
+            }
+        }
     }
 
-    // 相机预览帧门控：本 app 只有相机预览一个画面，进前台常开、离开时关掉，
-    // 避免相机线程白做整帧 YUV→RGB（每帧几十万次像素运算，推理管线走 YUV 直通用不到）。
-    DisposableEffect(Unit) {
-        faceTracker.setCameraPreviewFramesEnabled(true)
+    // 相机预览门控：只在 UI 可见（生命周期 ≥ STARTED）时挂预览。预览优先走 Camera2
+    // 直出 Surface（零 YUV→RGB→Bitmap），Surface 不可用时回退到「限速 ≤30fps +
+    // 尺寸 ≤640×360」的 RGB 位图预览；UI 不可见时两个模式都关，相机线程不再
+    // 白做整帧 YUV→RGB（推理管线走 YUV 直通，本来就用不到这些 RGB 帧）。
+    //
+    // 时序：ON_START 在 Activity.onStart（相机 onResume 里才重新 start）之前，
+    // ON_STOP 在 onPause（相机已 stop）之后，两个方向都不会引起多余的会话重建。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    previewContainer?.uiVisible = true
+                    previewContainer?.refreshPreviewPath()
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    previewContainer?.uiVisible = false
+                    previewContainer?.refreshPreviewPath()
+                    // 容器还没建好时直接关 SDK 侧开关，兜住所有时序
+                    if (previewContainer == null) {
+                        faceTracker.setCameraPreviewFramesEnabled(false)
+                        faceTracker.setCameraPreviewSurface(null)
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            // 组合销毁：兜底关掉两个预览模式
+            previewContainer?.onPreviewPath = null
+            previewContainer?.uiVisible = false
             faceTracker.setCameraPreviewFramesEnabled(false)
+            faceTracker.setCameraPreviewSurface(null)
         }
     }
 
@@ -692,12 +756,20 @@ fun FaceCaptureScreen(
         // 主画面：相机预览 + 关键点 / 检测框叠加（手机端不再渲染 Live2D）
         AndroidView(
             factory = { ctx ->
-                CameraPreviewView(ctx).also {
-                    cameraPreviewView = it
-                    it.drawLandmarks = drawLandmarks
-                    it.drawKeyPoints = drawLandmarks
-                    it.drawDetectionBox = drawDetectionBox
-                    it.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+                // 直出 TextureView（底图）+ CameraPreviewView（叠加层）：
+                // 相机预览由 HAL 直接送显卡合成，不再走 YUV→RGB→Bitmap。
+                CameraPreviewSurfaceContainer(ctx).also { container ->
+                    previewContainer = container
+                    cameraPreviewView = container.previewView
+                    container.previewView.drawLandmarks = drawLandmarks
+                    container.previewView.drawKeyPoints = drawLandmarks
+                    container.previewView.drawDetectionBox = drawDetectionBox
+                    container.mirrorHorizontal = currentCamera?.isFrontFacing ?: true
+                    container.onPreviewPath = { surface, bitmapFrames ->
+                        faceTracker.setCameraPreviewSurface(surface)
+                        faceTracker.setCameraPreviewFramesEnabled(bitmapFrames)
+                    }
+                    container.refreshPreviewPath()
                 }
             },
             modifier = Modifier.fillMaxSize()

@@ -94,19 +94,30 @@ static MNN::CV::Matrix createRotationMatrix(int rotation,
     float cx_src = static_cast<float>(srcWidth) / 2.0f;
     float cy_src = static_cast<float>(srcHeight) / 2.0f;
     
+    // 旋转后的全尺寸。dst 允许比它小（调试预览按比例缩小输出），
+    // 此时 dst->src 映射里要先按比例放大回全尺寸；不缩放时 scale 恒为 1。
+    int rotWidth = (rotation == 90 || rotation == 270) ? srcHeight : srcWidth;
+    int rotHeight = (rotation == 90 || rotation == 270) ? srcWidth : srcHeight;
+    float scaleX = static_cast<float>(rotWidth) / static_cast<float>(dstWidth);
+    float scaleY = static_cast<float>(rotHeight) / static_cast<float>(dstHeight);
+    
     // The inverse of rotation by R is rotation by -R
     // postTranslate/postRotate chain: first translate dst to origin,
     // then rotate back (negative), then translate to src center
     
     switch (rotation) {
         case 0:
-            // No rotation, identity matrix works
+            // No rotation: 不缩放时整段是恒等映射，缩放时按中心缩放采样
+            matrix.postTranslate(-cx_dst, -cy_dst);
+            matrix.postScale(scaleX, scaleY);
+            matrix.postTranslate(cx_src, cy_src);
             break;
             
         case 90:
             // To rotate output 90° CW, we sample from src with 90° CCW (i.e., -90°)
             // dst coords -> translate to origin -> rotate -90° -> translate to src center
             matrix.postTranslate(-cx_dst, -cy_dst);
+            matrix.postScale(scaleX, scaleY);
             matrix.postRotate(-90.0f);
             matrix.postTranslate(cx_src, cy_src);
             break;
@@ -114,6 +125,7 @@ static MNN::CV::Matrix createRotationMatrix(int rotation,
         case 180:
             // 180° rotation (same as -180°)
             matrix.postTranslate(-cx_dst, -cy_dst);
+            matrix.postScale(scaleX, scaleY);
             matrix.postRotate(180.0f);  // 180° == -180°
             matrix.postTranslate(cx_src, cy_src);
             break;
@@ -121,6 +133,7 @@ static MNN::CV::Matrix createRotationMatrix(int rotation,
         case 270:
             // To rotate output 270° CW (= 90° CCW), we sample with +90° rotation
             matrix.postTranslate(-cx_dst, -cy_dst);
+            matrix.postScale(scaleX, scaleY);
             matrix.postRotate(90.0f);  // Inverse of 270° is -270° = 90°
             matrix.postTranslate(cx_src, cy_src);
             break;
@@ -282,8 +295,8 @@ extern "C" void convertYuvToRgbMNN(
     
     std::unique_ptr<MNN::CV::ImageProcess> process(MNN::CV::ImageProcess::create(config));
     
-    // Set rotation matrix
-    if (rotation != 0) {
+    // Set rotation / scale matrix（dst 可小于旋转全尺寸：预览缩放路径）
+    {
         MNN::CV::Matrix matrix = createRotationMatrix(rotation, srcWidth, srcHeight, dstWidth, dstHeight);
         process->setMatrix(matrix);
     }

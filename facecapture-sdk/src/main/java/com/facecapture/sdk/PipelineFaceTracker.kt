@@ -2,6 +2,8 @@ package com.facecapture.sdk
 
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.util.Size
+import android.view.Surface
 import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
@@ -844,6 +846,42 @@ class PipelineFaceTracker(private val context: Context) {
 
     /** 相机预览 RGB 帧当前是否开启。 */
     fun isCameraPreviewFramesEnabled(): Boolean = cameraPreviewFramesRequested
+
+    /**
+     * 调试预览帧率（15~30，默认 30）。被限速掉的帧连整帧 YUV→RGB 都不做，
+     * 只作用于预览，推理仍按相机满帧率走。
+     */
+    fun setCameraPreviewFps(fps: Int) {
+        camera2Manager.previewFps = fps
+        Log.i(TAG, "Camera preview fps: " + camera2Manager.previewFps)
+    }
+
+    /**
+     * 挂 / 摘相机直出预览 Surface（TextureView / SurfaceView）。
+     *
+     * 挂上后预览由相机 HAL 直接送显卡合成，**不再产生 YUV→RGB→Bitmap 路径**
+     * （[setCameraPreviewFramesEnabled] 的位图预览会自动让位）；传 null 回退。
+     * 相机已开时内部会重建一次会话。
+     */
+    fun setCameraPreviewSurface(surface: Surface?) {
+        camera2Manager.setPreviewSurface(surface)
+    }
+
+    /**
+     * 直出预览 Surface 被 HAL 拒绝（双流组合不支持）时回调；
+     * 上层据此回退到位图预览。
+     */
+    fun setOnPreviewSurfaceRejected(listener: (() -> Unit)?) {
+        camera2Manager.onPreviewSurfaceRejected = listener
+    }
+
+    /** 预览画面摆正所需的顺时针旋转角（与位图预览同一套几何）。 */
+    val previewRotationDegrees: Int
+        get() = camera2Manager.previewRotationDegrees
+
+    /** 相机采集帧尺寸（未旋转）；预览端算变换矩阵用，相机没开时为 null。 */
+    val previewFrameSize: Size?
+        get() = camera2Manager.previewFrameSize
 
     /**
      * 运行时切换 MNN 推理后端（Vulkan ⇄ CPU）。
