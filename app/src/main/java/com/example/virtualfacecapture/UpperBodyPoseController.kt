@@ -17,7 +17,8 @@ import java.util.concurrent.atomic.AtomicLong
  * 职责边界：
  *  - 持有 `:MediapipeUpperBody` 的 [UpperBodyPoseDetector]，管它的初始化 / 启停 / 释放；
  *  - 把相机线程上的 [YuvFrameData] 转成模块认识的 [Yuv420Frame]（**不拷贝像素**，
- *    ByteBuffer 直接透传，因为检测器要求在相机回调里同步转换，见 §3.2）；
+ *    ByteBuffer 直接透传；检测器的 pushFrame 会在回调内把平面拷进池化缓冲，
+ *    像素拷贝仍然只发生在相机回调期间，见 §3.2）；
  *  - **ROI 引导**：用同一帧的脸框（[MediaPipeFaceDetector.FaceBox]）生成 [FaceRoiHint]，
  *    检测器据此裁出上半身 ROI → 只缩放这块再推理；没有可信脸框时回退整帧；
  *    输入长边 256/320 自适应（正常 256，质量下降 / 脸框变小 / ROI miss 升 320，

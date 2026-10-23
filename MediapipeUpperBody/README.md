@@ -6,9 +6,10 @@
 
 ```
 Camera2 YUV_420_888（app 侧 15fps 抽帧）+ 同一帧脸框
-   │  pushFrame(Yuv420Frame, faceHint)
-   ▼
+   │  pushFrame(Yuv420Frame, faceHint)   ← 相机线程：只把 Y/U/V 按 stride 拷进池化
+   ▼                                       DirectByteBuffer（0.15~0.4ms）→ 立即返回
 UpperBodyPoseDetector
+   │  ⓪ upper-body-worker 线程取「最新一帧」（YuvFrameRing 3 槽，只保留最新帧）
    │  ① 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）；无脸框/太小 → 整帧
    │  ② 只采样 ROI：旋转 + 镜像 + 缩放到长边上限（256/320 自适应，只缩不放）→ ARGB Bitmap（约 1~4ms）
    │  ③ PoseLandmarker.detectAsync(mpImage, ts)   ← 单飞，忙时丢帧
@@ -116,12 +117,12 @@ if (detector.isModelAvailable()) {
         )
     ) {
         detector.setTargetFps(15)          // 默认就是 15
-detector.inputSizeMode = InputSizeMode.ADAPTIVE   // A/B：PRECISION(固定320) / FRAME_RATE(固定256)
+        detector.inputSizeMode = InputSizeMode.ADAPTIVE   // A/B：PRECISION(320) / FRAME_RATE(256)
         detector.start()
     }
 }
 
-// —— 相机线程（Buffer 只在回调内有效，必须同步调）——
+// —— 相机线程（Buffer 只在回调内有效，必须在回调内调；内部只拷贝平面，立即返回）——
 detector.pushFrame(
     Yuv420Frame(
         y = yBuffer, u = uBuffer, v = vBuffer,
@@ -138,9 +139,12 @@ detector.resetBaseline()         // 让用户摆正后重新取中性姿态
 detector.release()               // 关闭 landmarker；幂等，未 initialize 也能调
 ```
 
-> `pushFrame` 内部只做「限帧判断 + 同步 YUV→Bitmap + 投递 detectAsync」，
-> 不等待推理锁；单飞用 `AtomicBoolean`，忙时当前帧直接 `dropped++`。
-> 转换只读 `ByteBuffer.get(index)`、不依赖 position，返回后不保留 ByteBuffer 引用。
+> `pushFrame` 在相机线程上只做「按 stride 拷贝 Y/U/V 到池化 DirectByteBuffer +
+> 发布为最新帧」（典型 0.15~0.4ms）就返回；限帧判断、ROI 采样、YUV→Bitmap、
+> 投递 detectAsync 都在模块内部的 `upper-body-worker` 线程做（见 `YuvFrameRing`）。
+> 队列**只保留最新帧**：上一帧没被消费就直接顶掉（计入 `dropped`），绝不排队放大延迟。
+> 拷贝只读 `ByteBuffer.get(index)`、不依赖 position，返回后不保留 ByteBuffer 引用；
+> 单飞用 `AtomicBoolean`，忙时当前帧直接 `dropped++`。
 
 ---
 
@@ -162,6 +166,7 @@ class UpperBodyPoseDetector(context: Context) {
     fun stop()
     fun release()
     fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null)
+                                          // 相机线程只拷贝平面入队；ROI/转换/推理在 upper-body-worker
     fun resetBaseline()
     fun setMinConfidences(detection: Float, presence: Float, tracking: Float)
     fun setTargetFps(fps: Int)
@@ -181,7 +186,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 - `framesIn`：`pushFrame` 被调用且检测器处于 ready+started 的帧数（含被丢弃的）；
 - `framesOut`：`onResult` 实际产出的帧数（含 `tracking=false` 的空帧）；
-- `dropped`：因限帧 / 上一帧仍在推理 / 转换失败而丢弃的帧数；
+- `dropped`：因限帧 / 上一帧仍在推理 / 转换失败 / 被更新的帧顶掉而丢弃的帧数；
 - `avgLatencyMs`：`detectAsync` 提交 → 结果回调的指数滑动平均（0.8/0.2）。
 
 ---
@@ -193,7 +198,8 @@ class UpperBodyPoseDetector(context: Context) {
 - 先按 `rotationDegrees` **顺时针**旋转，再按 `mirrorHorizontal` 在旋转后的画面上水平镜像；
 - `faceHint` 有效时只采样「脸框 → 上半身 ROI」（`UpperBodyRoi.fromFace`：bodyW=faceW×4.5、
   bodyH=faceH×5.5，顶部留 0.35×脸高）；否则整帧；
-- 长边缩到 **320**（保持宽高比，不放大），输出 `ARGB_8888`；
+- 长边缩到 **256 / 320**（`InputSizeMode`：PRECISION 固定 320 / FRAME_RATE 固定 256 /
+  ADAPTIVE 自适应，默认；保持宽高比，不放大），输出 `ARGB_8888`；
 - 最近邻采样，**不做整帧拷贝**；整帧 1080p 竖屏约采样 180×320 ≈ 5.8 万像素，ROI 典型
   10 万像素上下；
 - **镜像只处理像素**：返回的 `LEFT_WRIST` 仍然是 MediaPipe 语义的「左手」，不交换左右。
@@ -251,7 +257,9 @@ class UpperBodyPoseDetector(context: Context) {
 
 ### 4.7 线程
 
-- `pushFrame` 在相机线程 / tap 回调里调用；内部同步完成 ROI 采样 + Bitmap 构造；
+- `pushFrame` 在相机线程 / tap 回调里调用；回调内只同步拷贝平面（0.15~0.4ms），
+  ROI 采样 + Bitmap 构造 + detectAsync 提交在内部 `upper-body-worker` 线程
+  （`YuvFrameRing` 3 槽、只保留最新帧）；
 - `onResult` / `onError` 在 MediaPipe 回调线程；
 - 生命周期 / 配置方法主线程调用即可；内部状态由锁 + volatile 保护；
 - `release()` 幂等，未 `initialize` 过也能调；`release()` 后可再次 `initialize()`。

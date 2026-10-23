@@ -636,7 +636,7 @@ class UpperBodyPoseDetector(context: Context) {
 
     /** 停掉 worker 线程并关闭环形缓冲（release 用）；之后再次 start() 会自动重建。 */
     private fun shutdownWorker() {
-        val thread: Thread?
+        var thread: Thread? = null
         synchronized(workerLock) {
             workerRunning = false
             thread = workerThread
@@ -654,7 +654,9 @@ class UpperBodyPoseDetector(context: Context) {
 
     /** `upper-body-worker` 线程主体：只消费「最新帧」，空闲时挂在环形缓冲上等。 */
     private fun workerLoop() {
-        while (workerRunning) {
+        // frameRing.isClosed：release() 与 pushFrame 竞态时即使 workerRunning 被重新置位，
+        // 已关闭的队列也会让本线程立刻退出，不会留下空转线程。
+        while (workerRunning && !frameRing.isClosed) {
             val slot = frameRing.takeLatest(WORKER_IDLE_WAIT_MS) ?: continue
             try {
                 val frame = slot.frame

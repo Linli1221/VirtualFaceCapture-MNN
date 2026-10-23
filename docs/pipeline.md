@@ -584,18 +584,26 @@ if (bodyTapWithHint != null || bodyTapLegacy != null) {
 3. `try/catch(Throwable)` 是必需的——**相机线程一旦被抛出去，面捕也会跟着停**；
 4. 关闭时两个 tap 都置 null，相机回调里只多一次判空（`MainActivity.kt`）。
 
-### 8.2 为什么不能直接把帧丢给后台线程
+### 8.2 帧怎么交给后台线程（回调内拷贝 + 只保留最新帧）
 
-MediaPipe 需要 `Bitmap`，而 `Bitmap` 必须当场构造——**YUV 的 ByteBuffer 在相机回调返回后
-就随 `image.close()` 失效了**。所以像素转换必须同步做，只有推理能异步。
+MediaPipe 需要 `Bitmap`，而 **YUV 的 ByteBuffer 在相机回调返回后就随 `image.close()` 失效**，
+异步 worker 不能直接持有它。二选一：把 `Image` 所有权传给 worker（最后一个消费者负责
+`close()`），或在回调内把平面拷进池化缓冲。这里用后者——生命周期和丢帧处理都更简单：
 
-`YuvBitmapConverter.convert` 现在做两件事：
+1. **相机线程只做一次平面拷贝**：`YuvFrameRing`（3 槽池化 DirectByteBuffer，行内紧凑、
+   丢掉行尾 padding）按 stride 把 Y/U/V 拷进来（典型 0.15~0.4ms）并发布为「最新帧」，
+   立即返回；
+2. **`upper-body-worker` 线程消费最新帧**：队列**只保留最新帧**——上一帧没被消费就直接
+   顶掉（计入 `dropped`），绝不排队放大端到端延迟；然后才做 ROI / 转换 / detectAsync。
+
+`YuvBitmapConverter.convert`（worker 线程）现在做两件事：
 
 1. **脸框 → 上半身 ROI**（`UpperBodyRoi.fromFace`）：bodyW = faceW×4.5、bodyH = faceH×5.5，
    水平以脸中心为中心、顶部留 0.35×脸高；没有可信脸框 / 脸太小 / ROI <48px 时用整帧。
 2. **只采样 ROI**（最近邻反查源坐标）并缩放到**当前输入长边**（256/320 自适应、只缩不放，
    状态机见 `InputSizePolicy`）。整帧 720p→320p 也只采约 5.8 万像素（256 档再省 36%）；
-   带 ROI 时输出 10 万像素上下，15fps 下约 1~4ms，仍在相机线程预算内。
+   带 ROI 时输出 10 万像素上下，15fps 下约 1~4ms —— 这一段在 `upper-body-worker` 线程，
+   不再占用相机线程的 16.7ms 帧预算。
 
 结果点先在 ROI 局部坐标，**回映到整帧预览坐标之后**再做 13 点提取 / 躯干角 / 平滑，
 所以协议 `ub[]` 的语义与改造前完全一致。
@@ -603,7 +611,7 @@ MediaPipe 需要 `Bitmap`，而 `Bitmap` 必须当场构造——**YUV 的 ByteB
 ### 8.3 限帧 + 单飞
 
 ```kotlin
-// UpperBodyPoseDetector.pushFrame
+// UpperBodyPoseDetector.processFrame（upper-body-worker 线程；pushFrame 只拷贝入队）
 if (nowMs - lastSubmit < 1000/targetFps) { dropped++; return }   // 15fps 门限
 if (!inFlight.compareAndSet(false, true)) { dropped++; return }  // 上一帧没回调就丢
 ```
@@ -909,7 +917,7 @@ YUV 预处理、命令录制、结果回读）。
 |---|---|---|---|
 | 1 | **YUV plane 生命周期**：`image.close()` 在回调返回即执行，但帧已 `trySend` 进通道；`ImageReader` 只有 3 块 buffer，60 fps 下 16.7–50 ms 就被复用 | 检测通道排队 1–2 帧时，读到的可能是**已被覆盖的画面** | `Camera2Manager.kt:1401`、`PipelineFaceTracker.kt` 通道定义 |
 | 2 | **重排缺口 60 ms**：永久丢一帧会让输出定格约 67 ms 再突发放放 | 偶发一次顿挫 | `FrameReorderBuffer.kt:27` |
-| 3 | **上半身抽帧在相机线程同步转换**（ROI→320p，约 1~4 ms / 66 ms） | duty 很低；ROI 已把采样限制在人身上，但转换期间仍占相机线程 | `UpperBodyPoseDetector.pushFrame` |
+| 3 | ~~**上半身抽帧在相机线程同步转换**~~ 已改为「回调内 0.15~0.4ms 平面拷贝 + `upper-body-worker` 线程做 ROI/转换」 | 相机线程只剩一次 memcpy；队列只保留最新帧，慢了丢旧帧 | `YuvFrameRing` / `UpperBodyPoseDetector.pushFrame` |
 | 4 | **多路并行时头姿滤波采样顺序 = worker 到达顺序** | 不是严格时间序；60 fps 的 EMA 影响很小 | `g_head_pose_mutex`，`MediaPipeFaceLandmarkJNI.cpp:81` |
 | 5 | **未加锁的静态 perf profiler** 在 4 路并行时并发写 | 统计层数据竞争，不影响结果 | `perf_profiler.h` |
 

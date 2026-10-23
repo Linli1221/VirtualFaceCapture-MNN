@@ -437,6 +437,8 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 ### 代价
 
 - 相机线程：每 66 ms 多 1~4 ms 的 YUV→Bitmap 转换（约 6% 预算）；面捕 channel 仍然先喂。
+  **（后续已优化：相机线程只做 0.15~0.4ms 平面拷贝入「只保留最新」的 YuvFrameRing，
+  ROI 采样 / Bitmap / detectAsync 移到 `upper-body-worker` 线程，不再占相机帧预算。）**
 - 推理：15 fps Pose 推理与面捕的 face landmarker 并行；GPU 满载时才回退 CPU（帧率会掉到 5~10）。
 - 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 Bitmap（本轮起长边上限 320，约 300–400 KB（256 档约 200–260 KB；256/320 自适应见 InputSizePolicy），交给 GC）。
 - 关掉时：tap 为 null，没有 Bitmap、没有额外推理，面捕路径与之前完全一致。
@@ -553,10 +555,10 @@ delivered_fps ≈ min(传感器实际帧率, 1000 / 单次回调耗时)
    收益是正确性不是帧率，且改动跨 `Camera2Manager` / `PipelineFaceTracker`，本轮未做。
 2. **重排缺口 60ms**：永久丢一帧会让输出定格 ~67ms 再突发放行。直接改小超时会在 30fps
    采集（帧间隔 33ms）下误判缺口，必须改成「知道某帧已失败就 `markSkipped`」的方案。
-3. **上半身抽帧仍在相机线程上**：开启上半身时，`onYuvFrameForBodyWithHint` 每 66ms 在
-   相机线程同步做一次「ROI 采样 → Bitmap」（约 1~4ms，本轮已从整帧 256 改为 ROI 320）。
-   它不改变 30fps 的结论（duty 很低），但会加大 `callback max`；要彻底解耦需给
-   `UpperBodyPoseDetector` 加「最新帧 + 独立线程」语义。
+3. ~~**上半身抽帧仍在相机线程上**~~ **已解耦**：`pushFrame` 现在在相机线程只把 Y/U/V
+   按 stride 拷进池化 DirectByteBuffer（`YuvFrameRing`，3 槽，典型 0.15~0.4ms）并发布为
+   「最新帧」，ROI 采样 → Bitmap（1~4ms）→ detectAsync 全部在 `upper-body-worker` 线程；
+   队列只保留最新帧（慢了丢旧帧），相机线程不再出现 1~4ms 的转换峰值。
 4. **预览移出相机线程 / 降预览分辨率**：720p 预览在相机线程上峰值 5.5~13.5ms；
    限速到 30fps 已把均摊减半，峰值仍需「独立预览线程」或
    「MNN 输出 BGRA + `Bitmap.copyPixelsFromBuffer()`」。
@@ -608,7 +610,8 @@ delivered_fps ≈ min(传感器实际帧率, 1000 / 单次回调耗时)
 
 - 原生 ROI 的 bbox/平移方向写反会采样错位；数学已复算，仍需真机固定图 diff。
 - 上半身 ROI 依赖脸框坐标系（旋转后、未镜像）；脸框给错时靠 1s 整帧回退兜底。
-- 上半身转换仍在相机线程同步执行；ROI 限制了采样量，但峰值仍会进 `callback max`。
+- ~~上半身转换仍在相机线程同步执行~~ 已移到 `upper-body-worker`（相机线程只剩平面拷贝
+  0.15~0.4ms）；ROI 限制了采样量，worker 上的转换峰值不再进 `callback max`。
 - 本轮的 128p 检测分支**没有**新增 YUV→128p 预下采样：检测输入本来就是 128×128，
   MNN 只按输出像素采样，先下采样反而多读整帧（见 round2 文档 §4）。
 
