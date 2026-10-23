@@ -5,7 +5,8 @@ import java.nio.ByteBuffer
 /**
  * 相机线程上的一帧 YUV_420_888。
  *
- * **ByteBuffer 只在相机回调期间有效**，所以 app 侧必须在 `onYuvFrameForBody` 回调里
+ * **ByteBuffer 只在相机回调期间有效**，所以 app 侧必须在 `onYuvFrameForBodyWithHint`
+ * （或旧 `onYuvFrameForBody`）回调里
  * 同步调用 [UpperBodyPoseDetector.pushFrame]；本模块会在 pushFrame 内立即把像素
  * 采样 / 旋转 / 缩放成 Bitmap，不会保留这些 ByteBuffer。
  *
@@ -65,7 +66,7 @@ class Yuv420Frame(
     }
 
     companion object {
-        /** MediaPipe Pose 的推荐输入长边（256，见 docs/upper-body.md §3.2）。 */
+        /** [targetSize] 的默认长边（256，只缩不放）。检测器实际用 320（见 UpperBodyPoseDetector）。 */
         const val DEFAULT_MAX_LONG_SIDE = 256
     }
 }

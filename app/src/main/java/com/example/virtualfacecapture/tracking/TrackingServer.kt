@@ -20,6 +20,7 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -867,6 +868,25 @@ internal class TrackingWsConnection(
     /** 数据帧只有 1 个槽位：覆盖式写入，读走即空。 */
     private val pendingTrack = AtomicReference<String?>(null)
 
+    /**
+     * writer 线程的唤醒信号。
+     *
+     * 之前 writer 空闲时 `controlQueue.poll(20ms)`，而 [offerTrack] 只写一个
+     * [AtomicReference] 不会唤醒它 —— 结果每帧最多要等 20ms 才被发出去，
+     * **发送帧率被硬性钉在 ~50fps**，还额外带来 0~20ms 的延迟。面捕要 60fps，
+     * 这里必须让投递立刻唤醒 writer。
+     *
+     * 许可数限制在 2 以内，避免帧率高于发送能力时许可无限累积、导致空转。
+     */
+    private val writerWakeup = Semaphore(0)
+
+    /** 唤醒 writer；已有未消费的许可时不再叠加。 */
+    private fun signalWriter() {
+        if (writerWakeup.availablePermits() < 2) {
+            writerWakeup.release()
+        }
+    }
+
     private val pendingPong = AtomicReference<ByteArray?>(null)
     private val pendingPing = AtomicBoolean(false)
     private val closeRequested = AtomicBoolean(false)
@@ -888,6 +908,8 @@ internal class TrackingWsConnection(
     fun offerTrack(message: String) {
         if (closed) return
         pendingTrack.set(message)
+        // 关键：立刻叫醒 writer。否则它还在 20ms 的 await 里，发送帧率会掉到 ~50fps。
+        signalWriter()
     }
 
     /** 投递控制消息（不会被覆盖）。 */
@@ -898,17 +920,20 @@ internal class TrackingWsConnection(
             controlQueue.poll()
             controlQueue.offer(message)
         }
+        signalWriter()
     }
 
     /** 让 writer 线程发一个协议层 ping。 */
     fun sendPing() {
         if (closed) return
         pendingPing.set(true)
+        signalWriter()
     }
 
     /** 队列里的控制消息发完后再关闭连接（[TrackingServer.stop] 用它送出 bye）。 */
     fun requestClose() {
         closeRequested.set(true)
+        signalWriter()
     }
 
     /** 只有 writer 线程会调用，所以不需要加锁。 */
@@ -963,9 +988,9 @@ internal class TrackingWsConnection(
                     continue
                 }
 
-                // 空闲：短阻塞等控制消息，醒来再检查一次最新帧槽位
-                val next = controlQueue.poll(20L, TimeUnit.MILLISECONDS)
-                if (next != null) sendFrame(OP_TEXT, next.toByteArray(Charsets.UTF_8))
+                // 空闲：阻塞等唤醒信号（数据帧 / 控制消息 / ping / close 都会 release），
+                // 醒来回到循环顶部统一分发。20ms 只是兜底超时（防止漏唤醒时永久挂住）。
+                writerWakeup.tryAcquire(20L, TimeUnit.MILLISECONDS)
             }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -1103,6 +1128,8 @@ internal class TrackingWsConnection(
         controlQueue.clear()
         pendingPong.set(null)
         pendingPing.set(false)
+        // 让 writer 立刻从 20ms 兜底等待里醒来退出，而不是等超时。
+        signalWriter()
         try {
             socket.close()
         } catch (ignored: IOException) {

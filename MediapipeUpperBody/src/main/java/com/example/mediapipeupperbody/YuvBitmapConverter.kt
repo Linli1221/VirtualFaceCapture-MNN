@@ -6,8 +6,11 @@ import android.graphics.Bitmap
  * YUV_420_888 → 旋转 / 镜像 / 缩小后的 ARGB_8888 Bitmap。
  *
  * 性能策略（docs/upper-body.md §2 ①）：
- *  - **不做整帧转换**：直接按输出像素反查源坐标（最近邻采样），输出长边 256 时
- *    一个 1080p 竖屏帧只要采样约 192×256 ≈ 5 万像素，实测量级在 1~4ms；
+ *  - **不做整帧转换**：直接按输出像素反查源坐标（最近邻采样），输出长边上限 320 时
+ *    一个 1080p 竖屏帧只要采样约 180×320 ≈ 5.8 万像素；带 ROI 时只采样 ROI
+ *    （典型 10 万像素上下），实测量级在 1~4ms；
+ *  - **ROI 裁切**：传入 [RoiWindow] 时只采样窗口内的旋转后像素，输出仍是「预览方向」
+ *    （镜像在 ROI 内部翻转）。roi = null / 全帧 / 非法时与旧版逐位一致；
  *  - 像素数组复用，Bitmap 只在每帧创建一次（MediaPipe LIVE_STREAM 异步持有它直到
  *    回调返回，不能复用同一张 Bitmap）；
  *  - 旋转 / 镜像映射全部来自纯 Kotlin 的 [YuvGeometry]，方便单测。
@@ -19,14 +22,29 @@ internal class YuvBitmapConverter {
 
     private var pixels: IntArray = IntArray(0)
 
+    /**
+     * @param frame 相机 YUV 帧（未旋转 / 未镜像的源图）
+     * @param maxLongSide 输出图长边上限（只缩不放）
+     * @param roi 旋转后源像素坐标里的裁切窗口；null / 整帧 / 非法（越界、0 尺寸）都按整帧处理。
+     *   非法 ROI 选择**回退整帧**而不是返回 null：宁可多采样一点像素，也不要让这一帧
+     *   （乃至整个上半身功能）因为一个坏窗口而丢掉。
+     */
     @Synchronized
-    fun convert(frame: Yuv420Frame, maxLongSide: Int): Bitmap? {
+    fun convert(frame: Yuv420Frame, maxLongSide: Int, roi: RoiWindow? = null): Bitmap? {
         if (!frame.isValid()) return null
 
         val rotation = frame.normalizedRotation
         val rotatedWidth = frame.rotatedWidth
         val rotatedHeight = frame.rotatedHeight
-        val target = YuvGeometry.scaledSize(rotatedWidth, rotatedHeight, maxLongSide)
+
+        // 采样窗口（旋转后坐标）。roi == null 时就是整帧，走与旧版逐位一致的路径。
+        val window = if (roi != null && roi.fitsWithin(rotatedWidth, rotatedHeight)) roi else null
+        val windowX = window?.x0 ?: 0
+        val windowY = window?.y0 ?: 0
+        val windowWidth = window?.width ?: rotatedWidth
+        val windowHeight = window?.height ?: rotatedHeight
+
+        val target = YuvGeometry.scaledSize(windowWidth, windowHeight, maxLongSide)
         if (target.isEmpty) return null
 
         val outWidth = target.width
@@ -36,14 +54,21 @@ internal class YuvBitmapConverter {
             pixels = IntArray(pixelCount)
         }
 
-        // 输出坐标 → 旋转后坐标（镜像在旋转后的画面上做水平翻转）。
+        // 输出坐标 → 旋转后坐标（镜像在旋转后的画面上做水平翻转，且只翻转 ROI 内部）。
         // 预计算映射表，内层循环只做整数查表 + 采样。
+        // 整帧（window == null）时 local 就是旧版的 raw，逐位一致。
         val mirror = frame.mirrorHorizontal
         val rotatedX = IntArray(outWidth) { outX ->
-            val raw = (outX * rotatedWidth) / outWidth
-            if (mirror) rotatedWidth - 1 - raw else raw
+            val local = (outX * windowWidth) / outWidth
+            if (mirror) {
+                windowX + windowWidth - 1 - local
+            } else {
+                windowX + local
+            }
         }
-        val rotatedY = IntArray(outHeight) { outY -> (outY * rotatedHeight) / outHeight }
+        val rotatedY = IntArray(outHeight) { outY ->
+            windowY + (outY * windowHeight) / outHeight
+        }
 
         val yBuffer = frame.y
         val uBuffer = frame.u

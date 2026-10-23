@@ -22,6 +22,8 @@ import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.CameraLensFacing
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.sqrt
 
 /**
@@ -194,6 +196,30 @@ class Camera2Manager(private val context: Context) {
 
         /** 目标宽高比（16:9），没有 720p 时用于同族尺寸的次级排序。 */
         private val TARGET_ASPECT = TARGET_WIDTH.toFloat() / TARGET_HEIGHT
+
+        /**
+         * 预览 RGB 帧的最小生成间隔（纳秒）。
+         *
+         * 预览只用于调试观察，没必要跟满 60fps：60fps 采集下每 2 帧生成 1 帧
+         * （33ms）就是 30fps 预览。相机线程上的整帧 YUV→RGB（720p 约 2.7MB）
+         * + 像素打包 + Bitmap 上传因此直接减半 —— 这几乎是把「相机线程处理太慢
+         * 导致 ImageReader 丢帧、交付帧率掉到 30」这个坑一次性填掉。
+         */
+        private const val PREVIEW_INTERVAL_NS = 33_000_000L
+
+        /**
+         * 判定「相机没在跑 60fps」的交付帧率下限。
+         *
+         * 58fps 这类读数属于正常抖动，不触发降档；低于 50fps 才认为相机侧确实
+         * 喂不满（或回调被拖慢到丢帧）。
+         */
+        private const val MIN_CAPTURE_FPS = 50f
+
+        /** 启动后最多自动降档几次（每次重开相机，代价约 1 秒）。 */
+        private const val MAX_SIZE_DOWNSHIFTS = 2
+
+        /** 相机回调耗时统计窗口（帧）。60fps 下 120 帧 ≈ 2 秒打一条日志。 */
+        private const val CB_STATS_WINDOW_FRAMES = 120
     }
     
     /**
@@ -486,13 +512,23 @@ class Camera2Manager(private val context: Context) {
             Log.e(TAG, "Camera permission not granted")
             return
         }
+        synchronized(captureLifecycleLock) { startCameraInternal() }
+    }
 
+    private fun startCameraInternal() {
         // Guard against double-start (e.g. rapid Start taps or a switch while
         // the previous session is still tearing down).
         if (backgroundThread != null || cameraDevice != null) {
             Log.w(TAG, "Camera already started, releasing the previous session first")
-            stopCamera()
+            stopCameraInternal()
         }
+
+        // 探针降档触发的重开要保留目标尺寸；手动 start / 换镜头时重新按能力挑。
+        if (!keepCaptureSizeOverride) {
+            captureSizeOverride = null
+            sizeDownshiftCount = 0
+        }
+        keepCaptureSizeOverride = false
 
         startBackgroundThread()
 
@@ -500,16 +536,23 @@ class Camera2Manager(private val context: Context) {
         deliveredFrameCount = 0
         deliveredWindowStartNs = 0L
         cameraDeliveredFps = 0f
+        deliveredFpsReady = false
+        cameraCallbackAvgMs = 0f
+        cbWindowFrames = 0
+        cbWindowTotalNs = 0L
+        cbWindowMaxNs = 0L
         appliedFrameDurationNs = 0L
         appliedExposureNs = 0L
         appliedFpsRange = null
         activeFpsRange = null
         lastCaptureResultKey = null
+        lastPreviewFrameNs = 0L
         // 上一轮若因 HAL 拒绝 SENSOR_FRAME_DURATION 关了钉帧率，重开时重新尝试，
         // 否则一次回退会让之后每次采集都停在 30fps。
         pinFrameRate = true
         // 物理相机流失败退回逻辑相机的机会也重新给一次。
         physicalFallbackTried = false
+        cameraSessionActive = true
 
         openCamera()
     }
@@ -518,6 +561,23 @@ class Camera2Manager(private val context: Context) {
      * Stop camera capture and release resources
      */
     fun stopCamera() {
+        synchronized(captureLifecycleLock) { stopCameraInternal() }
+    }
+
+    private fun stopCameraInternal() {
+        // 先让探针失效：旧的 2.5s/0.8s 定时任务醒来后看到代号不一致会直接退出，
+        // 不会在 stop 之后把相机重新拉起来。
+        cameraSessionActive = false
+        fpsProbeGeneration++
+        currentCaptureSize = null
+        streamConfigMap = null
+
+        // 顺序很关键：先停相机线程（quitSafely 会把已入队的回调跑完再退出），
+        // 再关 session / ImageReader。反过来的话，在途回调会去操作已经 close 的
+        // reader，`image.close()` 抛 IllegalStateException 会直接打死相机线程，
+        // 之后整条链路永久断流。
+        stopBackgroundThread()
+
         captureSession?.close()
         captureSession = null
         captureSurface = null
@@ -527,12 +587,16 @@ class Camera2Manager(private val context: Context) {
         
         imageReader?.close()
         imageReader = null
-        
-        stopBackgroundThread()
     }
     
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        // 相机线程必须比普通后台线程更早被调度：它的 16.7ms 预算是硬上限
+        // （回调一旦超过就丢帧，交付帧率直接掉档），而后面的 fc-* 推理线程
+        // 已经跑在 NORM+2 上。用默认优先级会让相机回调在 CPU 忙时被压后。
+        backgroundThread = HandlerThread(
+            "CameraBackground",
+            android.os.Process.THREAD_PRIORITY_DISPLAY,
+        ).also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
     
@@ -608,13 +672,34 @@ class Camera2Manager(private val context: Context) {
             val map = streamCharacteristics
                 .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-            // Choose capture size: 720p @ 60fps when the camera can do it.
-            val previewSize = chooseCaptureSize(
-                map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray(),
-                map,
-            )
+            // 采集尺寸：优先用探针降档选定的尺寸（本次会话）或该相机之前探明的尺寸
+            // （跨 stop/start 保留）；否则按「能跑满 60fps」重新挑。
+            val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+            streamConfigMap = map
+            currentCameraKey = activeInfo.key
+            captureSizeCandidates = yuvSizes
+                .filter {
+                    minOf(it.width, it.height) >= MIN_SIZE &&
+                        it.width * it.height <= MAX_PIXEL_COUNT
+                }
+                .sortedByDescending { it.width * it.height }
 
-            Log.i(TAG, "Selected capture size: ${previewSize.width}x${previewSize.height}")
+            val rememberedSize = resolvedCaptureSizes[activeInfo.key]
+            val overrideSize = (captureSizeOverride ?: rememberedSize)?.takeIf { wanted ->
+                yuvSizes.any { it.width == wanted.width && it.height == wanted.height }
+            }
+            val previewSize = overrideSize ?: chooseCaptureSize(yuvSizes, map)
+            currentCaptureSize = previewSize
+
+            if (overrideSize != null) {
+                Log.i(
+                    TAG,
+                    "Selected capture size (adaptive downshift): " +
+                        "${previewSize.width}x${previewSize.height}",
+                )
+            } else {
+                Log.i(TAG, "Selected capture size: ${previewSize.width}x${previewSize.height}")
+            }
 
             // Create ImageReader for frame capture.
             // 3 个 buffer：处理端偶尔慢一拍时相机可以继续出帧，配合
@@ -721,11 +806,14 @@ class Camera2Manager(private val context: Context) {
      * Camera2 只允许从设备上报的尺寸里选，所以这里不是「想要什么就是什么」，
      * 而是按下面的顺序挑最接近目标的那个：
      *
-     *  1. 设备报了 1280x720（或竖屏的 720x1280）→ 直接用。如果该尺寸的
-     *     `minFrameDuration` 说明它跑不满 60fps，打警告（仍然保留 720p）；
-     *  2. 没有 720p → 在 720p 以内、且 [StreamConfigurationMap.getOutputMinFrameDuration]
-     *     证明能跑满 60fps 的尺寸里取最大的（先保证 60fps，再尽量清晰）；
+     *  1. 设备报了 1280x720（或竖屏的 720x1280）**且该尺寸能跑满 60fps** → 用它；
+     *  2. 没有可用的 720p（或 720p 只到 30fps）→ 在 720p 以内、且
+     *     [StreamConfigurationMap.getOutputMinFrameDuration] 证明能跑满 60fps 的
+     *     尺寸里取最大的（先保证 60fps，再尽量清晰）；
      *  3. 整台相机都没有 60fps 尺寸 → 取 720p 以内最大的尺寸，并警告实际帧率。
+     *
+     * 注意策略 1 的条件：**帧率优先于清晰度**。很多 HAL 会把 720p 列进 YUV
+     * 尺寸表却只给 30fps，死守 720p 会让整条管线被相机按在 30fps。
      *
      * 为什么用 `getOutputMinFrameDuration` 而不是只看
      * `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`：后者只说明 sensor 能跑多快，
@@ -767,33 +855,37 @@ class Camera2Manager(private val context: Context) {
             return fallback
         }
 
-        // 1. 精确的 720p（兼容竖屏上报的 720x1280）
+        // 1. 精确的 720p：只有「该尺寸确实能跑满 60fps」时才用。
+        //
+        //    很多 HAL 会把 720p 也列在 YUV 尺寸表里，但它的 minFrameDuration
+        //    只有 30fps。上一版在这种机型上仍然死守 720p，结果整条管线被相机
+        //    按在 30fps —— 推理再快也没用。所以这里改成：720p 跑不满 60fps
+        //    就往下找一个能跑满的尺寸（通常是 640x480），帧率优先、清晰度次之。
         val target = candidates.firstOrNull {
             it.width == TARGET_WIDTH && it.height == TARGET_HEIGHT
         } ?: candidates.firstOrNull {
             it.width == TARGET_HEIGHT && it.height == TARGET_WIDTH
         }
-        if (target != null) {
+        if (target != null && canDeliverTargetFps(map, target)) {
             val maxFps = maxFpsForSize(map, target)
-            if (maxFps == null || maxFps >= TARGET_FPS - FPS_TOLERANCE) {
-                Log.i(
-                    TAG,
-                    "✓ Selected 720p capture: ${target.width}x${target.height} " +
-                        "(max ${maxFps?.let { "%.1f".format(it) } ?: "unknown"} fps)",
-                )
-            } else {
-                Log.w(
-                    TAG,
-                    ("⚠ 720p (${target.width}x${target.height}) is advertised but this camera " +
-                        "caps it at %.1f fps (< ${TARGET_FPS}); keeping 720p — " +
-                        "the delivered frame rate will follow the camera").format(maxFps),
-                )
-            }
+            Log.i(
+                TAG,
+                "✓ Selected 720p capture: ${target.width}x${target.height} " +
+                    "(max ${maxFps?.let { "%.1f".format(it) } ?: "unknown"} fps)",
+            )
             return target
         }
+        if (target != null) {
+            val maxFps = maxFpsForSize(map, target)
+            Log.w(
+                TAG,
+                ("⚠ 720p (${target.width}x${target.height}) is advertised but this camera " +
+                    "caps it at %.1f fps (< ${TARGET_FPS}); picking a ${TARGET_FPS}fps-capable " +
+                    "size instead (frame rate first)").format(maxFps),
+            )
+        }
 
-        // 2. 没有 720p：挑 60fps 能力里最大的尺寸
-        Log.w(TAG, "Camera does not advertise 1280x720; picking the largest ${TARGET_FPS}fps size <= 720p")
+        // 2. 没有可用的 720p：挑能跑满 60fps 的最大尺寸
         val sixtyFpsSizes = candidates.filter { canDeliverTargetFps(map, it) }
         val preferred = if (sixtyFpsSizes.isNotEmpty()) sixtyFpsSizes else candidates
         val best = preferred.sortedWith(
@@ -804,7 +896,7 @@ class Camera2Manager(private val context: Context) {
         if (sixtyFpsSizes.isEmpty()) {
             Log.w(TAG, "⚠ No ${TARGET_FPS}fps-capable size advertised; using ${best.width}x${best.height}")
         } else {
-            Log.i(TAG, "✓ Selected capture size: ${best.width}x${best.height} (target ${TARGET_FPS}fps, no 720p)")
+            Log.i(TAG, "✓ Selected capture size: ${best.width}x${best.height} (target ${TARGET_FPS}fps)")
         }
         return best
     }
@@ -946,6 +1038,7 @@ class Camera2Manager(private val context: Context) {
                 return
             }
 
+            var captureStarted = false
             try {
                 // Start continuous capture
                 session.setRepeatingRequest(
@@ -953,6 +1046,7 @@ class Camera2Manager(private val context: Context) {
                     captureCallback,
                     backgroundHandler
                 )
+                captureStarted = true
             } catch (e: IllegalArgumentException) {
                 // 个别 HAL 不接受显式 SENSOR_FRAME_DURATION，退回到只设 AE 区间。
                 Log.w(TAG, "Repeating request rejected, retrying without pinned frame rate", e)
@@ -965,12 +1059,19 @@ class Camera2Manager(private val context: Context) {
                             captureCallback,
                             backgroundHandler
                         )
+                        captureStarted = true
                     } catch (e2: Exception) {
                         Log.e(TAG, "Error starting capture (fallback)", e2)
                     }
                 }
             } catch (e: CameraAccessException) {
                 Log.e(TAG, "Error starting capture", e)
+            }
+
+            // 采集自检：启动 2.5s 后读真实交付帧率，偏低就自动降一档采集尺寸。
+            // 这里不阻塞相机线程 —— 探测在独立的单线程执行器上跑。
+            if (captureStarted) {
+                scheduleFpsProbe()
             }
         }
 
@@ -1134,6 +1235,92 @@ class Camera2Manager(private val context: Context) {
     private var deliveredWindowStartNs = 0L
     private var lastCaptureResultKey: String? = null
 
+    /** 是否已经凑满至少一个 1s 统计窗口（探针据此避免把「还没统计到」误判成低帧率）。 */
+    @Volatile
+    private var deliveredFpsReady = false
+
+    // ---- 相机回调耗时（用来区分「传感器慢」还是「我们慢」）-------------------
+
+    /**
+     * 相机线程单个回调的平均处理耗时（毫秒）。
+     *
+     * ImageReader 的 listener 在**单线程** Handler 上串行执行，而
+     * `acquireLatestImage()` 只保留最新帧，所以实际交付帧率 =
+     * min(传感器帧率, 1000 / 回调耗时)：回调 16.7ms → 60fps，33ms → 30fps。
+     * 打印这个值就能一眼分清「传感器/AE 只有 30fps」和「我们的处理把回调拖到 33ms」，
+     * 两者的解法完全不同（前者换尺寸也没用，后者要砍相机线程的活）。
+     */
+    @Volatile
+    var cameraCallbackAvgMs: Float = 0f
+        private set
+
+    /** 回调耗时统计窗口（帧）：60fps 下约 2 秒打一次日志。 */
+    private var cbWindowFrames = 0
+    private var cbWindowTotalNs = 0L
+    private var cbWindowMaxNs = 0L
+
+    // ---- 预览限速 / 采集尺寸自适应 -----------------------------------------
+
+    /** 上一次生成预览 RGB 的时刻（nanoTime）；只在相机线程访问。 */
+    private var lastPreviewFrameNs = 0L
+
+    /** 当前会话实际的采集尺寸（自适应降档后更新），供日志与降档逻辑使用。 */
+    @Volatile
+    private var currentCaptureSize: Size? = null
+
+    /** 实测低帧率时强制使用的采集尺寸（null = 每次按能力重新挑）。 */
+    @Volatile
+    private var captureSizeOverride: Size? = null
+
+    /** 本会话已自动降档的次数（上限 [MAX_SIZE_DOWNSHIFTS]）。 */
+    @Volatile
+    private var sizeDownshiftCount = 0
+
+    /** 探针代号：重开相机 / 停相机会递增，旧探针读到不一致就自动失效。 */
+    @Volatile
+    private var fpsProbeGeneration = 0
+
+    /** stopCamera() 之后为 false，探针不会再把相机重新拉起来。 */
+    @Volatile
+    private var cameraSessionActive = false
+
+    /** 本轮 startCamera() 是否由探针降档触发（是则保留 [captureSizeOverride]）。 */
+    private var keepCaptureSizeOverride = false
+
+    /** 当前相机的候选采集尺寸（按像素降序），供降档时挑选下一个档位。 */
+    @Volatile
+    private var captureSizeCandidates: List<Size> = emptyList()
+
+    /** 当前相机（或物理镜头）的 key，用作 [resolvedCaptureSizes] 的索引。 */
+    @Volatile
+    private var currentCameraKey: String? = null
+
+    /**
+     * 已经探明「在这个相机上跑满 60fps」的采集尺寸（按相机 key 持久化）。
+     *
+     * 进程内一直保留：这样用户 stop/start、切走再切回同一个镜头时，不必再花
+     * 3.3 秒重新「先按能力挑 → 实测 → 降档」。相机不同则各记各的。
+     */
+    private val resolvedCaptureSizes = java.util.concurrent.ConcurrentHashMap<String, Size>()
+
+    /** 当前相机（或物理镜头）的 stream map，用于判断某尺寸能否跑满 60fps。 */
+    @Volatile
+    private var streamConfigMap: StreamConfigurationMap? = null
+
+    /**
+     * 帧率探针线程。
+     *
+     * 不能跑在相机 HandlerThread 上：降档要 stopCamera()，而 stopCamera() 会
+     * join 相机线程 —— 在相机线程上调用就是自己等自己（死锁）。这里用独立单线程
+     * 串行执行「探测 → 重开」，与 [captureLifecycleLock] 一起保证不会并发重入。
+     */
+    private val fpsProbeExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "Camera-fps-probe").apply { isDaemon = true }
+    }
+
+    /** startCamera / stopCamera / 降档重开互斥，避免并发重入把相机会话打乱。 */
+    private val captureLifecycleLock = Any()
+
     /**
      * 读取 HAL 真实生效的参数。
      *
@@ -1212,25 +1399,72 @@ class Camera2Manager(private val context: Context) {
     var preferMNNConverter: Boolean = true
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
-        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
-
-        updateDeliveredFps()
+        val cbStartNs = System.nanoTime()
+        val image = try {
+            reader.acquireLatestImage()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "ImageReader closed while acquiring a frame: ${e.message}")
+            return@OnImageAvailableListener
+        } ?: return@OnImageAvailableListener
 
         try {
+            updateDeliveredFps()
+
             if (useDirectYuvMode && yuvFrameCallback != null) {
                 // Direct YUV mode - pass YUV data directly to JNI for zero-copy processing
                 processYuvDirect(image)
-                
-                // Also generate RGB preview if enabled (for debug visualization)
+
+                // Also generate RGB preview if enabled (for debug visualization),
+                // but rate-limit it: it is the single most expensive thing on the
+                // camera thread at 720p and it does NOT need 60fps.
                 if (enablePreviewInYuvMode && frameCallback != null) {
-                    processYuvToRgbForPreview(image)
+                    maybeConvertPreviewFrame(image)
                 }
             } else {
                 // Legacy RGB mode - convert YUV to RGB first
                 processYuvToRgb(image)
             }
+        } catch (e: Exception) {
+            // 相机线程被异常打死 = 永久断流：单帧失败只允许丢帧，不允许终止线程。
+            Log.e(TAG, "Frame processing failed, dropping frame", e)
         } finally {
-            image.close()
+            try {
+                image.close()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Image was already closed: ${e.message}")
+            }
+            recordCallbackTime(System.nanoTime() - cbStartNs)
+        }
+    }
+
+    /**
+     * 统计相机回调耗时（只在相机线程调用，无需加锁）。
+     *
+     * 这是判定「delivered=30」根因的唯一直接数据：16.7ms 说明我们的处理没问题，
+     * 传感器/AE 就是 30fps；接近或超过 33ms 说明是我们在拖慢交付。
+     */
+    private fun recordCallbackTime(elapsedNs: Long) {
+        cbWindowFrames++
+        cbWindowTotalNs += elapsedNs
+        if (elapsedNs > cbWindowMaxNs) cbWindowMaxNs = elapsedNs
+        if (cbWindowFrames >= CB_STATS_WINDOW_FRAMES) {
+            val avgMs = (cbWindowTotalNs.toDouble() / cbWindowFrames / 1_000_000.0).toFloat()
+            cameraCallbackAvgMs = avgMs
+            Log.i(
+                TAG,
+                "Camera callback: avg %.2f ms, max %.2f ms over %d frames (60fps budget = 16.67 ms)"
+                    .format(avgMs, cbWindowMaxNs / 1e6f, cbWindowFrames),
+            )
+            if (avgMs > 16.7f) {
+                Log.w(
+                    TAG,
+                    "⚠ Camera callback takes %.2f ms — the camera thread cannot keep up with 60fps; " +
+                        "this alone caps delivered FPS at ~%.0f".format(avgMs, 1000.0 / avgMs),
+                )
+            }
+            cbWindowFrames = 0
+            cbWindowTotalNs = 0L
+            cbWindowMaxNs = 0L
         }
     }
     
@@ -1253,6 +1487,172 @@ class Camera2Manager(private val context: Context) {
             cameraDeliveredFps = deliveredFrameCount * 1e9f / elapsedNs
             deliveredFrameCount = 0
             deliveredWindowStartNs = now
+            deliveredFpsReady = true
+        }
+    }
+
+    /**
+     * 预览 RGB 限速：同一时间窗口内最多转换一帧。
+     *
+     * 预览是相机线程上最重的一段（整帧 YUV→RGB + RGB→ARGB + Bitmap 上传），
+     * 720p 60fps 时每帧要处理约 2.7MB。预览只要看着不卡即可，30fps 足够；
+     * 把它减半后，相机回调能稳定在 16.7ms 预算内，ImageReader 不再因为回调慢
+     * 而丢帧，`cameraDeliveredFps` 才能真的跑满 60。
+     */
+    private fun maybeConvertPreviewFrame(image: android.media.Image) {
+        val now = System.nanoTime()
+        if (lastPreviewFrameNs != 0L && now - lastPreviewFrameNs < PREVIEW_INTERVAL_NS) {
+            return
+        }
+        lastPreviewFrameNs = now
+        processYuvToRgbForPreview(image)
+    }
+
+    /**
+     * 采集帧率自检 + 自动降档。
+     *
+     * 平台上报的「某尺寸能跑 60fps」并不可靠：不少机型在 720p 上只有 30fps，
+     * 或者 HAL 声称 60fps 但实际被 AE / 带宽按在 30fps。启动 2.5s 后读一次
+     * [cameraDeliveredFps]（真实交付帧率），仍低于 [MIN_CAPTURE_FPS] 就在不
+     * 小于 3/4 像素的前提下自动降一档尺寸重开相机，最多降 [MAX_SIZE_DOWNSHIFTS] 次。
+     *
+     * 这么做的目的很明确：**先保证 60fps，再谈清晰度**。面捕是动作跟随，30fps
+     * 的手感比 720p 的清晰度重要得多。
+     */
+    private fun scheduleFpsProbe() {
+        if (sizeDownshiftCount >= MAX_SIZE_DOWNSHIFTS) return
+        val generation = ++fpsProbeGeneration
+        fpsProbeExecutor.execute(Runnable { runFpsProbe(generation) })
+    }
+
+    /** 探针主体：跑在 [fpsProbeExecutor] 的单线程上，因此可以放心 sleep。 */
+    private fun runFpsProbe(generation: Int) {
+        // 等 AE / 对焦稳定，并凑满一个 1s 交付帧率统计窗口。
+        sleepQuietly(2500L)
+        if (!cameraSessionActive || generation != fpsProbeGeneration) return
+        if (!deliveredFpsReady) {
+            Log.i(TAG, "Camera FPS self-check skipped: no delivery window yet")
+            return
+        }
+        val firstFps = cameraDeliveredFps
+        if (firstFps >= MIN_CAPTURE_FPS) {
+            Log.i(TAG, "Camera FPS self-check: %.1f FPS ✓ (target $TARGET_FPS)".format(firstFps))
+            return
+        }
+        Log.w(TAG, "Camera FPS self-check: %.1f FPS, re-checking in 0.8s".format(firstFps))
+        sleepQuietly(800L)
+        if (!cameraSessionActive || generation != fpsProbeGeneration) return
+        val secondFps = cameraDeliveredFps
+        if (secondFps >= MIN_CAPTURE_FPS) {
+            Log.i(TAG, "Camera recovered to %.1f FPS — keeping size".format(secondFps))
+            return
+        }
+
+        // ---- 先判因，再决定要不要降档 --------------------------------------
+        // HAL 实测的 SENSOR_FRAME_DURATION 是最权威的证据：
+        //   ≈16.7ms → 传感器在 60fps 出帧，delivered 低是我们回调慢（降档/砍预览有效）
+        //   ≈33.3ms → 传感器/AE 本身就是 30fps（换尺寸完全无用，别白重开两次相机）
+        val appliedDurMs = appliedFrameDurationNs / 1_000_000.0
+        if (appliedDurMs > 20.0) {
+            Log.w(
+                TAG,
+                ("⚠ SENSOR_FRAME_DURATION is %.2f ms (%.1f fps) — the sensor/AE itself is not " +
+                    "delivering $TARGET_FPS fps; a smaller capture size cannot help").format(
+                    appliedDurMs, 1000.0 / appliedDurMs,
+                ),
+            )
+            return
+        }
+
+        Log.w(
+            TAG,
+            ("⚠ Camera delivers only %.1f FPS at %s (callback avg %.2f ms, downshift %d/%d) — " +
+                "switching to a smaller capture size").format(
+                secondFps,
+                currentCaptureSize?.let { "${it.width}x${it.height}" } ?: "?",
+                cameraCallbackAvgMs,
+                sizeDownshiftCount + 1,
+                MAX_SIZE_DOWNSHIFTS,
+            ),
+        )
+        // 如果连 AE 区间上限都到不了 60，换尺寸也没用：这台相机 / 这个镜头
+        // 就是 30fps 硬件，直接给出结论，别再白重开两次相机。
+        val range = appliedFpsRange ?: activeFpsRange
+        if (range != null && range.upper < TARGET_FPS) {
+            Log.w(
+                TAG,
+                "⚠ Camera AE ranges top out at ${range.upper}fps — this lens cannot " +
+                    "deliver $TARGET_FPS fps at any size; the pipeline will follow the camera",
+            )
+            return
+        }
+        restartAtSmallerSize(generation)
+    }
+
+    /** 在候选尺寸里挑「至少小 25%」的下一档，优先平台明确支持 60fps 的最大尺寸。 */
+    private fun pickDownshiftSize(current: Size): Size? {
+        val currentPixels = current.width * current.height
+        val smaller = captureSizeCandidates
+            .filter { it.width * it.height < currentPixels }
+            .filter { it.width * it.height <= (currentPixels * 3) / 4 }
+            .sortedByDescending { it.width * it.height }
+        if (smaller.isEmpty()) return null
+        val map = streamConfigMap
+        // 只在「更小且仍能跑满 60fps」时才降档：如果平台明确说更小尺寸也只能 30fps，
+        // 降下去只会白丢清晰度、帧率一点不涨。
+        val capable = smaller.firstOrNull { canDeliverTargetFps(map, it) }
+        if (capable == null) {
+            Log.w(TAG, "No smaller size is advertised as ${TARGET_FPS}fps-capable; not downshifting")
+        }
+        return capable
+    }
+
+    /**
+     * 降档：改写采集尺寸覆盖值并在同一把锁内完成「停 → 开」，避免和手动
+     * start / stop / 换镜头并发交错。
+     */
+    private fun restartAtSmallerSize(expectedGeneration: Int) {
+        synchronized(captureLifecycleLock) {
+            if (!cameraSessionActive || expectedGeneration != fpsProbeGeneration) {
+                Log.i(TAG, "Adaptive downshift skipped: camera session changed")
+            } else {
+                val current = currentCaptureSize
+                if (current == null) {
+                    Log.i(TAG, "Adaptive downshift skipped: no capture size")
+                } else {
+                    val next = pickDownshiftSize(current)
+                    if (next == null) {
+                        Log.w(
+                            TAG,
+                            "⚠ No smaller 60fps-capable capture size — camera stays at its " +
+                                "frame-rate ceiling; inference is not the bottleneck",
+                        )
+                    } else {
+                        sizeDownshiftCount++
+                        captureSizeOverride = next
+                        keepCaptureSizeOverride = true
+                        // 记住「这个相机上跑得动 60fps 的尺寸」：下次 start / 切回该镜头
+                        // 直接用，不用再花 3.3 秒重新探测降档。
+                        currentCameraKey?.let { resolvedCaptureSizes[it] = next }
+                        Log.w(
+                            TAG,
+                            "Adaptive capture downshift #$sizeDownshiftCount: " +
+                                "${current.width}x${current.height} → ${next.width}x${next.height}",
+                        )
+                        stopCameraInternal()
+                        startCameraInternal()
+                    }
+                }
+            }
+        }
+    }
+
+    /** 简单 sleep，忽略中断（探针线程是 daemon，退出时直接结束即可）。 */
+    private fun sleepQuietly(millis: Long) {
+        try {
+            Thread.sleep(millis)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
         }
     }
 

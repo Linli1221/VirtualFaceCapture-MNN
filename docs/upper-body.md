@@ -3,6 +3,7 @@
 > 本文是 `feat/mediapipe-upper-body` 分支的实现契约。**改动本文件里的类名 / 方法签名 /
 > 协议字段前，先同步所有端**。协议字段的最终说明写在
 > [`docs/tracking-protocol.md`](./tracking-protocol.md)（§4.2 / §5.3 / §8.5），这里只讲分工。
+> 上半身在整条动捕链路里的位置见 [`docs/pipeline.md`](./pipeline.md) §8。
 
 ---
 
@@ -26,14 +27,17 @@
 
 ```
 Camera2 (YUV_420_888, 主/后/外接)
-   │  facecapture-sdk PipelineFaceTracker#onYuvFrameForBody（抽帧 tap，默认 66ms = 15fps）
+   │  facecapture-sdk PipelineFaceTracker#onYuvFrameForBodyWithHint
+   │  （抽帧 tap，默认 66ms = 15fps；附带最近脸框，一级扩充 1.15×，TTL 500ms）
    ▼
 app: UpperBodyPoseController                 ← 生命周期 / 开关 / 基线 / 统计
-   │  ① 采样 + 旋转 + 缩放 → ARGB Bitmap（256 长边，保持长宽比）
-   │  ② MediaPipeUpperBody.UpperBodyPoseDetector#pushFrame()
+   │  ① FaceBox → FaceRoiHint（score < 0.3 或非法 → null）
+   │  ② MediaPipeUpperBody.UpperBodyPoseDetector#pushFrame(frame, faceHint)
    ▼
 :MediapipeUpperBody  UpperBodyPoseDetector   ← PoseLandmarker(LIVE_STREAM), GPU 优先、失败回退 CPU
-   │  ③ 取 13 点 → One-Euro 平滑 → 相对基线 (roll/yaw)
+   │  ③ 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）→ 只采样 ROI → ARGB Bitmap（长边上限 320）
+   │     无脸框 / 脸太小 / ROI 太小 → 整帧 320p；ROI miss → 1s 整帧回退
+   │  ④ 33 点先回映整帧预览坐标 → 取 13 点 → One-Euro 平滑 → 相对基线 (roll/yaw)
    ▼
 UpperBodyPoseFrame (CommonData)
    ├─► CameraPreviewView.updateUpperBody()     手机预览上的骨架叠加
@@ -76,7 +80,8 @@ class UpperBodyPoseDetector(context: Context) {
     fun start()                                        // 允许 pushFrame
     fun stop()
     fun release()
-    fun pushFrame(frame: Yuv420Frame)                  // 相机线程同步调用：内部立即转换，之后异步推理
+    fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null)
+                                                       // 相机线程同步调用：ROI 裁切 + 转换，之后异步推理
     fun resetBaseline()
     fun setMinConfidences(detection: Float, presence: Float, tracking: Float)
     fun setTargetFps(fps: Int)
@@ -87,6 +92,15 @@ class UpperBodyPoseDetector(context: Context) {
         const val MODEL_FULL = "pose_landmarker_full.task"
     }
 }
+
+/** 同一帧上的脸框提示（旋转后、预览方向、未镜像的归一化坐标，[0,1]）。 */
+data class FaceRoiHint(
+    val left: Float, val top: Float, val right: Float, val bottom: Float,
+    val score: Float = 1f,
+) { val isValid: Boolean /* 有限、right>left、bottom>top、score∈[0,1] */ }
+
+/** 旋转后源像素坐标里的裁切窗口（右/下边界不含）。 */
+data class RoiWindow(val x0: Int, val y0: Int, val width: Int, val height: Int)
 
 /** 相机线程上的一帧 YUV（Buffer 只在回调期间有效，pushFrame 必须在回调里同步调用）。 */
 class Yuv420Frame(
@@ -100,9 +114,12 @@ class Yuv420Frame(
 
 行为要求：
 
-1. **输入图**：按 `rotationDegrees` 旋转、`mirrorHorizontal` 镜像，输出长边 **256**（保持长宽比）
-   的 ARGB_8888 Bitmap 喂给 `PoseLandmarker`。返回的归一化坐标因此可以直接当作该 Bitmap 的
-   [0,1] 坐标，与相机画面一一对应。
+1. **输入图**：按 `rotationDegrees` 旋转、`mirrorHorizontal` 镜像，输出长边**上限 320**
+   （保持长宽比，只缩不放；ROI 本身小于 320 时不放大）
+   的 ARGB_8888 Bitmap 喂给 `PoseLandmarker`。`faceHint` 有效时只采样「脸框 → 上半身 ROI」
+   （`UpperBodyRoi.fromFace`：bodyW=faceW×4.5、bodyH=faceH×5.5，顶部留 0.35×脸高）；
+   faceHint 为空 / 非法 / 脸太小 / ROI <48px 时整帧 320p。返回的归一化坐标是 **ROI 局部**
+   坐标，必须先 `UpperBodyRoi.mapLocalToPreview` 回映到整帧预览坐标，再做 13 点提取。
 2. **镜像**：只镜像像素，不改 MediaPipe 的左右语义（左手仍是 `LEFT_WRIST`）。
 3. **推理**：`LIVE_STREAM` + `detectAsync`，时间戳单调递增（`System.nanoTime()/1_000_000`，
    重复时 +1）；同一时刻只允许一个在飞的 `detectAsync`，来帧过快就丢弃（计入 `dropped`）。
@@ -118,23 +135,33 @@ class Yuv420Frame(
 6. **平滑 / 基线**：逐点 One-Euro（位置）平滑；`resetBaseline()` 后从接下来 ~10 个有效帧
    取均值作为中性肩线，`TorsoAngles` 输出相对值（肩线 roll、绕竖轴 yaw，单位度）。
    `tracking = false` 的帧 `torso = ZERO`，`points` 用 `UpperBodyPoseFrame.empty()`。
-7. **线程**：`pushFrame` 任意线程可调；`onResult` 在 MediaPipe 回调线程；内部状态用锁保护。
+7. **线程**：`pushFrame` 应在相机线程 / tap 回调里调用（ByteBuffer 只在回调内有效；内部
+   立即完成 ROI 采样与 Bitmap 构造）；`onResult` 在 MediaPipe 回调线程；内部状态用锁保护。
+   ROI 帧没跟踪到上半身时，接下来 **1000ms** 一律整帧再试（避免 ROI/整帧逐帧交替），
+   ROI 帧成功会清掉残留窗口。
 8. **不许**在模块里引 `androidx.compose` / App 类 / MediapipeFaceLandmark（模块只依赖
    `:CommonData` + tasks-vision + androidx.core）。
 
 ### 3.3 帧抽头：`facecapture-sdk` 的 `PipelineFaceTracker`
 
 ```kotlin
-/** 相机 YUV 帧 tap（上层做上半身等附加推理用）。回调在**相机线程**，Buffer 只在回调内有效。 */
-var onYuvFrameForBody: ((YuvFrameData) -> Unit)? = null  // YuvFrameData = com.example.mediapipefacelandmark.YuvFrameData
+/** 旧 tap：只有帧，没有脸框。保留兼容；新接入方用下面的带提示版本。 */
+var onYuvFrameForBody: ((YuvFrameData) -> Unit)? = null
+
+/** 新 tap：帧 + 最近脸框（旋转后归一化、已一级扩充 1.15×；可能为 null）。优先于旧 tap。 */
+var onYuvFrameForBodyWithHint: ((YuvFrameData, MediaPipeFaceDetector.FaceBox?) -> Unit)? = null
+
 var bodyTapIntervalMs: Long = 66L   // 0 = 每帧都回调
 ```
 
 - 实现方式：在 `camera2Manager.setYuvFrameCallback { ... }` 里，喂完面捕的 channel 之后，
   按 `bodyTapIntervalMs` 抽帧调用 tap，**同步**执行（不允许抛异常影响面捕，要 try/catch）。
+- 两个 tap 都挂时**只调带提示的那个**；带提示为 null 时回退旧 tap。
+- 脸框在 tap 时刻从 `lastFaceBox` 快照；超过 **500ms** 没刷新（掉脸 / 检测节流 / 重检）就传
+  null，让上半身回退整帧。`lastFaceBox` 存的是检测框 **×1.15 一级扩充后**的脸 ROI。
 - 回调参数直接复用 `MediapipeFaceLandmark` 的 `YuvFrameData`（有 y/u/v ByteBuffer、stride、
   width/height、rotation、rotatedWidth/Height）——app 模块已经能看见这个类型。
-- `stop()` / `release()` / 切后台时清空 tap（`onYuvFrameForBody = null`）。
+- `stop()` / 切后台时清空两个 tap（`= null`）。
 
 ### 3.4 `TrackingOutputManager` / `TrackingServer`（协议组负责）
 
@@ -156,8 +183,8 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 
 | 文件 | 职责 |
 |---|---|
-| `UpperBodyPoseController.kt`（新） | 持有 `UpperBodyPoseDetector`、按开关 start/stop、把 `YuvFrameData` → `Yuv420Frame`、把 `UpperBodyPoseFrame` 分发给 UI / 网络 |
-| `MainActivity.kt` | 创建 controller；`faceTracker.onYuvFrameForBody = { upperBody.pushYuvFrame(it) }`；控制面板加「上半身: 开/关」；调试 HUD 加一行；把帧传给预览 |
+| `UpperBodyPoseController.kt`（新） | 持有 `UpperBodyPoseDetector`、按开关 start/stop、把 `YuvFrameData` → `Yuv420Frame`、`FaceBox` → `FaceRoiHint`、把 `UpperBodyPoseFrame` 分发给 UI / 网络 |
+| `MainActivity.kt` | 创建 controller；`faceTracker.onYuvFrameForBodyWithHint = { frame, box -> upperBody.pushYuvFrame(frame, box) }`；控制面板加「上半身: 开/关」；调试 HUD 加一行；把帧传给预览 |
 | `CameraPreviewView.kt` | `var drawUpperBody: Boolean`、`fun updateUpperBody(frame: UpperBodyPoseFrame?)`，按 `UpperBodySkeleton.BONES` 画骨架（点坐标已是镜像后的，**不要再翻转**） |
 
 ### 3.6 Windows 客户端（`windows-client/`）
@@ -223,8 +250,11 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 ## 5. 验收清单
 
 1. `./gradlew :app:assembleDebug` 通过（新增模块参与构建；未放模型时**只警告不失败**）。
-2. `./gradlew :app:testDebugUnitTest` 通过（协议新字段的序列化 / 解析用例）。
+2. `./gradlew :app:testDebugUnitTest :MediapipeUpperBody:testDebugUnitTest` 通过
+   （协议字段 + `UpperBodyRoiTest` 的 ROI/回映用例）。
 3. 真机（arm64）：开关打开后预览出现上半身骨架；HUD 显示 body fps / 质量 / 躯干角；
+   前置摄像头 + 0°/90°/270° 旋转下骨架与画面一致（ROI 回映正确）；
+   logcat 出现 `ROI 引导生效：WxH @(x,y)`；远端坐姿下关键点不比整帧版本抖；
    关掉后相机线程无额外开销（面捕 fps 不下降）。
 4. PC：mock 手机端（`npm run mock`）→ 形象手臂 / 身体跟着动；`npm run selftest` 通过；
    透明置顶窗口下帧率仍为 60 fps。

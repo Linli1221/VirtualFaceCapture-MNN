@@ -9,6 +9,7 @@
 #ifndef MEDIAPIPE_FACE_LANDMARKER_H
 #define MEDIAPIPE_FACE_LANDMARKER_H
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -169,6 +170,24 @@ private:
                                 float center_x, float center_y, float width, float height,
                                 float face_rotation, MNN::Tensor* dest);
 
+    // Build the destination-pixel -> source-pixel matrix used by the YUV
+    // preprocess path. Shared by the whole-frame and ROI-only paths so the two
+    // can never drift apart. \p srcWidth/\p srcHeight receive the (unrotated)
+    // source buffer dimensions implied by \p img_rotation.
+    MNN::CV::Matrix buildYuvTransform(int img_width, int img_height, int img_rotation,
+                                      float center_x, float center_y,
+                                      float width, float height, float face_rotation,
+                                      int& srcWidth, int& srcHeight) const;
+
+    // Run the cached ImageProcess with an explicit dst->src matrix. \p img_width
+    // and \p img_height are the dimensions of the YUV data actually passed to
+    // convert() (the whole frame or a packed face ROI).
+    void preprocessImageFromYuvWithMatrix(const uint8_t* yuvData,
+                                          MNN::CV::ImageFormat yuvFormat,
+                                          int img_width, int img_height,
+                                          const MNN::CV::Matrix& trans,
+                                          MNN::Tensor* dest);
+
     // Decode model outputs to landmarks
     void decodeLandmarks(const float* landmarks_tensor,
                          float center_x, float center_y,
@@ -195,6 +214,13 @@ private:
     int image_process_format_ = -1;
     // Repacked YUV buffer reused across frames (resize instead of re-allocate).
     std::vector<uint8_t> yuv_buffer_;
+    // Repacked face-ROI YUV buffer (only the landmark crop, typically 0.1-0.3 MB
+    // instead of the full 1.38 MB frame). Reused across frames.
+    std::vector<uint8_t> yuv_roi_buffer_;
+    // Per-instance first-use logging guards (atomic: detectFromYuv is called
+    // from several landmark worker threads, one per engine slot).
+    std::atomic<bool> yuv_roi_logged_{false};
+    std::atomic<bool> yuv_fallback_logged_{false};
     // Host output tensors reused across frames.
     std::unique_ptr<MNN::Tensor> landmarks_output_host_;
     std::unique_ptr<MNN::Tensor> flag_output_host_;

@@ -42,6 +42,7 @@ import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.CameraDeviceInfo
 import com.example.commondata.HeadPoseData
 import com.example.commondata.UpperBodyPoseFrame
+import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.MnnBackend
 import com.example.mediapipefacelandmark.YuvFrameData
 import com.example.virtualfacecapture.tracking.TrackingOutputManager
@@ -205,22 +206,36 @@ class MainActivity : ComponentActivity() {
     private var upperBodyEnabled = mutableStateOf(false)
 
     /**
-     * 相机线程上的上半身 YUV 抽头。
+     * 相机线程上的上半身 YUV 抽头（带脸框提示）。
      *
      * 做成一个字段而不是每次新建 lambda：挂上 / 摘掉时零分配。
-     * 关闭时 [PipelineFaceTracker.onYuvFrameForBody] 为 null，相机回调里只多一次判空。
+     * 关闭时 [PipelineFaceTracker.onYuvFrameForBodyWithHint] 为 null，
+     * 相机回调里只多一次判空。
+     *
+     * [faceBox] 是 SDK 一级扩充（1.15x）后的「脸 ROI」，可能为 null（无脸 /
+     * 提示过期）；上半身 ROI 没有提示时会自行回退到整帧。
      */
-    private val bodyFrameTap: (YuvFrameData) -> Unit = { frame ->
-        upperBody.pushYuvFrame(frame)
+    private val bodyFrameTap: (YuvFrameData, MediaPipeFaceDetector.FaceBox?) -> Unit = { frame, faceBox ->
+        upperBody.pushYuvFrame(frame, faceBox)
     }
 
     /**
      * 挂上 / 摘掉上半身帧抽头（相机线程侧）。
      *
-     * @param on true = 按 66ms（≈15fps）抽帧；false = tap 置 null，面捕热路径零额外开销。
+     * 只挂带提示的新回调，并把旧的 [PipelineFaceTracker.onYuvFrameForBody]
+     * 置 null：两者同时挂上时 SDK 只会调新的，这里显式清掉避免语义歧义。
+     *
+     * @param on true = 按 66ms（≈15fps）抽帧；false = 两个 tap 都置 null，
+     *           面捕热路径零额外开销。
      */
     private fun attachBodyTap(on: Boolean) {
-        faceTracker.onYuvFrameForBody = if (on) bodyFrameTap else null
+        if (on) {
+            faceTracker.onYuvFrameForBodyWithHint = bodyFrameTap
+            faceTracker.onYuvFrameForBody = null
+        } else {
+            faceTracker.onYuvFrameForBodyWithHint = null
+            faceTracker.onYuvFrameForBody = null
+        }
         faceTracker.bodyTapIntervalMs = UpperBodyPoseController.TAP_INTERVAL_MS
     }
 

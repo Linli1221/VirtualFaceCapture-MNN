@@ -5,13 +5,14 @@
 设计/协议契约见 [docs/upper-body.md](../docs/upper-body.md)（§2 / §3.1 / §3.2 / §6）。
 
 ```
-Camera2 YUV_420_888（app 侧 15fps 抽帧）
-   │  pushFrame(Yuv420Frame)
+Camera2 YUV_420_888（app 侧 15fps 抽帧）+ 同一帧脸框
+   │  pushFrame(Yuv420Frame, faceHint)
    ▼
 UpperBodyPoseDetector
-   │  ① 同步采样：旋转 + 镜像 + 缩放到长边 256 → ARGB_8888 Bitmap（约 1~4ms）
-   │  ② PoseLandmarker.detectAsync(mpImage, ts)   ← 单飞，忙时丢帧
-   │  ③ MediaPipe 回调线程：33 点 → 13 点 → One-Euro → 相对基线躯干角
+   │  ① 脸框 → 上半身 ROI（4.5×/5.5× 脸宽高）；无脸框/太小 → 整帧
+   │  ② 只采样 ROI：旋转 + 镜像 + 缩放到长边上限 320（只缩不放）→ ARGB Bitmap（约 1~4ms）
+   │  ③ PoseLandmarker.detectAsync(mpImage, ts)   ← 单飞，忙时丢帧
+   │  ④ MediaPipe 回调线程：33 点回映整帧 → 13 点 → One-Euro → 相对基线躯干角
    ▼
 onResult(UpperBodyPoseFrame)
 ```
@@ -159,7 +160,7 @@ class UpperBodyPoseDetector(context: Context) {
     fun start()
     fun stop()
     fun release()
-    fun pushFrame(frame: Yuv420Frame)
+    fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null)
     fun resetBaseline()
     fun setMinConfidences(detection: Float, presence: Float, tracking: Float)
     fun setTargetFps(fps: Int)
@@ -187,8 +188,11 @@ class UpperBodyPoseDetector(context: Context) {
 ### 4.1 输入图（旋转 / 镜像 / 缩放）
 
 - 先按 `rotationDegrees` **顺时针**旋转，再按 `mirrorHorizontal` 在旋转后的画面上水平镜像；
-- 长边缩到 **256**（保持宽高比，不放大），输出 `ARGB_8888`；
-- 最近邻采样，**不做整帧拷贝**；1080p 竖屏一帧约采样 192×256，约 5 万像素；
+- `faceHint` 有效时只采样「脸框 → 上半身 ROI」（`UpperBodyRoi.fromFace`：bodyW=faceW×4.5、
+  bodyH=faceH×5.5，顶部留 0.35×脸高）；否则整帧；
+- 长边缩到 **320**（保持宽高比，不放大），输出 `ARGB_8888`；
+- 最近邻采样，**不做整帧拷贝**；整帧 1080p 竖屏约采样 180×320 ≈ 5.8 万像素，ROI 典型
+  10 万像素上下；
 - **镜像只处理像素**：返回的 `LEFT_WRIST` 仍然是 MediaPipe 语义的「左手」，不交换左右。
 
 返回的归一化坐标直接就是这张 Bitmap 的 [0,1] 坐标，所以与手机预览方向一致
@@ -244,7 +248,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 ### 4.7 线程
 
-- `pushFrame` 任意线程（实际是相机线程）；内部转换同步完成；
+- `pushFrame` 在相机线程 / tap 回调里调用；内部同步完成 ROI 采样 + Bitmap 构造；
 - `onResult` / `onError` 在 MediaPipe 回调线程；
 - 生命周期 / 配置方法主线程调用即可；内部状态由锁 + volatile 保护；
 - `release()` 幂等，未 `initialize` 过也能调；`release()` 后可再次 `initialize()`。
@@ -255,8 +259,9 @@ class UpperBodyPoseDetector(context: Context) {
 
 | 契约 | 本模块实现 |
 |---|---|
-| §2 ① 采样 + 旋转 + 缩放 → ARGB Bitmap（256 长边） | `YuvBitmapConverter` + `YuvGeometry` |
-| §2 ② `UpperBodyPoseDetector#pushFrame` | `UpperBodyPoseDetector.pushFrame` |
+| §2 ① 脸框 → 上半身 ROI | `UpperBodyRoi` |
+| §2 ② 只采样 ROI + 旋转 + 缩放 → ARGB Bitmap（320 长边） | `YuvBitmapConverter` + `YuvGeometry` |
+| §2 ③ `UpperBodyPoseDetector#pushFrame` | `UpperBodyPoseDetector.pushFrame` |
 | §2 ③ 13 点 → One-Euro → 相对基线 | `UpperBodyGeometry` / `UpperBodySmoother` / `TorsoBaseline` |
 | §3.1 `UpperBodyPoseFrame` / `BodyPoint` / `TorsoAngles` | 直接使用 :CommonData（`api project(':CommonData')`） |
 | §3.2 公开 API | 见 §3；`setBackend` 为契约外补充 |
@@ -277,7 +282,8 @@ class UpperBodyPoseDetector(context: Context) {
 | `UpperBodyGeometryTest` | 33→13 提取 / 协议顺序 / tracking 门限 / quality / 肩与肘退化 / roll 符号与数值 / yaw 符号与数值 / NaN 兜底 |
 | `UpperBodySmootherTest` | One-Euro 收敛 / 不越界 / NaN 安全 / reset；点位与躯干平滑 |
 | `TorsoBaselineTest` | 10 帧校准 / 相对角 / reset / 非法值不污染 |
-| `Yuv420FrameTest` | 旋转归一化 / 旋转尺寸 / 长边 256 缩放 / 不放大 / 源坐标映射 / stride 校验 |
+| `UpperBodyRoiTest` | 脸框 → ROI 扩展/clamp/回退、镜像回映、z 缩放、320 长边 |
+| `Yuv420FrameTest` | 旋转归一化 / 旋转尺寸 / 长边 256 缩放（帧对象默认值）/ 不放大 / 源坐标映射 / stride 校验 |
 
 这些测试只依赖 JUnit + JVM 类（`java.nio`）和 :CommonData 里的纯数据类，
 不需要 Android 设备。构建机上运行：
@@ -290,7 +296,7 @@ class UpperBodyPoseDetector(context: Context) {
 
 ## 7. 性能与已知限制
 
-- **默认参数**：长边 256、15fps、lite 模型；1080p 相机上转换约 1~4ms/帧。
+- **默认参数**：长边上限 320（ROI 引导，只缩不放）、15fps、lite 模型；1080p 相机上转换约 1~4ms/帧。
   实际推理耗时用 `getStats().avgLatencyMs` 观察；中端机 GPU 通常 6~15ms。
 - 未放模型时功能自动降级（`isModelAvailable()=false`），不影响面捕主链路。
 - assets 模型默认按 asset 相对路径加载（`noCompress` 已配置）；只有该路径在当前

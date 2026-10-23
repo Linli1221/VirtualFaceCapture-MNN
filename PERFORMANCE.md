@@ -41,7 +41,7 @@ Camera2 YUV ──► 人脸检测(MNN) ──► Landmark(MNN) ──► 后处
 | 5 | **每帧 3~4 次写 Compose state** | `MainActivity` 回调 | DebugOverlay 整棵子树每秒重组数十次（含 Live2D 的 `AndroidView`） |
 | 6 | **每帧 `Bitmap.copy()` 全尺寸 ARGB_8888** | `CameraPreviewView.updateCameraFrame` | 480×480 ≈ **900 KB/帧**、30fps ≈ 27 MB/s 的额外分配与拷贝 |
 | 7 | **每帧创建 ~650 个临时对象** | `OpenSeeFaceProcess` 后处理 | GC 压力大，帧时间出现尖峰 |
-| 8 | 原生每帧重复 `ImageProcess::create`、host tensor 分配 + **442 KB memcpy** | MNN 预处理 | 每帧固定浪费 |
+| 8 | 原生每帧重复 `ImageProcess::create`、host tensor 分配 + **768 KB memcpy** | MNN 预处理 | 每帧固定浪费 |
 | 9 | 校准窗口持有 N 帧 × 478 点（60fps ≈ 230 KB+） | `FaceCapturePipeline` | 启动首秒 GC 尖峰，校准结束那一帧卡 1~2 ms |
 | 10 | 眨眼曲线帧率写死 `60f` | `PipelineFaceTracker` | 实际帧率不足时眨眼时长被拉伸 |
 | 11 | **AE 区间被当成目标帧率**：`(30,60)` 只是一个「允许范围」，没设 `SENSOR_FRAME_DURATION` 时 AE 会从区间下端跑 | `Camera2Manager.applyCaptureRequestTuning` | **传感器稳定跑 30fps**，整条管线在等相机喂帧 —— CPU/GPU 双闲却只有 30 帧（详见第 7 节） |
@@ -62,7 +62,7 @@ Camera2 YUV ──► 人脸检测(MNN) ──► Landmark(MNN) ──► 后处
 |---|---|
 | 预览 RGB 帧默认关闭 + `@Volatile` | `enablePreviewInYuvMode` 默认 `false`，由上层按需开关（见 2.2） |
 | `willProducePreviewFrames` | 「开关打开 && 有订阅者」才真的转 RGB |
-| 新增 `MAX_PIXEL_COUNT` 整帧像素上限 | 人脸检测只吃 128/192 输入、landmark 只吃 192 的 ROI，整帧再大纯属浪费，大尺寸 YUV 也常常拿不到 60fps（初版 640×480；后续采集目标改为 720p，见 §8） |
+| 新增 `MAX_PIXEL_COUNT` 整帧像素上限 | 人脸检测只吃 128/192 输入、landmark 只吃 256 的 ROI，整帧再大纯属浪费，大尺寸 YUV 也常常拿不到 60fps（初版 640×480；后续采集目标改为 720p，见 §8） |
 | `chooseTargetFpsRange()` | 优先 `(60,60)` → 天花板≥60 且地板≤30（典型 `(30,60)`）→ 地板≤30 里最高 → 最高天花板 |
 | `ImageReader` 2 → 3 个 buffer | 处理端偶发慢一拍时相机可以继续出帧（配合 `acquireLatestImage` 不积压延迟） |
 | `windowManager` 缓存 | `getRotationDegrees()` 在相机线程**每帧**跑，之前每帧一次 `getSystemService` |
@@ -98,7 +98,7 @@ fun getMnnBackend(): MnnBackend
 | **运行时切换推理后端** | 三个 `loadModel()` 增加 `bool use_vulkan = true`；`nativeSetBackend` / `nativeGetBackend` 用 `nativeInit` 缓存的模型路径原地重建 session |
 | Vulkan 建不起来自动回落 CPU | `nativeInit` 里失败就重试 CPU 并 `g_use_vulkan=false`，Kotlin 侧 `nativeGetBackend()` 读到的是**真实**后端 |
 | 去掉每帧 `ImageProcess::create` | 按源格式缓存，只在格式变化时重建 |
-| 去掉每帧 host tensor 分配 + memcpy | landmark 预处理直接写复用 tensor，省掉**每帧 ~442 KB memcpy**；检测器省 ~60 KB/帧；blendshape 省 292 float 中间 vector |
+| 去掉每帧 host tensor 分配 + memcpy | landmark 预处理直接写复用 tensor，省掉**每帧 ~768 KB memcpy**；检测器省 ~192 KB/帧；blendshape 省 292 float 中间 vector |
 | YUV 打包缓冲成员复用 | `resize` 而不是重新 `malloc`（整帧拷贝本身无法避免：MNN 的 YUV 输入要求 Y+UV 连续） |
 | landmarks 返回数组 `thread_local` 复用 | 首帧之后零分配 |
 
@@ -155,7 +155,7 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(JN
 | Compose 合批 | DebugOverlay 重组 30~60 Hz → ≤10 Hz（关调试面板时 0） |
 | Bitmap 双缓冲 | 少 900 KB/帧 的分配与拷贝 |
 | 后处理 | -140 对象/帧、校准峰值 230 KB → 11.5 KB |
-| 原生 | 每帧少一次 442 KB memcpy + 多次堆分配 |
+| 原生 | 每帧少一次 768 KB memcpy + 多次堆分配 |
 
 **这些改动消除的是「浪费」，不改变推理本身的算力需求。** 能否真的稳住 60 帧，
 取决于你机型上 landmark 推理的单帧耗时（日志里 `Landmark Detection` 那一行）：
@@ -427,14 +427,14 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 |---|---|
 | `facecapture-sdk/.../PipelineFaceTracker.kt` | 相机 YUV 回调里新增 `onYuvFrameForBody` tap：先喂完面捕两条 channel，再按 `bodyTapIntervalMs`（默认 66 ms ≈ 15 fps）同步调用；整段 `try/catch`，异常绝不影响面捕；`stop()` 置 null |
 | `app/.../UpperBodyPoseController.kt` | 相机线程上把 `YuvFrameData`（duplicate ByteBuffer，不拷贝像素）包成 `Yuv420Frame` 交给检测器；`upperBody = false` 时 tap 为 null，回调里只多一次判空 |
-| `:MediapipeUpperBody` | 采样 + 旋转 + 镜像缩放到长边 256 的 ARGB（约 5 万像素，1~4 ms），`PoseLandmarker` LIVE_STREAM 异步推理，单飞（上一帧没回来就丢帧，计入 dropped）；GPU 优先，创建失败自动回退 CPU |
+| `:MediapipeUpperBody` | 采样 + 旋转 + 镜像缩放到长边 256 的 ARGB（约 5 万像素，1~4 ms），`PoseLandmarker` LIVE_STREAM 异步推理，单飞（上一帧没回来就丢帧，计入 dropped）；GPU 优先，创建失败自动回退 CPU。**（本轮已改为脸框 ROI → 320p，见 §12）** |
 | 协议 | 开启后每帧 `track` 多 `ubOk`/`ub(52)`/`ubT`/`body`，约 +0.6 KB/帧（60 fps ≈ +36 KB/s） |
 
 ### 代价
 
 - 相机线程：每 66 ms 多 1~4 ms 的 YUV→Bitmap 转换（约 6% 预算）；面捕 channel 仍然先喂。
 - 推理：15 fps Pose 推理与面捕的 face landmarker 并行；GPU 满载时才回退 CPU（帧率会掉到 5~10）。
-- 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 256 长边 Bitmap（约 200 KB，交给 GC）。
+- 内存：模型 5.5 MB（lite）/ 9 MB（full），每帧一张 Bitmap（本轮起长边上限 320，约 300–400 KB，交给 GC）。
 - 关掉时：tap 为 null，没有 Bitmap、没有额外推理，面捕路径与之前完全一致。
 
 ### 验证日志
@@ -446,3 +446,164 @@ Camera2 的 `CONTROL_AE_TARGET_FPS_RANGE` 是一个**允许区间**，不是目�
 
 > 本节数字是设计预算（75% 相机线程 60 fps 下），**未在本仓库环境真机量化**；
 > 无 JDK / Android SDK 的环境只能做静态审查 + PC 侧 Node 单测。
+
+---
+
+## 11. 采集侧：30 fps「相机瓶颈」的定位与自适应降档（2026-10）
+
+### 11.1 现象
+
+实测整条管线只有 ~30 fps，`Camera delivered` 也停在 30 附近 —— 也就是
+**相机没在喂 60 帧**，推理再快也没用。这一轮不改推理，专治采集侧。
+
+### 11.2 三个根因
+
+| # | 根因 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **720p 只有 30fps，但策略仍然保留 720p**：旧逻辑只打警告，不回退到能跑 60fps 的尺寸 | `Camera2Manager.chooseCaptureSize()` | 整条管线被相机按在 30fps |
+| 2 | **预览 RGB 每帧在相机线程上整帧转换**：720p 一帧 YUV→RGB 2.7MB，再 `ByteBuffer.get()` 拷 2.7MB、92 万次逐像素打包、`Bitmap.setPixels` 3.7MB；回调一旦超过 16.7ms，`acquireLatestImage()` 就开始丢帧，`cameraDeliveredFps` 直接掉到 ~30 | `Camera2Manager.onImageAvailableListener` → `CameraPreviewView.updateCameraFrame` | 相机线程自己把交付帧率压到 30 |
+| 3 | **HAL 声称 60fps、实际被 AE/带宽按在 30fps**（部分机型 720p 就是如此） | 平台行为，无 API 可查 | 同上；只能实测后降档 |
+
+> 说明：`Camera delivered` 是相机线程**真正拿到**的帧数（在推理之前统计）。
+> 它掉到 30，说明瓶颈在「相机 → 相机线程」这一段；如果它是 60 而
+> `Actual output FPS` 只有 40，才是推理/后处理的问题。
+
+### 11.3 改动
+
+| 位置 | 内容 |
+|---|---|
+| `Camera2Manager.chooseCaptureSize()` | **帧率优先**：720p 只有在 `getOutputMinFrameDuration` 证明能跑满 60fps 时才选；否则在 ≤720p 里挑「能跑满 60fps 的最大尺寸」（通常是 640×480）。平台没上报能力时仍按可用处理，交给下面的探针实测兜底 |
+| `Camera2Manager` 帧率探针 | 采集启动 **2.5s** 后读真实交付帧率；仍 < `MIN_CAPTURE_FPS = 50` 则 0.8s 后复测。**先判因**：`SENSOR_FRAME_DURATION` ≈ 33ms（或 AE 区间上限 < 60）→ 传感器/AE 就是 30fps，**不降档**（换了也没用）；只有传感器确实是 16.7ms、交付仍偏低时才降一档（像素至少小 25%）重开相机，最多 2 次 |
+| 采集尺寸记忆 | 探明「能跑满 60fps」的尺寸后按相机 key 记进 `resolvedCaptureSizes`：stop/start、切走再切回同一镜头时直接用，不再花 3.3s 重新探测 |
+| `Camera2Manager.recordCallbackTime()` | 新增**相机回调耗时**统计（120 帧窗口）。交付帧率 = min(传感器帧率, 1000/回调耗时)，这是区分「传感器只有 30fps」和「我们回调太慢」的唯一直接数据，并透出 `cameraCallbackAvgMs` 给 `PipelineFaceTracker` |
+| `Camera2Manager.maybeConvertPreviewFrame()` | 预览 RGB **限速到 30fps**（`PREVIEW_INTERVAL_NS = 33ms`）。预览只用于取景/调试，减半后相机线程负载明显下降 |
+| `mnn_yuv_converter.cpp` | 预览转换的**整帧 YUV 打包缓冲**与 `MNN::CV::ImageProcess` 按 (源尺寸/目标尺寸/旋转/格式) 缓存复用：不再每帧 `new/delete` 1.38MB（720p），也不再每帧重建 ImageProcess。缓存是 `thread_local`，只在相机线程调用 |
+| 生命周期 | `startCamera/stopCamera` 用 `captureLifecycleLock` 串行化；探针跑在独立单线程（不能在相机 HandlerThread 上 `stopCamera()`，那会 join 自己）；`cameraSessionActive` + `fpsProbeGeneration` 保证 stop 之后旧探针不会把相机重新拉起来；**stop 时先 quitSafely + join 相机线程，再关 session/ImageReader**（反过来会让在途回调操作已关闭的 reader，异常打死相机线程 ⇒ 永久断流）；回调整体包 try/catch，单帧失败只丢帧 |
+| 相机线程优先级 | `CameraBackground` 从默认优先级提到 `THREAD_PRIORITY_DISPLAY`(-4)：它的 16.7ms 是硬预算，而 `fc-*` 推理线程本来就跑在 NORM+2，默认优先级会在 CPU 忙时把相机回调压后 |
+| `PipelineFaceTracker.logPerfStats()` | 改为「锁内快照 + 重置（微秒级），锁外格式化 + 输出」。之前 13 条 `Log.i` 全程持 `perfLock`，2 路关键词 worker 的每帧计数被顶住 1~20ms，正好制造重排缺口 |
+| `TrackingServer` | writer 空闲时不再靠 `controlQueue.poll(20ms)`：`offerTrack/offerControl/sendPing/requestClose` 都会 `release()` 一个 Semaphore 立刻唤醒 writer（20ms 仅兜底）。修掉「发送帧率被钉在 ~50fps + 0~20ms 额外延迟」 |
+
+### 11.4 预期收益
+
+- 原 720p@30 机型：降到能跑 60 的尺寸后，`Camera delivered` 应该从 30 → 58~60，
+  整条管线有机会到 60fps（代价是关键点 ROI 的源分辨率下降）。
+- 720p 本来就能跑 60 的机型：仍然用 720p；预览限速把相机线程上最重的一段减半，
+  帧时间抖动更小。
+- 原生预览缓存：每帧省一次 1.38MB 的堆分配/释放 + 一次 ImageProcess 构建。
+- WS 写线程唤醒：发送侧从 ~50fps 上限恢复到跟得上的 60fps，并去掉 0~20ms 抖动。
+- perf 日志：不再每 60 帧卡关键词 worker 一次。
+
+### 11.5 日志判读
+
+新增日志（`adb logcat -s Camera2Manager PipelineFaceTracker`）：
+
+```
+✓ Selected 720p capture: 1280x720 (max 60.0 fps)
+✓ Selected capture size: 640x480 (target 60fps)
+⚠ 720p (1280x720) is advertised but this camera caps it at 30.0 fps (< 60); picking a 60fps-capable size instead (frame rate first)
+Camera callback: avg 8.40 ms, max 21.30 ms over 120 frames (60fps budget = 16.67 ms)
+Camera FPS self-check: 59.8 FPS ✓ (target 60)
+⚠ Camera delivers only 30.0 FPS at 1280x720 (callback avg 18.20 ms, downshift 1/2) — switching to a smaller capture size
+Adaptive capture downshift #1: 1280x720 → 640x480
+⚠ SENSOR_FRAME_DURATION is 33.33 ms (30.0 fps) — the sensor/AE itself is not delivering 60 fps; a smaller capture size cannot help
+⚠ Camera AE ranges top out at 30fps — this lens cannot deliver 60 fps at any size; the pipeline will follow the camera
+```
+
+- 先看 `Selected capture size`：如果选了 1280x720 却仍然 30fps，探针会在 ~3.3s 后判因/降档；
+- `Camera FPS self-check` 是权威结论：`59.x ✓` = 采集侧没问题，接下来才该看推理；
+- `Camera callback: avg … max …` 是**判因**的关键一行：avg ≤ 16.7ms 说明我们的处理没拖后腿，
+  交付帧率低只能是传感器/AE；avg 明显 > 16.7ms 才是我们自己在相机线程上太慢；
+- `Camera delivered: … (applied frameDuration=…, callback avg=…)` 同一行给出最终判定，
+  后面还会跟一行 ⚠ 结论（传感器限制 / 回调拖慢 / 推理瓶颈）；
+- 如果出现 `SENSOR_FRAME_DURATION is 33.33 ms` 或 `AE ranges top out at 30fps`，说明这台
+  相机/镜头硬件就是 30fps，**任何软件优化都到不了 60**（换镜头 / 换尺寸都无用）。
+
+### 11.6 判因模型
+
+`ImageReader` 的 listener 在单线程 Handler 上串行，`acquireLatestImage()` 又只留最新帧，所以：
+
+```
+delivered_fps ≈ min(传感器实际帧率, 1000 / 单次回调耗时)
+回调 16.7ms → 60fps      回调 33ms → 30fps      回调 50ms → 20fps
+```
+
+| 现象 | 结论 | 该做什么 |
+|---|---|---|
+| `SENSOR_FRAME_DURATION` ≈ 33.3ms | 传感器/AE 就是 30fps | 降尺寸没用；换镜头或接受 30fps |
+| `SENSOR_FRAME_DURATION` ≈ 16.7ms，`callback avg` > 16.7ms | 我们在拖慢交付 | 砍相机线程的活（预览限速/移出线程） |
+| 两者都正常但 `delivered` < 55 | HAL 带宽/热限 | 自适应降档会自己处理 |
+
+### 11.7 内存代价（12GB 总内存 / 4GB 可用）
+
+- 原生预览缓存：1.38MB（720p YUV 缓冲，thread_local，随相机线程存活）；
+- 预览限速只减少分配，不新增缓冲；
+- 降档探针：一个线程 + 几 KB 状态；`resolvedCaptureSizes` 每个相机一个 `Size`。
+- 合计 **< 2MB**，与「4GB 可用」相比可以忽略；换句话说，这轮不是内存换帧率，
+  而是把相机线程上白做的活砍掉。
+
+### 11.8 已知未修（按风险排序，需真机验证后再动）
+
+1. **YUV plane 生命周期（正确性）**：`onImageAvailable` 返回即 `image.close()`，但帧已经
+   入队；`ImageReader` 只有 3 块 buffer，60fps 下 16.7~50ms 就被复用。检测通道排队的帧
+   可能已被覆盖，关键点通道偶发撕裂。修法：帧池（6×1.38MB）+ 显式 memcpy（+0.3ms/帧）。
+   收益是正确性不是帧率，且改动跨 `Camera2Manager` / `PipelineFaceTracker`，本轮未做。
+2. **重排缺口 60ms**：永久丢一帧会让输出定格 ~67ms 再突发放行。直接改小超时会在 30fps
+   采集（帧间隔 33ms）下误判缺口，必须改成「知道某帧已失败就 `markSkipped`」的方案。
+3. **上半身抽帧仍在相机线程上**：开启上半身时，`onYuvFrameForBodyWithHint` 每 66ms 在
+   相机线程同步做一次「ROI 采样 → Bitmap」（约 1~4ms，本轮已从整帧 256 改为 ROI 320）。
+   它不改变 30fps 的结论（duty 很低），但会加大 `callback max`；要彻底解耦需给
+   `UpperBodyPoseDetector` 加「最新帧 + 独立线程」语义。
+4. **预览移出相机线程 / 降预览分辨率**：720p 预览在相机线程上峰值 5.5~13.5ms；
+   限速到 30fps 已把均摊减半，峰值仍需「独立预览线程」或
+   「MNN 输出 BGRA + `Bitmap.copyPixelsFromBuffer()`」。
+5. **双 ImageReader / GPU 预览**：相机同时输出到推理 ImageReader 与 SurfaceView，
+   预览零 CPU 转换（改动最大，收益也最大）。
+
+> 更细的证据、时序与补丁草案见 `docs/perf/audit-kotlin.md`（Kotlin 链路）与
+> `docs/perf/audit-native.md`（原生 MNN 热路径）。
+
+---
+
+## 12. 第二轮：按 ROI 分支重排（2026-10）
+
+这轮不改模型、不改协议，按「相机 720p 一次分发 → 128p 检测 / 720p 脸 ROI / 320p 上半身 ROI」
+重排三条分支。设计、数学推导与静态验证记录在
+[`docs/perf/round2-roi.md`](docs/perf/round2-roi.md)，这里只列改动与预期。
+
+### 12.1 改动
+
+| 层 | 改动 |
+|---|---|
+| 原生 landmark | 每帧不再整帧打包 1.38MB：用 `trans.mapXY` 把 256×256 输入的 4 角映射回 720p，取 bbox + 8px margin + 偶数对齐，只打包脸 ROI（典型 0.15–0.4MB）；ROI >85% 或边长 <64px 时退回整帧 |
+| 原生检测/landmark | 新增 `tryFastYuvView`：连续 NV12/NV21 + 无 padding 时直接引用相机缓冲（零拷贝）；任何布局不匹配自动 repack |
+| SDK | 检测框存入前做 **一级扩充 ×1.15**；新增 `onYuvFrameForBodyWithHint`，把最近脸框（TTL 500ms）传给上半身；旧 tap 保留 |
+| 上半身 | `UpperBodyRoi.fromFace`：脸宽×4.5、脸高×5.5，顶部留 0.35×脸高；只采样 ROI 到 **320p**（原整帧 256）；33 点先回映整帧再 extract；ROI miss → 1s 整帧回退 |
+| 文档 | `docs/pipeline.md` / `docs/upper-body.md` 同步新数据流；新增 `docs/perf/round2-roi.md` |
+
+### 12.2 预期收益（静态估算，未实测）
+
+- 原生 landmark 每帧少拷 1.0–1.2MB（≈ -0.15~0.30ms），检测命中零拷贝时每 100ms 少一次
+  1.38MB 重排；p95 更容易压回 16.7ms。
+- 上半身输入从「整帧 256」变成「ROI 320」：人的有效像素多 4–5 倍，远距离/坐姿关键点
+  应更稳；代价是每 66ms 多约 0.5ms 转换（15fps 下 duty 仍很低）。
+- 一级 + 二级扩充合计约 1.725×，大角度/快速转头时 landmark 顶点被裁的概率下降。
+
+### 12.3 验证状态
+
+**本机没有 JDK / Android SDK / 真机，未编译、未跑单测、未实测。** 已做的只有：
+原生 ROI 矩阵/打包的独立 Python/Node 复算（3,456 组，覆盖率 0 越界）、上半身回映公式
+复算、`UpperBodyRoiTest` 14 个用例静态核对。必须由 CI / 真机完成：
+
+1. `:app:assembleDebug`、`:MediapipeUpperBody:testDebugUnitTest`；
+2. 固定图「ROI 开/关」逐像素 diff；
+3. 前置镜像 + 0°/90°/270° 下上半身骨架与画面一致；
+4. logcat 看 `YUV ROI path: first hit` 的 ROI 占比、`ROI 引导生效` 的尺寸；
+5. 上半身 ROI vs 整帧的 A/B（远端坐姿抖动）。
+
+### 12.4 已知风险
+
+- 原生 ROI 的 bbox/平移方向写反会采样错位；数学已复算，仍需真机固定图 diff。
+- 上半身 ROI 依赖脸框坐标系（旋转后、未镜像）；脸框给错时靠 1s 整帧回退兜底。
+- 上半身转换仍在相机线程同步执行；ROI 限制了采样量，但峰值仍会进 `callback max`。
+- 本轮的 128p 检测分支**没有**新增 YUV→128p 预下采样：检测输入本来就是 128×128，
+  MNN 只按输出像素采样，先下采样反而多读整帧（见 round2 文档 §4）。

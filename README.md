@@ -151,6 +151,7 @@ yuvLandmarkFrame ─────┤                              ├──► �
 | `app/` | **Android 采集端**：相机、面捕管线、调试 HUD、追踪数据 WebSocket 服务 |
 | `windows-client/` | **Windows 渲染端**：Electron + Cubism Web，连手机 WS 渲染 Live2D |
 | `docs/tracking-protocol.md` | **两端之间唯一的契约**：VFC Tracking Protocol v1 |
+| `docs/pipeline.md` | **动捕流水线架构**：一帧数据从相机到 Live2D 的完整路径（含延迟账与已知取舍） |
 | `docs/upper-body.md` | 上半身关键点采集的设计与接口契约（模块 API / 数据流 / 验收） |
 | `:MediapipeFaceLandmark` | **核心推理模块**：MNN + `.mnn` 模型 + 原生 C++ 流水线 + NEON 优化 |
 | `:OpenSeeFaceProcess` | 仿 OpenSeeFace 的后处理：平滑、头姿、BlendShape 解算 |
@@ -315,6 +316,8 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
 
 - **默认关**：不打开时相机线程零额外开销，也不加载 MediaPipe Tasks 运行时；
   打开后按 66 ms（≈15 fps）抽帧推理，GPU 优先、失败自动回退 CPU。
+- **脸框引导 ROI**：用面捕最近的人脸框推出上半身区域，只把这块裁到 320p 再推理
+  （没有可信脸框 / ROI 太小时回退整帧）；结果点回映整帧坐标，协议 `ub[]` 语义不变。
 - **线上一帧只多约 0.6 KB**：`track` 里追加 `ubOk` / `ub`（13×4）/ `ubT` / `body`
   （[`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)），60 fps 下约 36 KB/s。
 - **PC 自动消费**：躯干驱动 `ParamBodyAngleX/Y/Z`、手臂驱动 `ParamArmLA/RA`；
@@ -599,6 +602,7 @@ VirtualFaceCapture-MNN/
 ├── facecapture-sdk/             # 对外发布的 AAR 门面
 ├── MediapipeUpperBody/          # 可选：上半身关键点（MediaPipe Tasks PoseLandmarker）
 ├── docs/tracking-protocol.md    # 两端通信协议（唯一契约）
+├── docs/pipeline.md             # 动捕流水线架构（相机 → 推理 → 协议 → 渲染）
 ├── docs/upper-body.md           # 上半身采集的设计与接口契约
 ├── tools/verify/                # 端到端验证脚本
 ├── Live2D/                      # 旧版手机端渲染（已停止构建，仅参考）

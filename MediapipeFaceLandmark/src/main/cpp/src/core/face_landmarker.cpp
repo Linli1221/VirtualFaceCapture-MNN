@@ -286,23 +286,23 @@ void FaceLandmarker::preprocessImage(const uint8_t* img_data, int img_width, int
     image_process_->convert(img_data, img_width, img_height, img_width * 3, dest);
 }
 
-void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::ImageFormat yuvFormat,
-                                             int img_width, int img_height, int img_rotation,
-                                             float center_x, float center_y, float width, float height,
-                                             float face_rotation, MNN::Tensor* dest) {
-    if (dest == nullptr) {
-        last_error_ = "Invalid preprocess destination tensor";
-        return;
-    }
-    
-    int srcWidth = (img_rotation == 90 || img_rotation == 270) ? img_height : img_width;
-    int srcHeight = (img_rotation == 90 || img_rotation == 270) ? img_width : img_height;
+MNN::CV::Matrix FaceLandmarker::buildYuvTransform(int img_width, int img_height,
+                                                  int img_rotation,
+                                                  float center_x, float center_y,
+                                                  float width, float height,
+                                                  float face_rotation,
+                                                  int& srcWidth, int& srcHeight) const {
+    srcWidth = (img_rotation == 90 || img_rotation == 270) ? img_height : img_width;
+    srcHeight = (img_rotation == 90 || img_rotation == 270) ? img_width : img_height;
     
     float cx_rotated = center_x * static_cast<float>(img_width);
     float cy_rotated = center_y * static_cast<float>(img_height);
     float w_rotated = width * static_cast<float>(img_width);
     float h_rotated = height * static_cast<float>(img_height);
     
+    // MNN::CV::Matrix follows the dst -> src convention: every postX() call is
+    // applied *after* the previous one, so the matrix maps destination pixels
+    // (the model input crop) back to source pixels.
     MNN::CV::Matrix trans;
     trans.setIdentity();
     
@@ -324,6 +324,19 @@ void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::Ima
         trans.postTranslate(cx_src, cy_src);
     }
     
+    return trans;
+}
+
+void FaceLandmarker::preprocessImageFromYuvWithMatrix(const uint8_t* yuvData,
+                                                      MNN::CV::ImageFormat yuvFormat,
+                                                      int img_width, int img_height,
+                                                      const MNN::CV::Matrix& trans,
+                                                      MNN::Tensor* dest) {
+    if (dest == nullptr) {
+        last_error_ = "Invalid preprocess destination tensor";
+        return;
+    }
+
     MNN::CV::ImageProcess::Config config;
     config.sourceFormat = yuvFormat;
     config.destFormat = MNN::CV::RGB;
@@ -349,7 +362,27 @@ void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::Ima
     image_process_->setMatrix(trans);
     
     // Convert straight into the reusable host tensor (no temp tensor + memcpy).
-    image_process_->convert(yuvData, srcWidth, srcHeight, 0, dest);
+    // img_width/img_height describe the buffer that was actually packed (the
+    // whole frame or just the face ROI); the matrix handles the rest.
+    image_process_->convert(yuvData, img_width, img_height, 0, dest);
+}
+
+void FaceLandmarker::preprocessImageFromYuv(const uint8_t* yuvData, MNN::CV::ImageFormat yuvFormat,
+                                             int img_width, int img_height, int img_rotation,
+                                             float center_x, float center_y, float width, float height,
+                                             float face_rotation, MNN::Tensor* dest) {
+    if (dest == nullptr) {
+        last_error_ = "Invalid preprocess destination tensor";
+        return;
+    }
+
+    int srcWidth = 0;
+    int srcHeight = 0;
+    MNN::CV::Matrix trans = buildYuvTransform(img_width, img_height, img_rotation,
+                                              center_x, center_y, width, height, face_rotation,
+                                              srcWidth, srcHeight);
+
+    preprocessImageFromYuvWithMatrix(yuvData, yuvFormat, srcWidth, srcHeight, trans, dest);
 }
 
 void FaceLandmarker::decodeLandmarks(const float* landmarks_tensor,
@@ -482,24 +515,130 @@ FaceLandmarksResult FaceLandmarker::detectFromYuv(
         return result;
     }
     
-    int srcWidth = (rotation == 90 || rotation == 270) ? img_height : img_width;
-    int srcHeight = (rotation == 90 || rotation == 270) ? img_width : img_height;
-    
     auto yuvFormat = yuv::detectFormat(uvPixelStride, uData, vData);
-    // Reuses the member buffer: resize only, no per-frame re-allocation.
-    yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
-                       srcWidth, srcHeight, yuvFormat, yuv_buffer_);
-    
-    PERF_START(preprocess_timer);
     
     float center_x, center_y, width, height, face_rotation;
     transformFaceRect(face_rect, center_x, center_y, width, height, face_rotation);
     
+    // dst-pixel -> whole-frame source-pixel transform. The ROI path below only
+    // appends a translation; the rest stays identical to the full-frame path.
+    int srcWidth = 0;
+    int srcHeight = 0;
+    MNN::CV::Matrix trans = buildYuvTransform(img_width, img_height, rotation,
+                                              center_x, center_y, width, height, face_rotation,
+                                              srcWidth, srcHeight);
+
+    // ---- ROI size decision ----
+    // The model samples the crop described by the transform; mapping the four
+    // destination corners back to source pixels gives the only region convert()
+    // can touch. Its bbox (+ margin, even-aligned for the chroma planes) is all
+    // the source data that needs to be packed.
+    int roiX = 0;
+    int roiY = 0;
+    int roiW = 0;
+    int roiH = 0;
+    bool useRoi = false;
+    {
+        const MNN::CV::Point c0 = trans.mapXY(0.0f, 0.0f);
+        const MNN::CV::Point c1 = trans.mapXY(static_cast<float>(input_w_ - 1), 0.0f);
+        const MNN::CV::Point c2 = trans.mapXY(0.0f, static_cast<float>(input_h_ - 1));
+        const MNN::CV::Point c3 = trans.mapXY(static_cast<float>(input_w_ - 1),
+                                              static_cast<float>(input_h_ - 1));
+        const float minX = std::min(std::min(c0.fX, c1.fX), std::min(c2.fX, c3.fX));
+        const float maxX = std::max(std::max(c0.fX, c1.fX), std::max(c2.fX, c3.fX));
+        const float minY = std::min(std::min(c0.fY, c1.fY), std::min(c2.fY, c3.fY));
+        const float maxY = std::max(std::max(c0.fY, c1.fY), std::max(c2.fY, c3.fY));
+
+        const bool bboxFinite = std::isfinite(minX) && std::isfinite(maxX) &&
+                              std::isfinite(minY) && std::isfinite(maxY);
+        if (bboxFinite) {
+            const int kRoiMargin = 8;
+            // x0/y0 round down to even, x1/y1 (exclusive) round up to even, so the
+            // UV origin (roiX/2, roiY/2) and the UV extent stay aligned.
+            int x0 = (static_cast<int>(std::floor(minX)) - kRoiMargin) & ~1;
+            int y0 = (static_cast<int>(std::floor(minY)) - kRoiMargin) & ~1;
+            int x1 = (static_cast<int>(std::ceil(maxX)) + kRoiMargin + 1) & ~1;
+            int y1 = (static_cast<int>(std::ceil(maxY)) + kRoiMargin + 1) & ~1;
+            x0 = std::max(0, x0);
+            y0 = std::max(0, y0);
+            x1 = std::min(srcWidth, x1);
+            y1 = std::min(srcHeight, y1);
+
+            roiX = x0;
+            roiY = y0;
+            roiW = std::max(0, x1 - x0) & ~1;
+            roiH = std::max(0, y1 - y0) & ~1;
+
+            const int kMinRoiSide = 64;
+            const float kMaxRoiAreaRatio = 0.85f;
+            const float frameArea = static_cast<float>(srcWidth) * static_cast<float>(srcHeight);
+            const float roiArea = static_cast<float>(roiW) * static_cast<float>(roiH);
+            useRoi = (roiW >= kMinRoiSide && roiH >= kMinRoiSide &&
+                      roiArea < kMaxRoiAreaRatio * frameArea);
+        }
+    }
+
+    // ---- Pack YUV: face ROI when it is clearly cheaper, whole frame otherwise ----
+    const uint8_t* yuvSrc = nullptr;
+    bool roiPacked = false;
+
+    if (useRoi) {
+        const size_t roiBytes = yuv::prepareBufferRect(
+            yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
+            srcWidth, srcHeight, roiX, roiY, roiW, roiH, yuvFormat, yuv_roi_buffer_);
+        if (roiBytes > 0) {
+            // convert() samples ROI-local coordinates now, so shift the mapped
+            // source coordinates by the ROI origin (applied after the mapping).
+            trans.postTranslate(-static_cast<float>(roiX), -static_cast<float>(roiY));
+            yuvSrc = yuv_roi_buffer_.data();
+            roiPacked = true;
+            if (!yuv_roi_logged_.load(std::memory_order_relaxed) &&
+                !yuv_roi_logged_.exchange(true)) {
+                FACE_LOGI("YUV ROI path: first hit, roi=%dx%d at (%d,%d) = %.1f%% of %dx%d frame",
+                          roiW, roiH, roiX, roiY,
+                          100.0f * static_cast<float>(roiW) * static_cast<float>(roiH) /
+                              (static_cast<float>(srcWidth) * static_cast<float>(srcHeight)),
+                          srcWidth, srcHeight);
+            }
+        }
+    }
+
+    if (!roiPacked) {
+        yuv::YuvFastView fastView;
+        const bool fastHit = yuv::tryFastYuvView(yData, uData, vData,
+                                                 yRowStride, uvRowStride, uvPixelStride,
+                                                 srcWidth, srcHeight, fastView);
+        if (fastHit) {
+            // Zero-copy: convert() can read the camera buffers in place.
+            yuvSrc = fastView.data;
+            yuvFormat = fastView.format;
+        } else {
+            // Reuses the member buffer: resize only, no per-frame re-allocation.
+            yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
+                               srcWidth, srcHeight, yuvFormat, yuv_buffer_);
+            yuvSrc = yuv_buffer_.data();
+        }
+        if (!yuv_fallback_logged_.load(std::memory_order_relaxed) &&
+            !yuv_fallback_logged_.exchange(true)) {
+            FACE_LOGI("YUV full-frame path: first use (%s), %dx%d",
+                      fastHit ? "zero-copy NV12/NV21" : "repacked", srcWidth, srcHeight);
+        }
+    }
+
+    PERF_START(preprocess_timer);
+
     // Convert straight into the reusable host tensor (no per-frame vector/memcpy).
-    preprocessImageFromYuv(yuv_buffer_.data(), yuvFormat,
-                           img_width, img_height, rotation,
-                           center_x, center_y, width, height, face_rotation,
-                           input_host_tensor_.get());
+    // The full-frame fallback goes through the original entry point (which rebuilds
+    // the same matrix via buildYuvTransform) so it stays byte-identical to the
+    // pre-ROI implementation; only the ROI path uses the already-shifted matrix.
+    if (roiPacked) {
+        preprocessImageFromYuvWithMatrix(yuvSrc, yuvFormat, roiW, roiH, trans,
+                                         input_host_tensor_.get());
+    } else {
+        preprocessImageFromYuv(yuvSrc, yuvFormat, img_width, img_height, rotation,
+                               center_x, center_y, width, height, face_rotation,
+                               input_host_tensor_.get());
+    }
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     
     PERF_END(preprocess_timer, s_perf_profiler.preprocess);

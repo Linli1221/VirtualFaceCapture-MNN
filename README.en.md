@@ -325,6 +325,9 @@ wrists / hips) plus **baseline-relative torso angles**, so the avatar can lean, 
 
 - **Off by default** — no extra cost on the camera thread and no MediaPipe Tasks runtime loaded.
   When enabled it taps one frame every 66 ms (~15 fps), GPU first with automatic CPU fallback.
+- **Face-guided ROI**: the latest face box drives an upper-body crop scaled to 320p before
+  inference (falls back to the full frame when the box is stale/too small); landmarks are mapped
+  back to full-frame coordinates, so the `ub[]` protocol semantics are unchanged.
 - **~0.6 KB extra per frame**: `ubOk` / `ub` (13×4) / `ubT` / `body` are appended to `track`
   ([`docs/tracking-protocol.md` §4.2/§5.3](docs/tracking-protocol.md)), ≈36 KB/s at 60 fps.
 - **Consumed automatically on the PC**: torso drives `ParamBodyAngleX/Y/Z`, arms drive

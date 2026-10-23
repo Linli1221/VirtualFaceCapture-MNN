@@ -660,10 +660,21 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
         s_first_frame_dumped = true;
     }
     
-    // Prepare YUV buffer (reuses the member buffer: resize only, no re-alloc)
+    // Prepare the YUV input: use the zero-copy view when the camera hands us a
+    // contiguous NV12/NV21 buffer, otherwise repack (reuses the member buffer:
+    // resize only, no re-alloc). Detection always needs the full frame.
     auto yuvFormat = yuv::detectFormat(uvPixelStride, uData, vData);
-    yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
-                       width, height, yuvFormat, yuv_buffer_);
+    const uint8_t* yuvSrc = nullptr;
+    yuv::YuvFastView fastView;
+    if (yuv::tryFastYuvView(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
+                            width, height, fastView)) {
+        yuvSrc = fastView.data;
+        yuvFormat = fastView.format;
+    } else {
+        yuv::prepareBuffer(yData, uData, vData, yRowStride, uvRowStride, uvPixelStride,
+                           width, height, yuvFormat, yuv_buffer_);
+        yuvSrc = yuv_buffer_.data();
+    }
     
     // Calculate output dimensions after rotation
     int srcWidth = width;
@@ -724,7 +735,7 @@ std::vector<FaceDetection> FaceDetector::detectFromYuv(
     }
     
     image_process_->setMatrix(trans);
-    image_process_->convert(yuv_buffer_.data(), srcWidth, srcHeight, 0,
+    image_process_->convert(yuvSrc, srcWidth, srcHeight, 0,
                             input_host_tensor_.get());
     input_tensor_->copyFromHostTensor(input_host_tensor_.get());
     

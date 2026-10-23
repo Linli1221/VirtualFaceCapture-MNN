@@ -22,13 +22,23 @@ import kotlin.math.max
  *
  * 数据流（docs/upper-body.md §2 / §3.2）：
  * ```
- * 相机 YUV_420_888
- *   → pushFrame()（相机线程）
- *   → 旋转 + 镜像 + 采样缩放到长边 256 的 ARGB Bitmap
+ * 相机 YUV_420_888 + 同一帧的脸框
+ *   → pushFrame(frame, faceHint)（相机线程）
+ *   → UpperBodyRoi.fromFace：脸框 → 上半身 ROI（旋转后源像素）
+ *   → 只裁 ROI + 旋转 + 镜像 + 采样缩放到长边上限 320（只缩不放）的 ARGB Bitmap
  *   → detectAsync()（异步，同一时刻最多一个在飞）
- *   → MediaPipe 回调线程：33 点 → 13 点 → One-Euro 平滑 → 相对基线躯干角
+ *   → MediaPipe 回调线程：33 点 → mapLocalToPreview 回映到整帧 → 13 点
+ *     → One-Euro 平滑 → 相对基线躯干角
  *   → onResult(UpperBodyPoseFrame)
  * ```
+ *
+ * ROI 引导的要点：
+ *  - 整帧 256 换成了「ROI 裁切 → 320p」，同样长边下上半身占的像素多 4~5 倍；
+ *  - 协议 ub[] 的语义不变：结果点回映到**整帧预览坐标**后再做 13 点提取 / 躯干角 / 平滑，
+ *    所以 ROI 随脸移动时坐标不会跳；
+ *  - ROI 只在「这一帧确实要送去推理」时计算（限帧 / 单飞丢掉的帧不做几何运算）；
+ *  - ROI 帧没跟踪到上半身时回退整帧 [ROI_FALLBACK_MS] 再试，避免脸框偏了以后每帧空转；
+ *  - 没有脸框（旧调用 / 面捕丢失）时与改造前一样按整帧推理。
  *
  * 使用方式：
  * ```
@@ -38,7 +48,8 @@ import kotlin.math.max
  * if (!detector.isModelAvailable() || !detector.initialize()) return  // 只关功能，不崩
  * detector.start()
  * // 相机回调里：
- * detector.pushFrame(yuv420Frame)
+ * detector.pushFrame(yuv420Frame)               // 整帧 320p
+ * detector.pushFrame(yuv420Frame, faceRoiHint)  // ROI 引导（推荐）
  * // 退出：
  * detector.release()
  * ```
@@ -128,6 +139,36 @@ class UpperBodyPoseDetector(context: Context) {
 
     @Volatile
     private var pendingSubmitNanos: Long = 0L
+
+    /**
+     * 本帧提交时用的 ROI / 镜像 / 整帧尺寸。
+     *
+     * 单飞（[inFlight]）保证同一时刻只有一个在飞，所以这三组值一定属于「当前那一帧」；
+     * 回调线程在放行单飞标记**之前**取局部快照，之后相机线程才会覆盖它们。
+     */
+    @Volatile
+    private var pendingRoi: RoiWindow? = null
+
+    @Volatile
+    private var pendingMirrored: Boolean = false
+
+    @Volatile
+    private var pendingFrameWidth: Int = 0
+
+    @Volatile
+    private var pendingFrameHeight: Int = 0
+
+    /** ROI 帧失败后到期的整帧回退窗口（System.nanoTime 的毫秒）；0 / 已过期 = 正常用 ROI。 */
+    @Volatile
+    private var fallbackUntilMs: Long = 0L
+
+    /** 首次 ROI 命中只打一条日志（相机线程写）。 */
+    @Volatile
+    private var roiHitLogged: Boolean = false
+
+    /** 首次 ROI 回退只打一条日志（回调线程写）。 */
+    @Volatile
+    private var roiFallbackLogged: Boolean = false
 
     /** 保活：MediaPipe 异步推理期间 Bitmap 必须一直可达。 */
     @Volatile
@@ -240,6 +281,8 @@ class UpperBodyPoseDetector(context: Context) {
             return
         }
         lastSubmitMs = 0L
+        // 每次 start 都是新的采集会话：清掉上一轮可能残留的 ROI 回退窗口。
+        fallbackUntilMs = 0L
         started = true
     }
 
@@ -263,6 +306,10 @@ class UpperBodyPoseDetector(context: Context) {
         inFlightBitmap = null
         pendingFrameTimestampMs = 0L
         pendingSubmitNanos = 0L
+        pendingRoi = null
+        fallbackUntilMs = 0L
+        roiHitLogged = false
+        roiFallbackLogged = false
         runCatching { old?.close() }
         synchronized(pipelineLock) {
             smoother.reset()
@@ -345,16 +392,20 @@ class UpperBodyPoseDetector(context: Context) {
     /**
      * 提交一帧相机 YUV（**相机线程同步调用**）。
      *
-     * 本方法立即完成像素转换（约 1~4ms @ 长边 256），随后才异步推理；
+     * @param frame 相机 YUV 帧（ByteBuffer 只在相机回调期间有效）
+     * @param faceHint 同一帧上的脸框（旋转后、未镜像的归一化坐标）。null / 非法 / 脸太小 → 整帧；
+     *   有效时按「脸框 → 上半身 ROI」裁切后再缩放到长边上限 320（只缩不放，见 [UpperBodyRoi]）。
+     *
+     * 本方法立即完成像素转换（ROI 引导后只采样上半身区域，约 1~4ms），随后才异步推理；
      * 转换只读 `ByteBuffer.get(index)`，**不依赖 position**，也不会在返回后保留
      * ByteBuffer 引用 —— 调用返回后 [Yuv420Frame] 里的 ByteBuffer 可以安全失效。
      *
-     * 以下情况直接丢弃（计入 `dropped`）且不抛异常：
+     * 以下情况直接丢弃（计入 `dropped`）且不抛异常（丢帧时连 ROI 都不算）：
      *  - 未 initialize / 未 start；
      *  - 距离上一帧不足 `1000/targetFps` 毫秒；
      *  - 上一次 detectAsync 还没回调（单飞）。
      */
-    fun pushFrame(frame: Yuv420Frame) {
+    fun pushFrame(frame: Yuv420Frame, faceHint: FaceRoiHint? = null) {
         if (!ready || !started) return
 
         stats.markInput()
@@ -375,8 +426,24 @@ class UpperBodyPoseDetector(context: Context) {
         // 本帧必须作废，且不能去清理「新实例」的单飞标记。
         val frameGeneration = generation
 
+        // ROI 只在「这一帧确实要送去推理」之后才算：被限帧 / 单飞丢掉的帧不做任何几何运算。
+        val rotatedWidth = frame.rotatedWidth
+        val rotatedHeight = frame.rotatedHeight
+        // 回退窗口内一律整帧：上一帧的 ROI 结果不可信，先让 MediaPipe 看全景。
+        val hint = if (nowMs < fallbackUntilMs) null else faceHint
+        val roi = UpperBodyRoi.fromFace(hint, rotatedWidth, rotatedHeight)
+        val usingRoi = !roi.isFullFrame(rotatedWidth, rotatedHeight)
+        if (usingRoi && !roiHitLogged) {
+            roiHitLogged = true
+            Log.i(
+                TAG,
+                "ROI 引导生效：${roi.width}×${roi.height} @(${roi.x0},${roi.y0})，" +
+                    "整帧 ${rotatedWidth}×${rotatedHeight}",
+            )
+        }
+
         val bitmap: Bitmap? = try {
-            converter.convert(frame, TARGET_LONG_SIDE)
+            converter.convert(frame, TARGET_LONG_SIDE, roi)
         } catch (t: Throwable) {
             Log.e(TAG, "YUV → Bitmap 转换失败", t)
             postErrorThrottled("上半身 YUV 转换失败：${t.message ?: t.javaClass.simpleName}")
@@ -398,6 +465,12 @@ class UpperBodyPoseDetector(context: Context) {
         val timestamp = nextDetectTimestamp()
         pendingFrameTimestampMs = System.currentTimeMillis()
         pendingSubmitNanos = System.nanoTime()
+        // 单飞保证：同一时刻只有一个在飞，所以这一组参数一定属于本帧；
+        // 回调线程放行单飞标记之前会把它们取成局部快照。
+        pendingRoi = roi
+        pendingMirrored = frame.mirrorHorizontal
+        pendingFrameWidth = rotatedWidth
+        pendingFrameHeight = rotatedHeight
         inFlightBitmap = bitmap
         try {
             currentLandmarker.detectAsync(BitmapImageBuilder(bitmap).build(), timestamp)
@@ -420,6 +493,12 @@ class UpperBodyPoseDetector(context: Context) {
         // 否则会让相机线程以为空闲，进而对同一个 landmarker 并发 detectAsync。
         if (resultGeneration != generation) return
 
+        // 单飞保证这一组值属于同一个提交。**先取局部快照，再放行单飞标记**：
+        // 之后相机线程可能立刻提交下一帧并覆盖 pending*。
+        val roi = pendingRoi
+        val mirrored = pendingMirrored
+        val frameWidth = pendingFrameWidth
+        val frameHeight = pendingFrameHeight
         val frameTimestampMs = pendingFrameTimestampMs
         val submitNanos = pendingSubmitNanos
         val latencyMs = if (submitNanos > 0L) {
@@ -434,7 +513,7 @@ class UpperBodyPoseDetector(context: Context) {
         if (!started || !ready) return
 
         try {
-            val frame = buildFrame(result, frameTimestampMs)
+            val frame = buildFrame(result, frameTimestampMs, roi, mirrored, frameWidth, frameHeight)
             stats.markOutput(latencyMs)
             try {
                 onResult?.invoke(frame)
@@ -456,17 +535,53 @@ class UpperBodyPoseDetector(context: Context) {
         postErrorThrottled("MediaPipe Pose 推理错误：${error.message ?: error.javaClass.simpleName}")
     }
 
-    private fun buildFrame(result: PoseLandmarkerResult, timestampMs: Long): UpperBodyPoseFrame {
+    /**
+     * 33 点 → 协议帧。
+     *
+     * 关键顺序：**先**用 [UpperBodyRoi.mapLocalToPreview] 把 ROI 局部坐标回映到整帧预览坐标，
+     * **再**交给 [UpperBodyGeometry.extract]。这样协议 ub[]、躯干角、平滑全都工作在整帧坐标上，
+     * 与改造前（整帧推理）语义一致，ROI 随脸移动时也不会出现坐标跳变。
+     *
+     * @param roi 本帧推理用的 ROI（null / 整帧 = 恒等映射）
+     * @param mirrored 本帧整帧预览是否镜像
+     * @param frameWidth 旋转后帧宽（回映用）
+     * @param frameHeight 旋转后帧高（回映用）
+     */
+    private fun buildFrame(
+        result: PoseLandmarkerResult,
+        timestampMs: Long,
+        roi: RoiWindow?,
+        mirrored: Boolean,
+        frameWidth: Int,
+        frameHeight: Int,
+    ): UpperBodyPoseFrame {
         val frameTimestampMs = if (timestampMs > 0L) timestampMs else System.currentTimeMillis()
         val pose = result.landmarks().firstOrNull()
         val rawPoints: List<BodyPoint>? = pose?.let { landmarks ->
             val converted = ArrayList<PoseLandmark>(landmarks.size)
             for (landmark in landmarks) {
+                val localX = landmark.x()
+                val localY = landmark.y()
+                val localZ = landmark.z()
+                val mapped = if (roi != null && frameWidth > 0 && frameHeight > 0) {
+                    UpperBodyRoi.mapLocalToPreview(
+                        localX = localX,
+                        localY = localY,
+                        localZ = localZ,
+                        roi = roi,
+                        frameWidth = frameWidth,
+                        frameHeight = frameHeight,
+                        mirrored = mirrored,
+                    )
+                } else {
+                    // 没有 ROI 信息（理论上只可能出现在状态错乱的边界）：原样当作整帧坐标
+                    UpperBodyRoi.PreviewPoint(localX, localY, localZ)
+                }
                 converted.add(
                     PoseLandmark(
-                        x = landmark.x(),
-                        y = landmark.y(),
-                        z = landmark.z(),
+                        x = mapped.x,
+                        y = mapped.y,
+                        z = mapped.z,
                         visibility = landmark.visibility().orElse(0f),
                     )
                 )
@@ -474,12 +589,20 @@ class UpperBodyPoseDetector(context: Context) {
             UpperBodyGeometry.extract(converted)
         }
 
-        if (rawPoints == null || !UpperBodyGeometry.isTracking(rawPoints)) {
+        val points = rawPoints
+        if (points == null || !UpperBodyGeometry.isTracking(points)) {
+            markRoiMiss(roi, frameWidth, frameHeight)
             synchronized(pipelineLock) {
                 smoother.reset()
                 lastPipelineTimestampMs = 0L
             }
             return UpperBodyPoseFrame.empty(frameTimestampMs)
+        }
+
+        // ROI 帧成功：清掉可能残留的回退窗口（回退窗口内的帧一定不是 ROI 帧，
+        // 所以这里不会把「正在回退」的状态提前清掉，避免 ROI 持续失败时逐帧抖动）。
+        if (roi != null && !roi.isFullFrame(frameWidth, frameHeight)) {
+            fallbackUntilMs = 0L
         }
 
         val smoothed: List<BodyPoint>
@@ -492,7 +615,7 @@ class UpperBodyPoseDetector(context: Context) {
             }
             lastPipelineTimestampMs = frameTimestampMs
 
-            smoothed = smoother.smooth(rawPoints, dtSeconds)
+            smoothed = smoother.smooth(points, dtSeconds)
             val rawTorso = UpperBodyGeometry.torso(smoothed)
             val smoothTorso = smoother.smoothTorso(rawTorso, dtSeconds)
             relativeTorso = baseline.apply(smoothTorso)
@@ -502,9 +625,29 @@ class UpperBodyPoseDetector(context: Context) {
             points = smoothed,
             torso = if (relativeTorso.isValid) relativeTorso else TorsoAngles.ZERO,
             tracking = true,
-            quality = UpperBodyGeometry.quality(rawPoints),
+            quality = UpperBodyGeometry.quality(points),
             timestampMs = frameTimestampMs,
         )
+    }
+
+    /**
+     * 本帧用了 ROI 但没跟踪到上半身 → 开一段整帧回退窗口（只打一次日志）。
+     *
+     * 为什么不逐帧清掉：ROI 若持续框偏（脸框不可信 / 人离开画面），「整帧成功一帧就回 ROI」
+     * 会让 ROI / 整帧逐帧交替，ubOk 以 ~7.5Hz 抖动，客户端手臂参数会被反复拉回默认值。
+     * 现在的行为：窗口内**一律**整帧，窗口到期自动恢复 ROI；ROI 帧成功才提前清掉残留窗口。
+     */
+    private fun markRoiMiss(roi: RoiWindow?, frameWidth: Int, frameHeight: Int) {
+        if (roi == null || roi.isEmpty || roi.isFullFrame(frameWidth, frameHeight)) return
+        fallbackUntilMs = System.nanoTime() / 1_000_000L + ROI_FALLBACK_MS
+        if (!roiFallbackLogged) {
+            roiFallbackLogged = true
+            Log.i(
+                TAG,
+                "ROI ${roi.width}×${roi.height} @(${roi.x0},${roi.y0}) 未跟踪到上半身，" +
+                    "回退整帧 ${ROI_FALLBACK_MS}ms 后再试 ROI",
+            )
+        }
     }
 
     // ------------------------------ 内部工具 ------------------------------
@@ -790,7 +933,19 @@ class UpperBodyPoseDetector(context: Context) {
 
         private const val FILE_MODEL_SUBDIR = "models"
         private const val CACHE_MODEL_SUBDIR = "upperbody_models"
-        private const val TARGET_LONG_SIDE = Yuv420Frame.DEFAULT_MAX_LONG_SIDE
+
+        /**
+         * 送进 PoseLandmarker 的 Bitmap 长边（改造后固定 320）。
+         *
+         * 不再用 [Yuv420Frame.DEFAULT_MAX_LONG_SIDE]（256）：那个常量只是帧对象的默认值，
+         * 保留 256 是为了不改变 [Yuv420Frame.targetSize] 的既有语义；本检测器自己用 320，
+         * 配合 ROI 裁切后上半身占的有效像素反而更多（见 docs/upper-body.md §2 的流程图）。
+         */
+        private const val TARGET_LONG_SIDE = 320
+
+        /** ROI 帧没跟踪到上半身时，改用整帧推理的时长（ms）。 */
+        private const val ROI_FALLBACK_MS = 1_000L
+
         private const val DEFAULT_TARGET_FPS = 15
         private const val CALIBRATION_FRAMES = TorsoBaseline.DEFAULT_CALIBRATION_FRAMES
         private const val DEFAULT_MIN_CONFIDENCE = 0.5f

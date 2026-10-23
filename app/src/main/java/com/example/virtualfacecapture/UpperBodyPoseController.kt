@@ -3,7 +3,9 @@ package com.example.virtualfacecapture
 import android.content.Context
 import android.util.Log
 import com.example.commondata.UpperBodyPoseFrame
+import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.YuvFrameData
+import com.example.mediapipeupperbody.FaceRoiHint
 import com.example.mediapipeupperbody.UpperBodyPoseDetector
 import com.example.mediapipeupperbody.Yuv420Frame
 import java.util.concurrent.atomic.AtomicLong
@@ -15,16 +17,19 @@ import java.util.concurrent.atomic.AtomicLong
  *  - 持有 `:MediapipeUpperBody` 的 [UpperBodyPoseDetector]，管它的初始化 / 启停 / 释放；
  *  - 把相机线程上的 [YuvFrameData] 转成模块认识的 [Yuv420Frame]（**不拷贝像素**，
  *    ByteBuffer 直接透传，因为检测器要求在相机回调里同步转换，见 §3.2）；
+ *  - **ROI 引导**：用同一帧的脸框（[MediaPipeFaceDetector.FaceBox]）生成 [FaceRoiHint]，
+ *    检测器据此裁出上半身 ROI → 只缩放这块到 320p 再推理；没有可信脸框时回退整帧 320p；
  *  - 把结果的 [UpperBodyPoseFrame] 分发给 UI（预览骨架 / HUD）和网络（由 MainActivity 接线，
  *    本类**不依赖** tracking 包）。
  *
  * 线程模型：
  *  - [pushYuvFrame] 由**相机线程**同步调用，只做「判活 + 转对象 + 交给检测器」，不阻塞、不抛异常；
+ *    ByteBuffer 只在相机回调期间有效，检测器在返回前就同步消费完（含 ROI 采样），不会跨线程持有；
  *  - [onFrame] / [onOverlay] 在 MediaPipe 回调线程触发（§3.2 第 7 条），上层自己切线程 / 节流；
  *  - [initialize] / [start] / [stop] / [release] 内部有锁，主线程可以直接调；但 initialize
  *    要加载模型（几百毫秒），建议放到后台线程（MainActivity 就是这么做的）。
  *
- * 生命周期：默认关闭。关闭时相机线程上不挂 tap（faceTracker.onYuvFrameForBody = null），
+ * 生命周期：默认关闭。关闭时相机线程上不挂 tap（新旧两个回调都置 null），
  * 因此没有任何逐帧开销，也不会加载 MediaPipe Tasks 运行时。
  *
  * @param context 用于读取 assets / filesDir 里的模型（交给检测器）
@@ -42,6 +47,14 @@ class UpperBodyPoseController(private val context: Context) {
 
         /** 模型缺失时给用户的指引（仓库自带下载脚本）。 */
         private const val FETCH_MODEL_HINT = "请运行 tools/fetch-pose-model.ps1"
+
+        /**
+         * 脸框分数的下限：低于它就当「这一帧没有可信的脸」处理（整帧 320p）。
+         *
+         * 太小的框会把 ROI 带到画面边缘，反而让 MediaPipe 看不到完整的上半身；
+         * 整帧 320p 是安全兜底（关键点会小一点，但至少有结果）。
+         */
+        private const val MIN_FACE_SCORE = 0.3f
     }
 
     /** 控制器状态机。 */
@@ -281,13 +294,27 @@ class UpperBodyPoseController(private val context: Context) {
     // ========================================================================
 
     /**
-     * 把相机线程上的 YUV 帧喂给检测器。
+     * 把相机线程上的 YUV 帧喂给检测器（**不带脸框**：整帧 320p 推理）。
      *
-     * **只能在 [com.facecapture.sdk.PipelineFaceTracker.onYuvFrameForBody] 回调里同步调用**：
-     * 检测器会在这里立刻完成 YUV → ARGB Bitmap 的转换（像素不能跨线程存活），之后异步推理。
-     * 本方法不抛异常，任何失败只记日志并计入统计。
+     * 保留旧签名给「没有脸框可用」的调用方：行为等价于改造前的整帧推理，只是长边从 256 变成 320。
      */
     fun pushYuvFrame(frame: YuvFrameData) {
+        pushYuvFrame(frame, null)
+    }
+
+    /**
+     * 把相机线程上的 YUV 帧 + 同一帧的脸框喂给检测器（**ROI 引导**）。
+     *
+     * **只能在 [com.facecapture.sdk.PipelineFaceTracker.onYuvFrameForBodyWithHint]
+     * （或旧 onYuvFrameForBody）回调里同步调用**：
+     * 检测器会在这里立刻按「脸框 → 上半身 ROI」裁切、旋转、镜像、缩放到长边上限 320
+     *（只缩不放）的 ARGB Bitmap（像素不能跨线程存活），之后异步推理。
+     * 本方法不抛异常，任何失败只记日志并计入统计。
+     *
+     * @param faceBox 面捕那一帧的脸框（旋转后、未镜像的归一化坐标，与 FaceBox 的既有约定一致）；
+     *   null / 分数 < [MIN_FACE_SCORE] / 坐标非法时按整帧处理，不会让上半身这一路失败。
+     */
+    fun pushYuvFrame(frame: YuvFrameData, faceBox: MediaPipeFaceDetector.FaceBox?) {
         // 关闭时相机侧根本不会调到这里（tap = null），这只是防御
         if (!running) return
         if (frame.width <= 0 || frame.height <= 0) return
@@ -308,7 +335,7 @@ class UpperBodyPoseController(private val context: Context) {
                 mirrorHorizontal = mirrorHorizontal,
             )
             framesIn.incrementAndGet()
-            detector.pushFrame(yuv)
+            detector.pushFrame(yuv, faceRoiHintOf(faceBox))
         } catch (t: Throwable) {
             val total = failures.incrementAndGet()
             // 只在第一次 / 每 100 次打日志：相机线程上不做无谓的字符串拼接
@@ -316,6 +343,26 @@ class UpperBodyPoseController(private val context: Context) {
                 Log.e(TAG, "上半身帧转换/入队失败（累计 " + total + " 次）", t)
             }
         }
+    }
+
+    /**
+     * [MediaPipeFaceDetector.FaceBox] → [FaceRoiHint]。
+     *
+     * 分数过低（< [MIN_FACE_SCORE]）或坐标非法时返回 null：宁可整帧 320p 慢一点，
+     * 也不要让一个不可信的脸框把 ROI 带到画面外（那会让 MediaPipe 直接看不到上半身）。
+     */
+    private fun faceRoiHintOf(faceBox: MediaPipeFaceDetector.FaceBox?): FaceRoiHint? {
+        if (faceBox == null) return null
+        val score = faceBox.score
+        if (!score.isFinite() || score < MIN_FACE_SCORE) return null
+        val hint = FaceRoiHint(
+            left = faceBox.x1,
+            top = faceBox.y1,
+            right = faceBox.x2,
+            bottom = faceBox.y2,
+            score = score,
+        )
+        return if (hint.isValid) hint else null
     }
 
     /** 运行统计快照（HUD / 日志用）；检测器没就绪时也能安全返回。 */
