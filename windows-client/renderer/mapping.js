@@ -453,8 +453,11 @@ export const BODY_BONES = Object.freeze([
  *   ParamArmLA/RA        上臂抬起角（肩→腕与竖直向下的夹角，0 = 下垂、150 = 满量程）
  *   ParamArmLB/RB        肘关节角（前臂相对上臂的屈曲；侧别镜像后**正 = 屈肘**）
  *   ParamShoulderL/R     锁骨角（肩线相对髋线的差动倾斜；**正 = 该侧肩抬起**）
- * `ParamHandL/R` 不输出：13 点协议里没有手部关键点，腕关节朝向无从测量（不造数据）；
- * 需要时由调用方拿 buildUpperBodySkeleton().arms[side].forearmDeg 自行接。
+ *   ParamHandL/R         手部旋转（前臂朝向的近似；协议没有手部关键点，腕朝向无从测量）
+ *   ParamHandAngleL/R    同上（Haru 等模型用的参数别名，值与 ParamHandL/R 相同）
+ *
+ * ⚠️ 这里的数值是「契约单位」（±30 量程），写进模型时由 live2d.js **按模型实际参数量程
+ * 等比缩放**（Haru 的 ParamArmLA 量程是 [-1,1]，直接写 27 会被 clamp 死）。
  */
 export const BODY_PARAM_IDS = Object.freeze([
   "ParamBodyAngleX",
@@ -466,6 +469,10 @@ export const BODY_PARAM_IDS = Object.freeze([
   "ParamArmRB",
   "ParamShoulderL",
   "ParamShoulderR",
+  "ParamHandL",
+  "ParamHandR",
+  "ParamHandAngleL",
+  "ParamHandAngleR",
 ]);
 
 /** 上半身快照多久没更新就按「丢失」处理（协议 §4.2：手机端 1500 ms 过期）。 */
@@ -497,6 +504,10 @@ export const BODY_DEFAULTS = Object.freeze({
   clavicleTiltMax: 25,
   /** clavicleRelTilt（-1..1）× shoulderScale → ParamShoulderL/R。 */
   shoulderScale: 30,
+  /** 手部（前臂朝向）满量程（度）：150 与手臂同一口径。 */
+  handAngleMax: 150,
+  /** handDeg（-1..1）× handScale → ParamHandL/R、ParamHandAngleL/R。 */
+  handScale: 30,
   /** 该侧肩 / 肘 / 腕可见度下限。 */
   minVisibility: BODY_ARM_MIN_VISIBILITY,
   /** 所有躯干 / 手臂参数的绝对值上限。 */
@@ -615,6 +626,8 @@ const EMPTY_ARM_BONE = Object.freeze({
   elevationTorsoDeg: 0,
   /** 肘关节角 = 前臂相对上臂的旋转（带符号，侧别镜像后 + = 屈肘）。 */
   elbowBendDeg: 0,
+  /** 前臂朝向（带符号，侧别镜像后 + = 向画面外/上）——手部参数的近似数据源（协议无手部关键点）。 */
+  handDeg: 0,
   /** 该侧肩 / 肘 / 腕可见度的最小值。 */
   visibility: 0,
   /** 肩→肘→腕 三段都非退化（重合点会让关节角失去意义）。 */
@@ -715,6 +728,8 @@ export function buildUpperBodySkeleton(ub) {
     const foreRot = foreOk ? signedAngleFromDown(foreDx, foreDy) : 0;
     const bend = wrapDeg(foreRot - upperRot);
     arm.elbowBendDeg = upperOk && foreOk ? (side === "L" ? -bend : bend) : 0;
+    // 手：前臂朝向的侧别镜像值（协议没有手部关键点，腕/手掌朝向以前臂方向近似）
+    arm.handDeg = foreOk ? (side === "L" ? -foreRot : foreRot) : 0;
     const armRot = Math.hypot(armDx, armDy) >= 1e-4 ? signedAngleFromDown(armDx, armDy) : 0;
     // 躯干「向下」轴与竖直向下的夹角恰好是 -leanDeg：手臂相对躯干 = armRot - (-lean)
     arm.elevationTorsoDeg = wrapDeg(armRot + skeleton.spine.leanDeg);
@@ -740,6 +755,8 @@ export function buildUpperBodySkeleton(ub) {
  *   armUp(side)     = clamp(armAngle / 150, 0, 1) → ParamArm{side}A = armUp * 30
  *   elbow(side)     = 前臂相对上臂的屈曲（度，侧别镜像后 + = 屈肘）
  *                     → ParamArm{side}B = clamp(elbow / 150, -1, 1) * 30
+ *   hand(side)      = 前臂朝向（度，侧别镜像；协议无手部关键点，腕朝向以此近似）
+ *                     → ParamHand{side} = ParamHandAngle{side} = clamp(hand / 150, -1, 1) * 30
  *   shrug           = clamp(锁骨差动倾斜 / 25, -1, 1)
  *                     → ParamShoulderL = shrug * 30、ParamShoulderR = -shrug * 30
  *
@@ -771,6 +788,8 @@ export function mapBody(bodyAngles, ub, opts = {}) {
   const elbowAngleMax = Math.max(1, finiteOr(o.elbowAngleMax, 150));
   const shoulderScale = finiteOr(o.shoulderScale, 30);
   const clavicleTiltMax = Math.max(1, finiteOr(o.clavicleTiltMax, 25));
+  const handScale = finiteOr(o.handScale, 30);
+  const handAngleMax = Math.max(1, finiteOr(o.handAngleMax, 150));
   const minVisibility = clamp(finiteOr(o.minVisibility, BODY_ARM_MIN_VISIBILITY), 0, 1);
 
   const params = {
@@ -785,6 +804,8 @@ export function mapBody(bodyAngles, ub, opts = {}) {
     armAngleR: null,
     elbowBendL: null,
     elbowBendR: null,
+    handAngleL: null,
+    handAngleR: null,
     spineLean: 0,
     clavicleTilt: 0,
     clavicleRelTilt: 0,
@@ -816,14 +837,20 @@ export function mapBody(bodyAngles, ub, opts = {}) {
     const arm = skeleton.arms[side];
     const angleKey = side === "L" ? "armAngleL" : "armAngleR";
     const bendKey = side === "L" ? "elbowBendL" : "elbowBendR";
+    const handKey = side === "L" ? "handAngleL" : "handAngleR";
     metrics[angleKey] = arm.elevationDeg;
     metrics[bendKey] = arm.elbowBendDeg;
+    metrics[handKey] = arm.handDeg;
     if (arm.visibility < minVisibility) continue; // 不可信 → 不输出该侧手臂参数
     const armUp = clamp(arm.elevationDeg / armAngleMax, 0, 1);
     params[side === "L" ? "ParamArmLA" : "ParamArmRA"] = armUp * armScale;
     // 肘：前臂相对上臂的屈曲（侧别镜像后正 = 屈肘）→ ParamArmLB/RB
     const elbowBend = clamp(arm.elbowBendDeg / elbowAngleMax, -1, 1);
     params[side === "L" ? "ParamArmLB" : "ParamArmRB"] = elbowBend * elbowScale;
+    // 手：前臂朝向的近似（协议没有手部关键点）→ ParamHandL/R 与别名 ParamHandAngleL/R 同值
+    const hand = clamp(arm.handDeg / handAngleMax, -1, 1) * handScale;
+    params[side === "L" ? "ParamHandL" : "ParamHandR"] = hand;
+    params[side === "L" ? "ParamHandAngleL" : "ParamHandAngleR"] = hand;
   }
 
   // 锁骨：肩线相对髋线的差动倾斜（整体侧倾归 body roll → ParamBodyAngleZ，这里只管肩膀差动）

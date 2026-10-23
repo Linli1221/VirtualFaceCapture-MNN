@@ -515,15 +515,33 @@ const CLAVICLE_TILT_MAX = 25, SHOULDER_SCALE = 30;
 const shrug = clamp(shrugDeg / CLAVICLE_TILT_MAX, -1, 1);
 setParam("ParamShoulderL",  shrug * SHOULDER_SCALE);   // 符号约定：正 = 该侧肩抬起
 setParam("ParamShoulderR", -shrug * SHOULDER_SCALE);   // （右肩相对下沉 = 左肩抬起）
+
+// ④ 手：前臂朝向（肘→腕向量相对竖直向下的带符号角）的侧别镜像值。
+//    协议没有手部关键点，腕/手掌朝向以前臂方向近似（不造数据，让手跟着胳膊走）。
+//    正 = 向画面外/上；Haru 用别名 ParamHandAngleL/R，Hiyori 用 ParamHandL/R，值相同。
+function forearmDeg(elbow, wrist, side) {
+  const rot = (a, b) => Math.atan2(b.x - a.x, b.y - a.y) * 180 / Math.PI;
+  const ang = rot(elbow, wrist);
+  return side === "L" ? -ang : ang;
+}
+
+const HAND_ANGLE_MAX = 150, HAND_SCALE = 30;
+setParam("ParamHandL", clamp(forearmDeg(p(P_LEFT_ELBOW), p(P_LEFT_WRIST), "L") / HAND_ANGLE_MAX, -1, 1) * HAND_SCALE);
+setParam("ParamHandR", clamp(forearmDeg(p(P_RIGHT_ELBOW), p(P_RIGHT_WRIST), "R") / HAND_ANGLE_MAX, -1, 1) * HAND_SCALE);
 ```
 
 - **参数总表**：`ParamBodyAngleX/Y/Z`（躯干）、`ParamArmLA/RA`（上臂抬起）、
-  `ParamArmLB/RB`（肘屈曲）、`ParamShoulderL/R`（锁骨差动）。`ParamShoulderL/R` 的符号约定是
+  `ParamArmLB/RB`（肘屈曲）、`ParamShoulderL/R`（锁骨差动）、`ParamHandL/R` 与别名
+  `ParamHandAngleL/R`（手，前臂朝向近似）。`ParamShoulderL/R` 的符号约定是
   **正 = 该侧肩抬起**；`ParamArmLB/RB` 是**正 = 屈肘**（模型的铰链方向相反时把 `ELBOW_SCALE`
   取负即可）。各模型的 `ParamArmB` / `ParamShoulder` 具体变形方向随 rig 而异，接新模型时先小
   幅度试一下符号。
-- `ParamHandL/R` **不输出**：13 点里没有手部关键点，腕关节朝向无从测量（不造数据）。要接时用
-  骨骼层的 `forearmDeg`（肘→腕段的绝对角）自行近似，并接受它是前臂方向、不是手腕旋转。
+- **写进模型前要按模型量程等比缩放**：上面公式的输出是「±30 契约量程」，但模型参数的实际
+  量程各不相同（Haru 的 `ParamArmLA` 是 [-1,1]、Hiyori 是 [-10,10]）。直接把 27 写进 [-1,1]
+  的参数会被 Cubism clamp 到 1，动作「钉死」在极值上不跟手。参考实现（`live2d.js` 的
+  `toModelRange`）把 `n = 值 / 30 ∈ [-1,1]` 映射进 `[min,max]`（以模型默认值为 0 点）。
+- `ParamHandL/R` 是**前臂朝向的近似**：13 点里没有手部关键点，腕/手掌朝向无从测量；
+  手部参数只保证「手跟着胳膊的方向走」，不是真实手腕旋转（要真手腕得扩协议加手部关键点）。
 - 手肘被躯干挡住时用肩 → 腕更稳；需要更精细时可用
   `armAngleFromDown(shoulder, elbow)` + `armAngleFromDown(elbow, wrist)` 两段近似
   （协议没有手心朝向，不要过度解读）。

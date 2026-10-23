@@ -667,6 +667,10 @@ function publishDebug() {
     ParamArmRB: stage.getEngineParam("ParamArmRB"),
     ParamShoulderL: stage.getEngineParam("ParamShoulderL"),
     ParamShoulderR: stage.getEngineParam("ParamShoulderR"),
+    ParamHandL: stage.getEngineParam("ParamHandL"),
+    ParamHandR: stage.getEngineParam("ParamHandR"),
+    ParamHandAngleL: stage.getEngineParam("ParamHandAngleL"),
+    ParamHandAngleR: stage.getEngineParam("ParamHandAngleR"),
   };
   const body = state.body ?? createBodyState();
   // 上半身调试信息（verifier / 调试面板 / 无手机截图都能读到）
@@ -682,6 +686,8 @@ function publishDebug() {
     armAngleR: body.metrics?.armAngleR ?? null,
     elbowBendL: body.metrics?.elbowBendL ?? null,
     elbowBendR: body.metrics?.elbowBendR ?? null,
+    handAngleL: body.metrics?.handAngleL ?? null,
+    handAngleR: body.metrics?.handAngleR ?? null,
     spineLean: body.metrics?.spineLean ?? 0,
     clavicleRelTilt: body.metrics?.clavicleRelTilt ?? 0,
     shoulderWidth: body.metrics?.shoulderWidth ?? 0,
@@ -778,7 +784,7 @@ function bodyStatusText(body) {
   return "无效";
 }
 
-/** 上半身骨骼参数（臂 A / 肘 B / 肩）在当前模型上是否存在（自带 4 个模型都没有 → 预期降级）。 */
+/** 上半身骨骼参数（臂 A / 肘 B / 肩 / 手）在当前模型上是否存在（自带 4 个模型都没有 → 预期降级）。 */
 function bodyParamSupportText() {
   const support = stage.bodySupport ?? {};
   const pick = (id) => (support[id] ? "有" : "无");
@@ -786,6 +792,7 @@ function bodyParamSupportText() {
     `臂A L:${pick("ParamArmLA")} R:${pick("ParamArmRA")}`,
     `肘B L:${pick("ParamArmLB")} R:${pick("ParamArmRB")}`,
     `肩 L:${pick("ParamShoulderL")} R:${pick("ParamShoulderR")}`,
+    `手 L:${support.ParamHandL || support.ParamHandAngleL ? "有" : "无"} R:${support.ParamHandR || support.ParamHandAngleR ? "有" : "无"}`,
   ].join(" · ");
 }
 

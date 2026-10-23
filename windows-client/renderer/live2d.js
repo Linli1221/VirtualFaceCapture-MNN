@@ -22,7 +22,7 @@
  *
  * 全局依赖（index.html 按顺序加载）：window.Live2DCubismCore → window.PIXI → PIXI.live2d
  */
-import { BODY_PARAM_IDS, PARAM_IDS, combineBodyAngleX } from "./mapping.js";
+import { BODY_ANGLE_LIMIT, BODY_PARAM_IDS, PARAM_IDS, combineBodyAngleX } from "./mapping.js";
 import { ParamTimeline } from "./interp.js";
 
 /** 默认渲染目标帧率（协议 §9：PC 渲染 60 FPS @ 1080p）。 */
@@ -45,6 +45,25 @@ const MAX_STEP_MS = 100;
 
 /** 渲染 fps 统计窗口（ms）。 */
 const FPS_WINDOW_MS = 500;
+
+/**
+ * 契约单位（±canonicalHalf）→ 模型实际参数量程的**等比缩放**（纯函数，可单测）。
+ *
+ * 上半身映射在协议层用固定 ±30 量程出值，但每个模型的参数量程不同——Haru 的 `ParamArmLA`
+ * 只有 [-1,1]，直接写 27 会被 Cubism clamp 到 1，动作「钉死」在极值上不跟手。
+ * 这里把 `n = value / canonicalHalf ∈ [-1,1]` 映射进模型的 `[min,max]`（以默认值 def 为 0 点）：
+ *   n ≥ 0 → def + n × (max - def)；n < 0 → def + n × (def - min)。
+ * 量程信息缺失时原样返回（保持旧行为）。
+ */
+export function toModelRange(value, canonicalHalf, range) {
+  const half = Math.max(1e-6, Math.abs(Number(canonicalHalf) || BODY_ANGLE_LIMIT));
+  const v = Number(value);
+  const n = Number.isFinite(v) ? Math.max(-1, Math.min(1, v / half)) : 0;
+  const def = Number.isFinite(range?.def) ? range.def : 0;
+  const min = Number.isFinite(range?.min) ? range.min : -half;
+  const max = Number.isFinite(range?.max) ? range.max : half;
+  return n >= 0 ? def + n * (max - def) : def + n * (def - min);
+}
 
 /** 环境自检：返回缺失项列表（空数组 = 可以渲染）。 */
 export function checkEnvironment() {
@@ -96,6 +115,8 @@ export class Live2DStage {
     this.currentTorsoX = null;
     /** 当前模型对 BODY_PARAM_IDS 的支持情况 { id: boolean }（调试面板 / 降级说明用）。 */
     this.bodySupport = Object.create(null);
+    /** 模型对上半身参数声明的实际量程 { id: {def,min,max} }（写入前等比缩放，见 toModelRange）。 */
+    this.bodyParamRanges = Object.create(null);
     /** 模型支持、且不在 PARAM_IDS 里的上半身参数（写参数时单独缓动 / 释放）。 */
     this.bodyOnlyParamIds = [];
     /** 本帧真正写进 core 的参数 id（PARAM_IDS + 模型支持的上半身可选参数）。 */
@@ -238,6 +259,7 @@ export class Live2DStage {
     // Cubism 对未知 id 也会给虚拟索引。
     this.bodyParams = Object.create(null);
     this.bodySupport = Object.create(null);
+    this.bodyParamRanges = Object.create(null);
     this.bodyOnlyParamIds = [];
     this.paramIds = PARAM_IDS.slice();
     for (const id of BODY_PARAM_IDS) {
@@ -246,6 +268,8 @@ export class Live2DStage {
       if (!supported) continue;
       if (!this.paramIds.includes(id)) this.paramIds.push(id);
       if (!PARAM_IDS.includes(id)) this.bodyOnlyParamIds.push(id);
+      const range = this._readParamRange(internal.coreModel, id);
+      if (range) this.bodyParamRanges[id] = range;
     }
 
     this.ready = true;
@@ -324,6 +348,35 @@ export class Live2DStage {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * 模型对某个参数声明的 {def, min, max}；读不到返回 null（写入时退化为不缩放）。
+   * 参数 id 表与最小/最大/默认值数组在 core 的同一个 struct 里，下标一一对应。
+   */
+  _readParamRange(core, id) {
+    if (!core) return null;
+    try {
+      const ids = core._parameterIds ?? core._model?.parameters?.ids ?? core.parameters?.ids ?? [];
+      const struct = core._model?.parameters ?? core.parameters ?? null;
+      const index = ids.indexOf(id);
+      if (index < 0 || !struct) return null;
+      const min = struct.minimumValues?.[index];
+      const max = struct.maximumValues?.[index];
+      let def = struct.defaultValues?.[index];
+      if (!Number.isFinite(def)) def = core.getParameterDefaultValue?.(core.getParameterIndex(id));
+      def = Number.isFinite(def) ? def : 0;
+      if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+      return { def, min, max };
+    } catch {
+      return null;
+    }
+  }
+
+  /** 上半身参数：契约单位（±30）→ 模型实际量程（读不到量程就原样写，保持旧行为）。 */
+  _mapBodyValue(id, value) {
+    const range = this.bodyParamRanges?.[id];
+    return range ? toModelRange(value, BODY_ANGLE_LIMIT, range) : value;
   }
 
   /** 模型自身的参数默认值（断线后回到中性用）。 */
@@ -425,7 +478,8 @@ export class Live2DStage {
         if (Math.abs(goal - value) < 0.0005) value = goal;
       }
       this.currentParams[id] = value;
-      values[id] = value;
+      // ParamBodyAngleX 属于上半身契约（±30 量程）：写进模型前按实际量程等比缩放
+      values[id] = id === "ParamBodyAngleX" ? this._mapBodyValue(id, value) : value;
     }
 
     // 上半身：在头部参数之后叠加（ParamBodyAngleX 相加后 clamp，其余写可选参数）。
@@ -440,9 +494,12 @@ export class Live2DStage {
       const smoothed = bodyAlpha >= 1 ? torsoX : previous + (torsoX - previous) * bodyAlpha;
       this.currentTorsoX = Math.abs(torsoX - smoothed) < 0.0005 ? torsoX : smoothed;
       const headX = this.currentParams.ParamBodyAngleX;
-      values.ParamBodyAngleX = combineBodyAngleX(
-        typeof headX === "number" && Number.isFinite(headX) ? headX : 0,
-        this.currentTorsoX,
+      values.ParamBodyAngleX = this._mapBodyValue(
+        "ParamBodyAngleX",
+        combineBodyAngleX(
+          typeof headX === "number" && Number.isFinite(headX) ? headX : 0,
+          this.currentTorsoX,
+        ),
       );
     }
     for (const id of this.bodyOnlyParamIds) {
@@ -456,7 +513,8 @@ export class Live2DStage {
         if (Math.abs(goal - value) < 0.0005) value = goal;
       }
       this.currentParams[id] = value;
-      values[id] = value;
+      // 契约单位（±30）→ 模型实际量程（Haru 的 ParamArmLA 是 [-1,1]，不缩放会 clamp 死）
+      values[id] = this._mapBodyValue(id, value);
     }
     return values;
   }

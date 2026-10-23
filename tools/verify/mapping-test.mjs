@@ -498,7 +498,8 @@ test('upper body: BODY_LANDMARK_ORDER / BODY_BONES match CommonData (§5.3)', ()
     [...api.BODY_PARAM_IDS],
     ['ParamBodyAngleX', 'ParamBodyAngleY', 'ParamBodyAngleZ',
      'ParamArmLA', 'ParamArmRA', 'ParamArmLB', 'ParamArmRB',
-     'ParamShoulderL', 'ParamShoulderR']
+     'ParamShoulderL', 'ParamShoulderR',
+     'ParamHandL', 'ParamHandR', 'ParamHandAngleL', 'ParamHandAngleR']
   );
 });
 
@@ -579,9 +580,14 @@ test('upper body skeleton (§8.5): elbow bend -> ParamArmLB/RB, symmetric sign, 
   close(bent.params.ParamArmRB, 18, 1e-9, 'ParamArmRB (mirror-symmetric)');
   close(bent.metrics.elbowBendL, 90, 0.01, 'elbowBendL');
   close(bent.metrics.elbowBendR, 90, 0.01, 'elbowBendR');
+  // 手 = 前臂朝向的近似（侧别镜像后两侧同号），ParamHandL/R 与别名 ParamHandAngleL/R 同值
+  close(bent.params.ParamHandL, 18, 1e-9, 'ParamHandL = 90/150*30');
+  close(bent.params.ParamHandR, 18, 1e-9, 'ParamHandR');
+  close(bent.params.ParamHandAngleL, bent.params.ParamHandL, 1e-12, 'ParamHandAngleL alias');
   const straight = api.mapBody([0, 0], makeUb());
   close(straight.params.ParamArmLB, 0, 1e-12, 'straight elbow = 0');
   close(straight.params.ParamArmRB, 0, 1e-12, 'straight elbow R = 0');
+  close(straight.params.ParamHandL, 0, 1e-12, 'hanging hand = 0');
 });
 
 test('upper body skeleton (§8.5): clavicle differential -> ParamShoulderL/R opposite signs', () => {

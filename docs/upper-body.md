@@ -211,8 +211,10 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
     不互相覆盖。
   - 输出参数（骨骼驱动，协议 §8.5）：`ParamBodyAngleX/Y/Z`（躯干）、`ParamArmLA/RA`
     （上臂抬起角）、`ParamArmLB/RB`（肘屈曲，正 = 屈肘）、`ParamShoulderL/R`（锁骨差动，
-    正 = 该侧肩抬起）。模型没有的由 `live2d.js` 跳过。
-    `ParamHandL/R` 协议没有可靠数据源（13 点里没有手部关键点），参考实现**不输出**，留给以后扩展。
+    正 = 该侧肩抬起）、`ParamHandL/R` + 别名 `ParamHandAngleL/R`（手：前臂朝向的近似，
+    协议没有手部关键点，只保证手跟着胳膊走）。模型没有的由 `live2d.js` 跳过。
+  - 写进模型前由 `live2d.js` 的 `toModelRange()` 把 ±30 契约量程**等比映射到模型实际
+    参数量程**（Haru 的 `ParamArmLA` 是 [-1,1]，直接写 27 会被 clamp 到极值、动作钉死）。
 - `renderer/app.js`：每帧 `readUpperBodyTrack` → `mapBody` → `smoothBodyParams`，喂给 stage；
   `__vfcDebug.body` 暴露原始帧 / ageMs / torso / armAngle / elbowBend / clavicleRelTilt / 参数；
   调试骨架 canvas 也在这里（`D` 键或 `?skeleton=1`，低可见度点灰显，`ubOk=false` 灰显最后一帧）。

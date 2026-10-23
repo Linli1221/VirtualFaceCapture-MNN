@@ -33,7 +33,7 @@ import {
   readUpperBodyTrack,
   smoothBodyParams,
 } from "../renderer/mapping.js";
-import { Live2DStage } from "../renderer/live2d.js";
+import { Live2DStage, toModelRange } from "../renderer/live2d.js";
 import { buildUpperBody } from "./mock-body.js";
 import {
   PoseOffsetCollector,
@@ -810,6 +810,8 @@ await test("mapBody：中性肩线 + 双臂下垂 → 所有参数 0", () => {
   near(mapped.params.ParamArmRB, 0);
   near(mapped.params.ParamShoulderL, 0);
   near(mapped.params.ParamShoulderR, 0);
+  near(mapped.params.ParamHandL, 0);
+  near(mapped.params.ParamHandR, 0);
   near(mapped.metrics.armAngleL, 0);
   near(mapped.metrics.armAngleR, 0);
   near(mapped.metrics.elbowBendL, 0);
@@ -963,6 +965,9 @@ await test("mapBody：肘弯曲 → ParamArmLB/RB 两侧同号，伸直为 0", (
   );
   near(bent.params.ParamArmLB, 18); // 90/150*30
   near(bent.params.ParamArmRB, 18);
+  near(bent.params.ParamHandL, 18); // 前臂水平 → 手部参数同向跟随
+  near(bent.params.ParamHandR, 18);
+  near(bent.params.ParamHandAngleL, 18); // Haru 的别名参数同值
   near(bent.metrics.elbowBendL, 90, 0.01);
   near(bent.metrics.elbowBendR, 90, 0.01);
   // 满量程与系数可调
@@ -1158,6 +1163,43 @@ await test("Live2DStage：上半身参数按 ~0.16s 低通（不直接跳变）�
   assert.ok(eased > 10 && eased < 20, "两帧之间应缓动，而不是直接跳到 20");
   stage.setBodyParams({ ParamArmLA: 20 });
   near(stage._computeFrameValues(2000, true).ParamArmLA, 20); // 截图 / 单步：立即落位
+});
+
+await test("toModelRange：契约 ±30 量程等比映射到模型实际量程（Haru ParamArmLA 是 [-1,1]）", () => {
+  // Haru 的手臂参数 [-1,1]：27/30 → 0.9，不再被 clamp 到极值
+  near(toModelRange(27, 30, { def: 0, min: -1, max: 1 }), 0.9, 1e-9);
+  // 肘参数 [-1,5]：18/30 → 3（旧行为直接写 18 会被 clamp 到 5）
+  near(toModelRange(18, 30, { def: 0, min: -1, max: 5 }), 3, 1e-9);
+  // 负值往 min 侧映射；非零默认值为 0 点
+  near(toModelRange(-30, 30, { def: 2, min: -3, max: 7 }), -3, 1e-9);
+  near(toModelRange(30, 30, { def: 2, min: -3, max: 7 }), 7, 1e-9);
+  near(toModelRange(0, 30, { def: 2, min: -3, max: 7 }), 2, 1e-9);
+  // 超量程输入先 clamp 到 ±1；坏数据不抛异常
+  near(toModelRange(90, 30, { def: 0, min: -1, max: 1 }), 1, 1e-9);
+  near(toModelRange(Number.NaN, 30, { def: 0, min: -1, max: 1 }), 0, 1e-9);
+});
+
+await test("Live2DStage：有量程信息时按模型量程缩放写入，无量程时保持旧行为", () => {
+  const stage = makeBodyStage(["ParamArmLA", "ParamArmLB"]);
+  stage.bodyParamRanges = {
+    ParamArmLA: { def: 0, min: -1, max: 1 },
+    ParamArmLB: { def: 0, min: -1, max: 5 },
+    ParamBodyAngleX: { def: 0, min: -10, max: 10 },
+  };
+  stage.setTargetParams({});
+  stage.setBodyParams({ ParamArmLA: 27, ParamArmLB: 18 });
+  const values = stage._computeFrameValues(1000, true);
+  near(values.ParamArmLA, 0.9, 1e-9);
+  near(values.ParamArmLB, 3, 1e-9);
+  // ParamBodyAngleX：头部 12 + 躯干 9 = 21（±30 契约）→ 7（±10 量程）
+  stage.setTargetParams({ ParamBodyAngleX: 12 });
+  stage.setBodyParams({ ParamBodyAngleX: 9 });
+  near(stage._computeFrameValues(2000, true).ParamBodyAngleX, 7, 1e-9);
+  // 无量程信息（老 stub / 测试场景）：原样写
+  const plain = makeBodyStage(["ParamArmLA"]);
+  plain.setTargetParams({});
+  plain.setBodyParams({ ParamArmLA: 27 });
+  near(plain._computeFrameValues(1000, true).ParamArmLA, 27);
 });
 
 console.log("[selftest] tools/mock-body.js · mock 手机端的上半身合成数据");

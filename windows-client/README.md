@@ -179,7 +179,7 @@ models/<名字>/<xxx>.model3.json     # 必须包含 moc3 / textures / physics3.
 
 头部姿态用**自适应归一化**（协议 §8.2）：按当前会话观察到的最大幅度动态缩放，
 首帧不会打满。模型缺少的参数不会报错（`__vfcDebug.missingParams` 可查）。
-上半身（躯干 + 肩/手臂/肘运动骨骼）的 9 个可选参数见下一节，同样「模型没有就跳过」。
+上半身（躯干 + 肩/手臂/肘/手运动骨骼）的 13 个可选参数见下一节，同样「模型没有就跳过」。
 注意 Cubism 会按模型自身的参数范围 clamp（例如 ATRI 的 `ParamMouthForm` 范围是 `[-1,0]`），
 所以「下发的目标值」与「引擎最终值」可能不同——调试面板里两个都显示。
 
@@ -205,11 +205,16 @@ PC 端自动消费，不需要任何开关：
 | ParamArmLA / ParamArmRA | `clamp(肩→腕与竖直向下的夹角 / 150°, 0, 1) * 30`（上臂抬起，左/右独立） |
 | ParamArmLB / ParamArmRB | `clamp(肘屈曲 / 150°, -1, 1) * 30`（前臂相对上臂，**正 = 屈肘**） |
 | ParamShoulderL / ParamShoulderR | `clamp(锁骨差动 / 25°, -1, 1) * 30`（肩线相对髋线，**正 = 该侧肩抬起**，左右反号） |
+| ParamHandL / ParamHandR（别名 ParamHandAngleL/R） | `clamp(前臂朝向 / 150°, -1, 1) * 30`（手部旋转的近似） |
 
 13 点先换算成**上半身运动骨骼**（`buildUpperBodySkeleton()`：脊柱 → 锁骨 → 上臂 → 前臂，
 角度都是相对父骨的旋转）再映射到上表：躯干跟着倾斜时手臂不会被误读成「抬起」，整体侧倾
-（肩髋同倾）也不会重复计数进 `ParamShoulderL/R`。`ParamHandL/R` 不输出——13 点里没有
-手部关键点，腕关节朝向无从测量（不造数据）。
+（肩髋同倾）也不会重复计数进 `ParamShoulderL/R`。手部参数是**前臂朝向的近似**——13 点里
+没有手部关键点，只保证「手跟着胳膊走」，不是真实手腕旋转。
+
+**量程自适应（重要）**：上表输出的是 ±30 契约量程，写进模型时 `live2d.js` 会按模型
+**实际声明的参数量程等比缩放**（`toModelRange`）：Haru 的 `ParamArmLA` 量程是 [-1,1]、
+Hiyori 是 [-10,10]，不缩放的话写入值会被 Cubism clamp 到极值，手臂「钉死」不跟手动。
 
 - **丢失时不跳变**：`ubOk=false`、字段缺失，或 `ubT` 超过 **1.5 s** 没有新值 → 参数按帧向 0
   衰减（每帧 ×0.85，约 0.3 s 回到模型默认），然后把控制权交还给 idle motion / breath。
@@ -230,7 +235,8 @@ PC 端自动消费，不需要任何开关：
   `ParamArmLA/RA`、`ParamArmLB/RB`（肘）与 `ParamBodyAngleX/Y/Z`（cdi3 参数表已核对），
   导入后 `?model=Haru` / `?model=Hiyori` 即可看到肩 / 手臂 / 肘跟着骨架动。
   注意：Hiyori 只有单参数 `ParamShoulder`（不是 `ParamShoulderL/R`），锁骨差动对不上、
-  不驱动；`ParamHandL/R`（Hiyori 有）依旧不驱动——13 点协议没有手部关键点。
+  不驱动；手部参数两个模型都能驱动（Haru 走别名 `ParamHandAngleL/R`、Hiyori 走
+  `ParamHandL/R`），是前臂朝向的近似。
 - **调试骨架**：按 `D` 打开调试面板（或 URL 加 `?skeleton=1`），画布右下角出现 13 点 /
   15 条边（与 `CommonData.UpperBodySkeleton.BONES` 一致）的骨架，直接画在归一化坐标上；
   低可见度点灰显，`ubOk=false` 时整具骨架灰显并显示「无上半身数据」或「过期」。
