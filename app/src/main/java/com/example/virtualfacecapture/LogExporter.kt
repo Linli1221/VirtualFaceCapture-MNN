@@ -27,8 +27,8 @@ import java.util.zip.ZipOutputStream
  * device-info.txt      机型 / 系统 / ABI / 屏幕 / 内存 / 语言
  * app-info.txt         版本、构建类型、进程、日志状态
  * logs/vfc.log ...     [VfcLog] 落盘的应用日志（含轮转文件）
- * dump/*.ppm           检测器首帧 dump（如果本次运行生成过）
- * prefs/*.xml          应用 SharedPreferences（相机选择等）
+ * dump/<ts>.ppm        检测器首帧 dump（如果本次运行生成过）
+ * prefs/<name>.xml     应用 SharedPreferences（相机选择等）
  * ```
  *
  * 只打包 App 自己能读到的内容：**不包含 logcat / native 日志 / tombstone**，
