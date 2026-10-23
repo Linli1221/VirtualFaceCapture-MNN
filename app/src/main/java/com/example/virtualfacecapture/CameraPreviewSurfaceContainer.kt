@@ -3,6 +3,7 @@ package com.example.virtualfacecapture
 import android.content.Context
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.Surface
 import android.view.TextureView
@@ -175,6 +176,12 @@ class CameraPreviewSurfaceContainer @JvmOverloads constructor(
      * 缩放 / 平移到最终位置（Matrix 的 post* 按书写顺序依次施加）。
      */
     private fun updateTransform() {
+        // 几何同步可能来自相机回调线程（onCameraChanged）；View 操作只能在 UI 线程，
+        // 这里统一切回主线程，重入也只是多算一次（每帧只在几何变化时触发）。
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            post { updateTransform() }
+            return
+        }
         val bufferW = frameWidth.toFloat()
         val bufferH = frameHeight.toFloat()
         val viewW = textureView.width.toFloat()
