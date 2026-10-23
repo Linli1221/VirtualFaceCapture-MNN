@@ -1,0 +1,128 @@
+# PR 被合并后，自动删除该 PR 的源分支（head branch）。
+#
+# 触发：
+#   - pull_request: closed —— 只处理「已合并」（merged == true）的 PR；
+#     直接 Close 但不合并的 PR，分支会保留（改动可能还要用）
+#   - workflow_dispatch —— 手动删一个指定分支，方便验证脚本本身
+#
+# 不会删除的情况（都按「正常跳过」处理，不会把 workflow 搞红）：
+#   - fork 来的 PR：GITHUB_TOKEN 在 fork PR 上恒为只读，且分支不在本仓库里
+#   - 主干 / 保护分支：master、main、develop、release/*、hotfix/*
+#   - 分支已经不存在（幂等，重复跑也安全）
+#
+# 权限：contents: write（删除 git ref 属于写操作）
+#
+# 更省事的等价方案：仓库 Settings → General → Pull Requests →
+#   勾选 "Automatically delete head branches"，由 GitHub 服务端直接处理，不用跑 workflow。
+#   两种都开也不冲突：本 workflow 撞到已被删除的分支会直接跳过。
+#
+# 失败语义：真正意料之外的错误（权限不足 403、仓库/分支名异常）才会 exit 1，
+#   其余情况只打 ::notice:: / ::warning::，避免合并后在 PR 上留下莫名其妙的红叉。
+name: Auto Delete Merged Branch
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要删除的分支名（不含 refs/heads/ 前缀）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  delete-head-branch:
+    name: Delete merged head branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # 手动触发无条件执行；PR 事件必须同时满足「已合并」+「源分支属于本仓库」
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true && github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - name: Resolve branch name
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            branch="${INPUT_BRANCH#refs/heads/}"
+            source="手动触发"
+          else
+            branch="${PR_HEAD_REF#refs/heads/}"
+            source="PR #${PR_NUMBER} 合并"
+          fi
+
+          if [ -z "$branch" ]; then
+            echo "::error::解析不到分支名（PR_HEAD_REF / inputs.branch 都是空的）"
+            exit 1
+          fi
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "目标分支：$branch（$source）"
+
+      - name: Delete branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          SOURCE: ${{ steps.target.outputs.source }}
+        run: |
+          set -euo pipefail
+
+          # 主干 / 保护分支永不删除
+          protected='^(master|main|develop|development|release/.+|hotfix/.+)$'
+          if [[ "$BRANCH" =~ $protected ]]; then
+            echo "::notice::「$BRANCH」是主干/保护分支，跳过删除"
+            {
+              echo "### 自动删除合并分支"
+              echo ""
+              echo "「$BRANCH」属于主干/保护分支，已跳过（$SOURCE）。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "删除 repos/$REPO/git/refs/heads/$BRANCH ..."
+          set +e
+          out=$(gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" 2>&1)
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            echo "::notice::已删除分支「$BRANCH」"
+            status="✅ 已删除"
+            detail="分支 \`$BRANCH\` 已删除。"
+          elif grep -qiE 'reference does not exist|not found' <<< "$out"; then
+            # 已经被 GitHub 的 "Automatically delete head branches" 或人工删掉了
+            echo "::notice::分支「$BRANCH」已不存在，无需删除"
+            status="⏭️ 已不存在"
+            detail="分支 \`$BRANCH\` 在删除前就已不存在。"
+          elif grep -qiE 'protected|forbidden|Permission' <<< "$out"; then
+            # 分支保护规则拦住了删除，这属于仓库配置问题，不该让合并结果变红
+            echo "::warning::分支「$BRANCH」删不掉（受保护或 token 权限不足）：$out"
+            status="⚠️ 跳过"
+            detail="分支 \`$BRANCH\` 受保护或 token 权限不足，未删除。"
+          else
+            echo "::error::删除分支「$BRANCH」失败（exit $rc）：$out"
+            exit 1
+          fi
+
+          {
+            echo "### 自动删除合并分支"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 分支 | \`$BRANCH\` |"
+            echo "| 来源 | $SOURCE |"
+            echo "| 结果 | $status |"
+            echo ""
+            echo "$detail"
+          } >> "$GITHUB_STEP_SUMMARY"
