@@ -36,6 +36,7 @@ import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
+import kotlin.math.roundToLong
 
 class GoldenParityTest {
 
