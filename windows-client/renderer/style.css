@@ -387,6 +387,25 @@ button:disabled {
   color: var(--warn);
 }
 
+/* ── raw 链校准控制（task-4）：6 个按钮两行排布，提示文案复用 calib-hint 的语义色 ── */
+#raw-calib-box .calib-actions {
+  flex-wrap: wrap;
+}
+
+#raw-calib-box .calib-actions button {
+  flex: 1 1 30%;
+}
+
+#raw-calib-hint {
+  margin-top: 7px;
+  white-space: normal;
+}
+
+#raw-calib-hint[data-tone="active"] { color: var(--accent); }
+#raw-calib-hint[data-tone="ok"] { color: var(--ok); }
+#raw-calib-hint[data-tone="warn"] { color: var(--warn); }
+
+
 button.active {
   background: rgba(255, 93, 108, 0.18);
   border-color: rgba(255, 93, 108, 0.5);

@@ -54,6 +54,32 @@ import {
   updateBodyStateFromTrack,
 } from "./mapping.js";
 import { Live2DStage, checkEnvironment } from "./live2d.js";
+import { WindowsPostPipeline } from "./windows-post-pipeline.js";
+
+// ═══════════════════════════════════════════════════════════════════════
+// raw_track 新链（task-4）与现有模块的职责边界 —— 改动前先读这段：
+//
+//   windows-post-pipeline.js（新，编排器）
+//     decode raw_track 二进制帧 → frameId 重排 → 丢过期 → dt → 点域 TimeBasedEMA
+//     → BlendShape 提取 → 姿态/表情校准 → 眨眼状态机 → 上半身融合
+//     （以上在 Web Worker / 同步回退里跑，task-3 的 7 个新模块是算法本体）
+//     → 主线程 mapFrame（本文件）→ 固定 500ms playout（全链唯一人为延迟）→ onPlayout。
+//
+//   mapping.js    —— 仍是「参数映射」唯一归属：52 维 bs → 表情参数、pose 归一化
+//                    （AdaptiveAngleNormalizer）→ ParamAngle*、上半身 mapBody。
+//                    raw 链与 v1 文本链**共用同一个 mapper 单实例**（这就是参数映射
+//                    留在主线程的原因，见 windows-post-pipeline.js 头部偏差说明）。
+//   calibrate.js  —— pcOffset（OffsetRamp / 一键校准 / 按角色 profile）仍是「本地显示
+//                    校准」的唯一归属；raw 链里它只做加法（相对角已由 pose-calibrator
+//                    减过基线），**绝不重复减基线**。CalibFile 的 pose.pcOffset /
+//                    rangeScale 维度与这里的 profile 同源。
+//   filter.js     —— 渲染侧观感低通（live2d.js 每帧消费），不属于输入链；raw 链的
+//                    「时间滤波」在 478 点域（temporal-filter.js，提取之前），两者不叠加。
+//   interp.js     —— 播放时间轴不动（v1 jitterBufferV1 行为完全不变）；raw 模式下由
+//                    applyRawStageProfile() 把深度档切到最小口径，只留小抖动插值。
+//
+//   v1 文本 track 路径（feedTrack）：逐字节不变，按 feature 协商与 raw 路径互斥。
+// ═══════════════════════════════════════════════════════════════════════
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws";
 const RECONNECT_DELAYS_MS = [500, 1000, 2000, 5000];
@@ -110,7 +136,13 @@ const TARGET_FPS = parseTargetFps(query.get("fps"));
  * 仍保留自己的 500 ms 发送缓冲（回滚路径完整，两步都能退回去）。
  */
 const JITTER_BUFFER_ENABLED = query.get("jb") !== "0";
-const CLIENT_FEATURES = [...(JITTER_BUFFER_ENABLED ? ["jitterBufferV1"] : []), "upperBodyPostV1"];
+/**
+ * rawTrackV1（协议 docs/raw-track-protocol.md §2）：本客户端实现 raw_track 二进制解析
+ * 与 Windows 侧完整后处理。协商成功且 startStream(rawMode=rawTrackV1) 后手机发二进制帧；
+ * 任一方未声明则保持 v1 文本 JSON track（老语义逐字节不变）。
+ */
+const RAW_TRACK_FEATURE = "rawTrackV1";
+const CLIENT_FEATURES = [...(JITTER_BUFFER_ENABLED ? ["jitterBufferV1"] : []), "upperBodyPostV1", RAW_TRACK_FEATURE];
 
 const ui = {
   root: document.getElementById("ui"),
@@ -225,6 +257,20 @@ const state = {
   body: createBodyState(),
   /** 头部 + 上半身合并后的参数表（真正写 core 由 live2d.js 叠加；这里给调试 / __vfc 看）。 */
   mergedParams: null,
+  // ---- raw_track 新链（task-4）----
+  /** 双模互斥状态机（协议 §2.2）：null=未定；"raw"=二进制 raw_track；"legacy"=文本 track。
+   *  由「最近收到的消息形态」驱动，同一时刻只消费一种 track 语义。 */
+  trackMode: null,
+  /** 手机 hello 是否声明 rawTrackV1（协议 §2.1）。 */
+  phoneRawCapable: false,
+  /** 已请求 startStream(rawMode=rawTrackV1) 的 requestId（ack 配对）。 */
+  rawStartRequestId: null,
+  /** raw 链统计（reorder 丢帧 / playout 深度 / 校准态；publishDebug 填充）。 */
+  rawStats: null,
+  /** worker 降级提示只弹一次。 */
+  rawFallbackShown: false,
+  /** 当前会话的 cameraProfile（hello 元数据；CalibFile 维度之一）。 */
+  cameraProfile: null,
 };
 
 const mapper = createMapper();
@@ -393,6 +439,8 @@ class TrackerClient {
       return;
     }
     this.socket = socket;
+    // raw_track 走 WS 二进制帧（RFC6455 opcode 0x2）：直接收 ArrayBuffer，零拷贝转交 worker
+    socket.binaryType = "arraybuffer";
     this.lastInboundAt = Date.now();
     this.handlers.onStatus?.({ phase: "connecting", attempt: this.attempt });
 
@@ -486,6 +534,18 @@ class TrackerClient {
   }
 
   handleMessage(raw) {
+    // raw_track 二进制分支（协议 §1.2：控制面文本 / 追踪数据二进制，两种 track 语义互斥）。
+    // 必须在 JSON.parse 之前分流：ArrayBuffer 是二进制帧；Blob 兜底（binaryType 未生效时）。
+    if (raw instanceof ArrayBuffer) {
+      this.handlers.onBinary?.(raw);
+      return;
+    }
+    if (typeof Blob !== "undefined" && raw instanceof Blob) {
+      raw.arrayBuffer().then((buffer) => this.handlers.onBinary?.(buffer)).catch(() => {
+        state.badMessages += 1;
+      });
+      return;
+    }
     let message;
     try {
       message = JSON.parse(raw);
@@ -543,6 +603,11 @@ const client = new TrackerClient({
     state.connected = true;
     // 新会话：播放时间轴重新预缓冲（jitterBufferV1 的 primed 复位，见 interp.js）
     stage.resetTimeline();
+    // raw 链会话边界：清双模状态机，等 hello 协商（协议 §2.2）
+    state.trackMode = null;
+    state.phoneRawCapable = false;
+    state.rawStartRequestId = null;
+    rawPipeline.reset("connect", true);
     setStatus("已连接，等待数据…", "connected");
     ui.btnConnect.textContent = "断开";
     publishDebug();
@@ -558,6 +623,9 @@ const client = new TrackerClient({
     resetBodyState();
     // 断线也清时间轴：重连后重新预缓冲，不会把断线前的旧样本接着播
     stage.resetTimeline();
+    // raw 链同样清干净（重排缓冲 / playout 队列 / 时间锚点；校准基线按 §6 保留）
+    state.trackMode = null;
+    rawPipeline.reset("disconnect", true);
     if (stage.ready) stage.relax();
     if (info?.manual) {
       setStatus("未连接", "idle");
@@ -587,6 +655,23 @@ const client = new TrackerClient({
     state.faceMissingSince = null;
     state.device = typeof message.device === "string" ? message.device : "";
     state.phoneApp = typeof message.app === "string" ? message.app : "";
+    // rawTrackV1 协商（协议 §2.1/§2.3）：手机 hello 声明 rawTrackV1 且客户端也声明
+    // → 发 startStream(rawMode=rawTrackV1) 显式指定；未声明则保持 v1 文本 track。
+    state.phoneRawCapable = message.rawTrackV1 === true;
+    state.trackMode = null;
+    rawPipeline.reset("hello", false); // 新会话：全部后处理状态重置（含校准运行态）
+    if (state.phoneRawCapable) {
+      const requestId = `raw-${Date.now().toString(36)}`;
+      state.rawStartRequestId = requestId;
+      client.send({ type: "startStream", rawMode: "rawTrackV1", requestId });
+    }
+    // cameraProfile（CalibFile 维度之一）：机型 + 镜头朝向元数据（手机 app 版本一并留档）
+    state.cameraProfile = {
+      device: state.device || null,
+      app: state.phoneApp || null,
+      negotiated: state.phoneRawCapable ? "rawTrackV1" : "legacy",
+    };
+    maybeLoadCalibrationFile();
     const version = Number(message.version);
     if (Number.isFinite(version) && version !== 1) {
       showError(`协议版本不一致：手机为 v${version}，本客户端为 v1（仍会尝试按 v1 读取 track）`);
@@ -595,8 +680,26 @@ const client = new TrackerClient({
     updateMeta();
     publishDebug();
   },
+  onBinary(buffer) {
+    // raw_track 二进制帧（协议 §4）：直接进 Windows 后处理链（worker 零拷贝移交）
+    if (state.frozen) return;
+    if (state.trackMode === "legacy") {
+      // 互斥状态机（协议 §2.2）：同一会话不允许混发两种 track 语义，收到二进制即切 raw
+      setCalibHint("同一连接从文本 track 切换到 raw_track 二进制模式（协议只允许一种 track 语义）。", "warn");
+    }
+    if (state.trackMode !== "raw") {
+      state.trackMode = "raw";
+      applyRawStageProfile(true); // raw 模式：时间轴切 jitterBuffer 最小口径（interp.js 本身不改）
+    }
+    rawPipeline.handleRawFrame(buffer, performance.now());
+  },
   onTrack(message) {
     if (state.frozen) return; // 冻结时保留 __vfc.applyTrack 手动喂的值
+    // v1 文本 track 路径（逐字节不变）：rawTrackV1 未协商 / 降级时走这里
+    if (state.trackMode !== "legacy") {
+      state.trackMode = "legacy";
+      applyRawStageProfile(false); // 恢复 jitterBufferV1 原行为（红线：v1 路径不许退化）
+    }
     feedTrack(message);
   },
   onCalib(message) {
@@ -700,6 +803,237 @@ function feedTrack(track) {
   return true;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────
+// raw_track 新链路总装（task-4 P3）：WS 二进制帧 → Windows 后处理链 → 参数上屏
+//
+// 数据流（docs/post-pipeline-migration.md §4 的 12 步；步骤 2~9 在 worker）：
+//   socket.onmessage(ArrayBuffer) → onBinary → rawPipeline.handleRawFrame()
+//     → [worker] decode → frameId 重排 → 丢过期 → dt → 点域 TimeBasedEMA → 提取
+//        → 校准 → 眨眼 → 上半身融合 → frame-result（Transferable 回主线程）
+//     → mapRawFrame()（本节：pcOffset + mapper + body 状态，与 v1 的 feedTrack 同一套）
+//     → PlayoutBuffer 固定 500ms（全链唯一人为延迟）
+//     → deliverRawParams() → stage.pushTrackParams() / setBodyParams()（interp.js 插值）
+//
+// v1 文本 track 的 feedTrack 路径一行未动；两条路径的「映射 → 上屏」共用同一个
+// mapper / bodyPost / stage 单实例，只是入口与延迟语义不同（v1 = jitterBufferV1
+// 自适应深度；raw = 固定 500ms playout + 时间轴最小口径）。
+// ─────────────────────────────────────────────────────────────────────────
+
+/** raw 链固定 playout 延迟（ms）：全链唯一人为延迟（迁移文档 §4 第 11 步 / 裁决 3）。 */
+const RAW_PLAYOUT_DELAY_MS = 500;
+
+/** CalibFile 的 localStorage key：model + cameraProfile 维度（docs §6.2）。 */
+function calibFileKey() {
+  const cp = state.cameraProfile ?? {};
+  const profile = [cp.device ?? "unknown", cp.app ?? "unknown"].join("|");
+  return `vfc.calib.${state.modelName ?? "default"}.${profile}`;
+}
+
+const rawPipeline = new WindowsPostPipeline({
+  playoutDelayMs: RAW_PLAYOUT_DELAY_MS,
+  mapFrame: mapRawFrame,
+  onPlayout: deliverRawParams,
+  onCalibState: handleRawCalibState,
+  onStats(stats) {
+    state.rawStats = stats;
+  },
+  onError(error) {
+    // worker 降级提示只弹一次；同步回退路径照常出画（docs 裁决 5）
+    if (!state.rawFallbackShown) {
+      state.rawFallbackShown = true;
+      setCalibHint(`后处理 worker 不可用，已降级到同步路径（${error.code ?? "fallback"}）：画面不受影响，性能略降。`, "warn");
+    }
+    publishDebug();
+  },
+});
+
+/**
+ * raw 帧的「映射段」（步骤 10）——与 v1 的 feedTrack 同一套公式：
+ *   最终角度 = result.pose（**已减 Windows 姿态基线**）+ pcOffset
+ * 注意基线语义：v1 的 track.pose 是手机减过基线；raw 的 result.pose 是 Windows 的
+ * pose-calibrator 减过基线（relativePose）。pcOffset 依旧只做加法，绝不重复减基线。
+ */
+function mapRawFrame(result) {
+  const now = performance.now();
+  // ---- 本地姿态偏移（PC 端显示校准，叠加在基线之上）----
+  const rampDtMs = state.lastPoseRampAt == null ? 0 : now - state.lastPoseRampAt;
+  state.lastPoseRampAt = now;
+  if (!state.poseRamp.settled) state.poseOffset = state.poseRamp.sample(rampDtMs);
+  const pose = applyPoseOffset(result.pose, state.poseOffset);
+  // 可选缓慢自适应（默认关）：读 track-shaped 视图（{pose, bs, face}），与 v1 同一实现
+  if (state.poseAdaptive.enabled) maybeAdaptOffset({ pose: result.pose, bs: result.bs52, face: result.faceValid });
+
+  const mapped = mapper.apply(result.bs52, pose);
+
+  // ---- 上半身：body-fusion 已完成 One-Euro/躯干基线（等价 v1 的 ubRaw 后处理完成）----
+  // 这里只走 mapBody + smoothBodyParams 三层回退（updateBodyStateFromTrack 的
+  // 「已处理」分支：raw 不置位，不再跑 bodyPost）。
+  const body = updateBodyState(
+    {
+      ub: result.ub?.points ?? undefined,
+      body: result.ub?.torso ?? undefined,
+      ubOk: Boolean(result.ub?.tracking),
+      ubT: result.ub?.ubT,
+      raw: false,
+    },
+    now,
+  );
+
+  state.lastResult = mapped;
+  state.lastAppliedPose = { pitch: pose[0], yaw: pose[1], roll: pose[2] };
+  state.frames += 1;
+
+  // 一键校准采样器照常收（合成 track 视图与 v1 同形状）
+  if (state.align) state.align.collector.addTrack({ pose: result.pose, bs: result.bs52, face: result.faceValid });
+
+  if (Number.isFinite(result.seq)) state.seq = result.seq;
+  if (Number.isFinite(result.cameraFps)) state.phoneFps = result.cameraFps;
+  if (result.faceValid === false) {
+    state.faceLost = (state.faceLost ?? 0) + 1;
+    if (state.faceMissingSince == null) state.faceMissingSince = now;
+  } else {
+    state.faceMissingSince = null;
+  }
+
+  return {
+    params: mapped.params,
+    bodyParams: body.current,
+    merged: mergeBodyParams(mapped.params, body.current),
+    t: result.t,
+    seq: Number.isFinite(result.seq) ? result.seq : null,
+    frameId: result.frameId,
+  };
+}
+
+/** playout 放行（500ms 后）→ 上屏：与 v1 的 stage 接口完全一致（interp.js 保持不变）。 */
+function deliverRawParams(item) {
+  state.mergedParams = item.merged;
+  stage.pushTrackParams(item.params, performance.now(), item.t, item.seq);
+  stage.setBodyParams(item.bodyParams);
+  publishDebug();
+}
+
+/**
+ * raw 模式 ↔ v1 模式的时间轴口径切换（interp.js **代码不改**，只改运行时 options）：
+ *   - raw：jitterBuffer 最小口径 —— 自适应深度不再叠加（500ms 已由 playout 出），
+ *     只保留小抖动插值与断流外推（稳定 0~33ms / 抖动 ≤66ms / 剧烈 ≤100ms）；
+ *   - v1：恢复进入 raw 前的原始 options（jitterBufferV1 行为逐位不变，回归红线）。
+ */
+let savedTimelineOptions = null;
+function applyRawStageProfile(raw) {
+  const timeline = stage.timeline;
+  if (!timeline?.options) return;
+  if (raw) {
+    if (!savedTimelineOptions) savedTimelineOptions = { ...timeline.options };
+    Object.assign(timeline.options, {
+      depthMinMs: 0,
+      depthStableMaxMs: 33,
+      depthJitterMinMs: 33,
+      depthJitterMaxMs: 66,
+      depthHeavyMinMs: 66,
+      depthHeavyMaxMs: 100,
+      primeTimeoutMs: 200,
+    });
+    timeline.reset(); // 口径切换重建时间轴（不倒带）
+    document.getElementById("raw-calib-box")?.removeAttribute("hidden"); // raw 模式才显示 PC 侧校准面板
+  } else if (savedTimelineOptions) {
+    Object.assign(timeline.options, savedTimelineOptions);
+    savedTimelineOptions = null;
+    timeline.reset();
+    document.getElementById("raw-calib-box")?.setAttribute("hidden", ""); // 回到 v1：PC 侧校准面板收起
+  }
+}
+
+// ---- 校准控制（协议 §6.3：PC 侧 recalibrate；手机只响应 resetTracking/startStream/stopStream）----
+
+/** 校准状态回调（worker / 同步共用）：更新 UI 提示，校准完成自动保存 CalibFile。 */
+function handleRawCalibState(calibState) {
+  const detail = calibState?.detail ?? {};
+  if (calibState?.state === "sampling") {
+    const remain = Math.max(detail.pose?.remainingMs ?? 0, detail.expression?.remainingMs ?? 0);
+    setCalibHint(`正在采样校准（${calibState.target ?? "face"}）… 剩余 ${Math.ceil(remain / 100) / 10}s，请保持自然姿势。`, "muted");
+  } else if (calibState?.state === "done") {
+    setCalibHint("校准完成，基线已生效。", "ok");
+    saveCalibrationFile({ download: false, source: "auto" }); // 保存时机：校准完成时（docs §6.2）
+  } else if (calibState?.state === "cancelled") {
+    setCalibHint("已取消校准（基线保持取消前的值）。", "muted");
+  }
+  renderCalibUi();
+  publishDebug();
+}
+
+/** 重校准（face/body/all）：PC 侧动作，不发手机；requestId 幂等，超时重试换新 id。 */
+function startRawCalibration(target = "face") {
+  const requestId = `${target}-${Date.now().toString(36)}`;
+  rawPipeline.recalibrate(target, requestId);
+  setCalibHint(`开始校准（${target}）：保持自然坐姿约 1 秒…`, "muted");
+  publishDebug();
+}
+
+/** 保存 CalibFile：localStorage（model + cameraProfile 维度）+ 可导出 JSON（docs §6.1）。 */
+async function saveCalibrationFile({ download = true, source = "manual" } = {}) {
+  const file = await rawPipeline.buildCalibrationFile({
+    model: state.modelName ?? "",
+    cameraProfile: state.cameraProfile,
+    pcOffset: state.poseOffsetTarget,
+    rangeScale: state.poseRangeScale,
+    source,
+  });
+  if (!file) {
+    setCalibHint("校准文件生成失败（后处理链未就绪）", "warn");
+    return null;
+  }
+  storeSet(calibFileKey(), JSON.stringify(file));
+  if (download) downloadJson(`vfc-calib-${state.modelName ?? "default"}-${Date.now()}.json`, file);
+  return file;
+}
+
+/** 会话 / 模型切换时注入 CalibFile（localStorage；缺省不动作）。 */
+function maybeLoadCalibrationFile() {
+  const raw = storeGet(calibFileKey());
+  if (!raw) return false;
+  try {
+    const file = JSON.parse(raw);
+    rawPipeline.loadCalibrationFile(file);
+    if (file?.pose?.pcOffset) {
+      applyPoseCalibration(file.pose.pcOffset, { persist: false, resetNormalizers: false, smooth: false });
+    }
+    setCalibHint("已载入本机校准（模型 + 镜头维度）。", "muted");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 恢复默认：清校准文件与全部基线，回到冷启动（自动重采姿态基线）。 */
+function restoreDefaultCalibration() {
+  try {
+    localStorage.removeItem(calibFileKey());
+  } catch { /* ignore */ }
+  rawPipeline.restoreDefaultCalibration();
+  applyPoseCalibration(DEFAULT_POSE_OFFSET, { persist: true, smooth: true });
+  setCalibHint("已恢复默认校准：保持自然坐姿约 1 秒，自动重采姿态基线。", "muted");
+  publishDebug();
+}
+
+/** JSON 导出（浏览器 / Electron 渲染层都可用；校准文件随人走）。 */
+function downloadJson(filename, value) {
+  try {
+    const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch {
+    /* 无下载能力的环境（截图 / 自测）不影响运行 */
+  }
+}
+
 function publishDebug() {
   const result = state.lastResult;
   const params = result?.params ?? null;
@@ -731,6 +1065,27 @@ function publishDebug() {
     lastAlignAt: state.lastAlign ? state.lastAlign.at : null,
     lastAlignSamples: state.lastAlign ? state.lastAlign.samples : null,
     lastAlignSpread: state.lastAlign ? state.lastAlign.spread : null,
+  };
+  // raw_track 新链状态（v1 路径下 trackMode=legacy / rawStats=null，不改变任何旧字段语义）
+  debugState.trackMode = state.trackMode;
+  debugState.rawChain = {
+    phoneRawCapable: state.phoneRawCapable,
+    mode: state.rawStats?.mode ?? (rawPipeline ? rawPipeline.mode : 'unstarted'),
+    workerFallback: Boolean(state.rawStats?.workerFailed),
+    frameId: state.rawStats?.processor?.reorder?.lastEmittedId ?? null,
+    epoch: state.rawStats?.processor?.reorder?.lastEmittedId != null
+      ? state.rawStats.processor.reorder.lastEmittedId >>> 7
+      : null,
+    playout: state.rawStats?.playout ?? null,
+    drops: state.rawStats?.processor
+      ? {
+          badBinary: state.rawStats.processor.badBinaryFrames,
+          expired: state.rawStats.processor.expired,
+          reorder: state.rawStats.processor.reorder?.droppedLate ?? 0,
+          dup: state.rawStats.processor.reorder?.droppedDup ?? 0,
+        }
+      : null,
+    calibrating: state.rawStats?.processor?.calibrating ?? null,
   };
   debugState.poseAdaptive = {
     enabled: state.poseAdaptive.enabled,
@@ -1526,6 +1881,10 @@ function renderDebugGrid() {
     ["输入抖动", fmt(interp.jitterMs, 1) + " ms" + (interp.starvedEpisodes ? ` · 见底 ${interp.starvedEpisodes} 次` : "")],
     ["插值延迟", fmt(interp.delayMs, 1) + " ms" + (interp.active ? " · 插值中" : "")],
     ["缓冲档位", (interp.primed === false ? "预缓冲中 · " : "") + ({ stable: "稳定", jitter: "抖动", heavy: "剧烈" }[interp.depthTier] ?? interp.depthTier ?? "-") + (interp.targetDelayMs != null ? ` · 目标 ${fmt(interp.targetDelayMs, 0)} ms` : "")],
+    ["链模式", state.trackMode === "raw" ? "raw_track 二进制" : state.trackMode === "legacy" ? "v1 文本 track" : "未开始"],
+    ["frameId", debugState.rawChain && debugState.rawChain.frameId != null ? debugState.rawChain.frameId + "（epoch " + debugState.rawChain.epoch + " / seq " + (debugState.rawChain.frameId & 127) + "）" : "-"],
+    ["playout", debugState.rawChain && debugState.rawChain.playout ? debugState.rawChain.playout.queued + " 帧 / " + Math.round(debugState.rawChain.playout.delayMs) + " ms" : "-"],
+    ["raw 丢帧", debugState.rawChain && debugState.rawChain.drops ? "坏帧 " + debugState.rawChain.drops.badBinary + " · 过期 " + debugState.rawChain.drops.expired + " · 旧 " + debugState.rawChain.drops.reorder + " · 重复 " + debugState.rawChain.drops.dup : "-"],
     ["frames", String(state.frames)],
     ["dropped", String(state.dropped)],
     ["缺失参数", (stage.missingParams ?? []).length ? (stage.missingParams ?? []).join(",") : "无"],
@@ -1646,6 +2005,13 @@ function wireUi() {
   });
 
   ui.btnRecalib.addEventListener("click", () => {
+    // 语义分流（协议 §6.3）：raw 模式校准归 Windows（recalibrate 是 PC 内部动作，不发手机）；
+    // v1 文本模式保持旧语义（command:recalibrate 让手机重做中性脸基线）。
+    if (state.trackMode === "raw") {
+      cancelAlign();
+      startRawCalibration("face");
+      return;
+    }
     if (!client.send({ type: "command", name: "recalibrate" })) {
       setStatus("未连接，无法发送重新校准命令", "error");
       return;
@@ -1655,6 +2021,31 @@ function wireUi() {
     mapper.reset();
     setStatus("已发送重新校准命令，等待手机 ack…", "connecting");
     setCalibHint("已让手机重做中性脸基线：校准完成后本地对齐偏移会自动清零，需要再点「一键校准」做最后的对齐。", "active");
+  });
+  // ---- raw 链校准控制（协议 §6.3：开始/取消/重校准/保存/恢复默认，全部 PC 侧）----
+  // 元素在 index.html 的 #raw-calib-box 里；缺失（旧缓存页面）时静默跳过，不影响渲染。
+  const rawCalibActions = {
+    "raw-calib-face": () => startRawCalibration("face"),
+    "raw-calib-body": () => startRawCalibration("body"),
+    "raw-calib-all": () => startRawCalibration("all"),
+    "raw-calib-cancel": () => {
+      rawPipeline.cancelCalibration();
+      setCalibHint("已取消校准（基线保持取消前的值）。", "muted");
+    },
+    "raw-calib-save": async () => {
+      const file = await saveCalibrationFile({ download: true, source: "manual" });
+      if (file) setCalibHint("校准已保存（localStorage + 已导出 JSON 文件）。", "ok");
+      else setCalibHint("校准文件生成失败（后处理链未就绪）", "warn");
+    },
+    "raw-calib-restore": () => restoreDefaultCalibration(),
+  };
+  for (const [id, handler] of Object.entries(rawCalibActions)) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("click", handler);
+  }
+  // 保存时机之二：页面卸载（docs §6.2）。校准没变化时 build 出的文件也只是覆盖同一份。
+  window.addEventListener("pagehide", () => {
+    if (state.trackMode === "raw") saveCalibrationFile({ download: false, source: "auto" });
   });
 
   // ---- 姿态校准：一键对齐 + 手动微调 ----
@@ -1899,6 +2290,27 @@ window.__vfc = {
   },
   cancelAlign() {
     return cancelAlign();
+  },
+  // ---- raw_track 链（task-4）测试钩子 ----
+  /** 手动喂一条 raw_track 二进制帧（ArrayBuffer；走后处理链与 500ms playout）。 */
+  applyRawFrame(buffer) {
+    rawPipeline.handleRawFrame(buffer, performance.now());
+    return rawPipeline.stats();
+  },
+  /** 后处理链诊断（worker/同步模式、重排丢帧、playout 深度、校准态）。 */
+  rawStats() {
+    return rawPipeline.stats();
+  },
+  /** 校准控制（PC 侧；requestId 幂等，target = face/body/all）。 */
+  recalibrate(target = "face") {
+    return rawPipeline.recalibrate(target, "vfc-" + Date.now().toString(36));
+  },
+  saveCalibration() {
+    return saveCalibrationFile({ download: false, source: "manual" });
+  },
+  resetRawCalibration() {
+    restoreDefaultCalibration();
+    return true;
   },
 
   /** 把当前 canvas 缩略成小图并算像素统计（自测 / 截图前后对比用，证明画面真的变了）。 */

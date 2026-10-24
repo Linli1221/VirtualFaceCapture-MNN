@@ -14,7 +14,8 @@
     "vendor": "node tools/vendor-assets.js",
     "package": "node tools/package-windows.js",
     "postinstall": "node tools/vendor-assets.js",
-    "selftest": "node tools/selftest.js"
+    "selftest": "node tools/selftest.js",
+    "test": "node test/run-all.mjs"
   },
   "dependencies": {
     "pixi-live2d-display": "0.4.0",

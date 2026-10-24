@@ -87,6 +87,24 @@
           </div>
         </details>
 
+
+        <!-- raw_track 链校准控制（task-4）：协议 §6.3 校准归 Windows（开始/取消/重校准/保存/恢复默认）。
+             v1 文本模式下隐藏；raw 模式由 app.js 显示并接管「手机重做基线」按钮语义。 -->
+        <details id="raw-calib-box" class="debug calib" hidden>
+          <summary>raw 链校准（PC 侧）</summary>
+          <div class="calib-actions">
+            <button id="raw-calib-face" class="primary" title="重采面部校准：姿态基线 + 眼/嘴/微笑阈值（约 1 秒）">校准面部</button>
+            <button id="raw-calib-body" title="重采上半身基线（躯干中性姿态，约 0.7 秒渐入）">校准上半身</button>
+            <button id="raw-calib-all" title="面部 + 上半身一起重校准">全部重校准</button>
+            <button id="raw-calib-cancel" title="取消当前采样窗口（基线保持取消前的值）">取消</button>
+            <button id="raw-calib-save" title="保存校准文件（localStorage + 导出 JSON，按 模型+镜头 维度）">保存</button>
+            <button id="raw-calib-restore" title="恢复默认：清掉校准文件与全部基线">恢复默认</button>
+          </div>
+          <div class="hint" id="raw-calib-hint">
+            raw 模式下校准完全在 Windows 侧：手机只负责推原始关键点 / 头姿。
+            校准按「模型 + 镜头」分别保存；换模型或换手机镜头需要各校准一次。
+          </div>
+        </details>
         <details id="filter-box" class="debug">
           <summary>最终观感滤波（PC · 默认关）</summary>
           <div class="toggles">
