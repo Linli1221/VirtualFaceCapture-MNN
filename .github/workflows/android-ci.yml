@@ -44,7 +44,10 @@ jobs:
           - variant: debug
             abi: arm64-v8a
             artifact: arm64-debug
-            gradle: ':app:assembleDebug'
+            # debug 腿同时跑 JVM 单测：rawTrackV1 协议组、SendQueue/FrameBuffer、
+            # GoldenParityTest（跨端黄金对拍）都在 app/src/test，testDebugUnitTest 全覆盖。
+            # 不加这一段时这些测试在 CI 上会被静默跳过。
+            gradle: ':app:testDebugUnitTest :app:assembleDebug'
             apk: app/build/outputs/apk/debug/app-debug.apk
             aar: ''
           - variant: release
