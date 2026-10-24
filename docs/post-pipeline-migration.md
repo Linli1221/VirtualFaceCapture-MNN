@@ -258,6 +258,12 @@ resetTimeline 语义。
      （不依赖 Android SDK）：把 .vfcraw 解析回 478 点序列，喂进 Kotlin 原实现，逐帧 dump。
      本机无 JDK → 由 android-ci.yml / GitHub Actions 生成产物下载。
 - expected.json 与 .vfcraw 一起构成 golden 对；Windows 侧跑同一 .vfcraw，逐帧对比。
+- **基准边界（验收报告必须写明，防下游误读）**：本机无 JDK/Android SDK 时，「黄金基准」
+  是照 Kotlin 源码逐条抄的**第二份独立转录**，不是 Kotlin 运行输出 —— 它能抓抄写/分支/
+  阈值类笔误（win-postproc 的 golden 评测即以此抓到 3 处真问题），**不能**证明与 Kotlin
+  逐位一致。该缺口由 task-5 / task-7 用**真·Kotlin 输出**对拍补齐：消费
+  tools/evals/golden-export/ 跨端数据集（12 场景 × 40 帧 + manifest + verify.mjs + SHA-256
+  哈希表），JVM 端跑 Kotlin 原实现导出期望值后逐帧比对。
 
 ### 7.4 合成 fixture（CI 必跑，不依赖真机）
 
@@ -285,6 +291,10 @@ resetTimeline 语义。
 | 上半身 | 13 点平滑后 x/y/z | abs ≤ 1e-4 | One-Euro 跨语言 |
 | 参数层 | Live2D 契约量程 ±30 | abs ≤ 0.5（≈1.7% span） | 归一化器状态相同时 |
 | 统计口径 | — | 报告 max / mean / p95 | 附录 I.1 |
+
+**容差口径（Lead 终裁，golden-export 口径表同此）**：跨端 Kotlin↔JS 比对基线
+**abs 1e-4 / rel 1e-4**（503f549）；JS↔JS（双转录自检）沿用 abs 1e-5 / rel 1e-4。
+逐层阈值（上表 0.01/0.5°/0.5 等）是**语义层**验收线，两套并存、同时满足才算过。
 
 - **状态机额外断言**：blink 6 态序列、眯眼锁值进入/退出、双眼同步触发时机必须**逐帧一致**
   （状态是离散的，不适用数值容差）。
