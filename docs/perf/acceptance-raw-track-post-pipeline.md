@@ -13,9 +13,12 @@
 win-integrate 总装、android-raw 真·Kotlin 对拍）与两份规格逐条对照**零未决偏差**；
 观察项 2 条、已知边界 3 条均已按「保真复刻不修 / 有意扩展」定性归档（§5）。
 
-**CI 项：待 push 后验证**（§6）——其中 android-ci 的 JVM 测试门槛在验收中发现缺口
-（workflow 只跑 assemble* 不跑 test），已由 Lead 修复（debug 腿加 :app:testDebugUnitTest），
-状态为「**已修复、待 CI 实跑确认**」。
+**CI 项：全部通过**（§6）：android-ci **@64577ec success**（含 `:app:testDebugUnitTest`
+实跑 88 测试全绿、GoldenParityTest 12 场景真·Kotlin 对拍通过）；windows-client-ci
+**@c286d63 success**（打包 exe smoke-result.json ready）。首跑失败 4 处（Gradle DSL 属性 /
+语句位尾逗号 / 测试反射字段名+缺 import / 存量断言口径）已全部修复并实跑确认。
+
+**验收结论：全闭环。**
 
 ---
 
@@ -109,15 +112,15 @@ Kotlin 逐位一致；该缺口由②（真·Kotlin 输出对拍，容差 abs 1e
 
 ---
 
-## 6. CI 待 push 后验证（push 落地即按此补结论）
+## 6. CI 验证结论（2026-10-24 实跑，**全绿**）
 
 | 门槛 | 验证命令 / 入口 | 判定标准 |
 |---|---|---|
-| android-ci 构建 + JVM 测试 | push 后看 android-ci.yml 两个 job | 全绿；debug 腿含 :app:testDebugUnitTest（**已修复**：此前只跑 assemble*，GoldenParityTest/TrackingProtocolTest/SendQueue/FrameBuffer 会被静默跳过，验收发现后由 Lead 修复） |
-| android-ci 首跑失败根因（已修复，待重跑确认） | 0685497 / b7b17e7 | ① app/build.gradle 的 `isReturnDefaultValues` Groovy DSL 属性名错误（配置阶段挂两腿）→ 改 `unitTests.returnDefaultValues`；② TrackingServer.kt:913 `recomputeUpperBodyPostV1(),` **语句位尾逗号**（Kotlin 语法错误，整个文件编译失败、assemble 两腿全挂）→ 删尾逗号。android-raw 已做 17 文件全量编译级核对（JNI 签名、数据类命名实参、成员存在性、尾逗号全仓扫描仅此一处），无其他问题 |
-| 真·Kotlin 对拍（三件套②） | 同上，GoldenParityTest 12 场景 | 全绿；容差 max(1e-4, 1e-4×|b|)；失败信息自带 jsInternalReferenceAgreement/t 序列（按 §4 排障顺序判读） |
-| 打包 exe smoke ready（三件套③） | windows-client-ci.yml「Smoke test packaged app」 | smoke-result.json 存在且 ready=true（含 --smoke 启动 + 渲染就绪 + selftest 步骤） |
-| v1 文本路径回归 | windows-client-ci 的 npm run selftest | 108/108（本地已验，CI 复核） |
+| android-ci 构建 + JVM 测试 | run 40066233754 | ✅ **success @64577ec**：Build debug APK + Build release APK 双腿绿；debug 腿 `:app:testDebugUnitTest` 实跑通过 —— **88 个测试全绿**（含 GoldenParityTest 12 场景真·Kotlin 对拍、TrackingProtocolTest 全组、SendQueue/FrameBuffer） |
+| android-ci 首跑失败根因链（**4 处，全部修复并实跑确认**） | 0685497 / b7b17e7 / f4286c1 / 64577ec | ① app/build.gradle `isReturnDefaultValues` 是 Kotlin DSL 名，Groovy 配置阶段即挂两腿 → `unitTests.returnDefaultValues`（0685497）；② TrackingServer.kt:913 `recomputeUpperBodyPostV1(),` **语句位尾逗号**，整个文件编译失败 → 删尾逗号（b7b17e7）；③ GoldenParityTest 的 by-lazy 反射字段名应为 `xxx$delegate` + `kotlin.math.roundToLong` 缺 import（f4286c1 / 64577ec）；④ TrackingProtocolTest:709 旧断言与文档口径不符（300 ms 是合法配置、30 ms 才回落）——**CI 从未跑过测试的存量问题**，顺带修正。android-raw 另做 17 文件全量编译级核对（JNI 签名、数据类命名实参、成员存在性、尾逗号全仓扫描仅此一处） |
+| 真·Kotlin 对拍（三件套②） | GoldenParityTest 12 场景（随 debug 腿实跑） | ✅ **通过**（容差 max(1e-4, 1e-4×|b|)；至此「独立转录 vs 真·Kotlin」缺口闭合，基准性质说明见 §4） |
+| 打包 exe smoke ready（三件套③） | windows-client-ci.yml「Smoke test packaged app」 | ✅ **success @c286d63**（打包 exe smoke-result.json ready）；其后 4 个提交只动 app/测试，未触发该 workflow，结果仍有效 |
+| v1 文本路径回归 | windows-client-ci 的 npm run selftest | ✅ **通过**（108/108，本地已验 + CI 复核） |
 
 ---
 
@@ -125,18 +128,19 @@ Kotlin 逐位一致；该缺口由②（真·Kotlin 输出对拍，容差 abs 1e
 
 | # | 问题 | 状态 / 建议 |
 |---|------|------------|
-| 1 | android-ci 无 JVM 测试任务（golden 对拍会被跳过） | **已修复、待 CI 实跑确认**（Lead 兜底改 workflow，debug 腿加 :app:testDebugUnitTest） |
-| 2 | 真·Kotlin 对拍（GoldenParityTest）尚未经 CI 实跑 | 随 #1 一起判定 |
-| 3 | 打包 exe smoke 未经本地跑（沙箱限制） | CI 补证；本地限制已如实报备 |
+| 1 | android-ci 无 JVM 测试任务（golden 对拍会被跳过） | ✅ **已闭环**：85e4a16 加 :app:testDebugUnitTest 并实跑通过 |
+| 2 | 真·Kotlin 对拍（GoldenParityTest）尚未经 CI 实跑 | ✅ **已通过**：12 场景全绿（64577ec），独立转录→真·Kotlin 缺口闭合 |
+| 3 | 打包 exe smoke 未经本地跑（沙箱限制） | ✅ **CI 补证通过**：smoke-result.json ready（@c286d63）；本地限制已如实报备 |
 | 4 | 观察项 1/2 的行为修正 | 建议另立任务裁决（本次不修，见 §5） |
 | 5 | BodyFusion baseline load 注入路径 | loadBaseline API 已补（d6db95b）；如需 CalibFile 注入即生效可后续增强 |
-| 6 | android-raw JVM 测试本机无 JDK 未跑 | 与 #1/#2 同一出口，CI 判定 |
-| 7 | 首跑 CI 两处构建失败（Gradle DSL 属性名 / 语句位尾逗号） | **已修复**（0685497 / b7b17e7），待重跑 CI 确认。验收教训：无 JDK 环境的静态自查（符号存在性 + 括号平衡）抓不到语句位尾逗号这类纯语法笔误，编译级核对必须由 CI 承担。补救（android-raw）：无 JDK 自查可加「语句位尾逗号」正则扫描（形如 ^\s*[\w\.]+\(\),\s*$，需人工排除注释/实参列表内合法用例）作常规项，**最终判据仍是 CI 编译** |
+| 6 | android-raw JVM 测试本机无 JDK 未跑 | ✅ **已闭环**：testDebugUnitTest 实跑 88 测试全绿 |
+| 7 | 首跑 CI 构建/测试失败 4 处（DSL 属性名 / 尾逗号 / 测试反射字段名+缺 import / 存量断言） | ✅ **已实跑确认**（0685497 / b7b17e7 / f4286c1 / 64577ec）。验收教训：无 JDK 环境的静态自查（符号存在性 + 括号平衡）抓不到语句位尾逗号这类纯语法笔误，编译级核对必须由 CI 承担。补救（android-raw）：无 JDK 自查可加「语句位尾逗号」正则扫描（形如 ^\s*[\w\.]+\(\),\s*$，需人工排除注释/实参列表内合法用例）作常规项，**最终判据仍是 CI 编译** |
 
 **提交清单（验收范围）**：f19c2aa / a96dba5 / 96d2aba / 489272b / c5fccee / 42ec34c（规格）
 · 464acfe / 55d1b55 / 503f549 / d6db95b（win-postproc）
 · 1d3aafd / 3c85a3f / aaf0034（android-raw）
 · 81cc829（win-integrate）
-· 85e4a16（android-ci.yml JVM 测试门槛，Lead）· 0685497（Gradle DSL 属性修复）· b7b17e7（语句位尾逗号修复）。
+· 85e4a16（android-ci.yml JVM 测试门槛，Lead）· 0685497 / b7b17e7 / f4286c1 / 64577ec（首跑失败 4 处修复）。
 
-> 注：首跑 CI 曾因上述两处构建失败全挂（见 §6 / §7 #7），修复后重跑结论以 Lead 转发为准。
+> 注：首跑 CI 曾因 4 处构建/测试失败全挂（见 §6 / §7 #7），修复后重跑 **android-ci @64577ec
+> 与 windows-client-ci @c286d63 双绿**（run 40066233754，https://github.com/Linli1221/VirtualFaceCapture-MNN/actions）。
