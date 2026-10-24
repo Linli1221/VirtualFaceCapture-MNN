@@ -94,6 +94,13 @@ Android 侧**只保留感知层**：
    为手机后处理结果）。同一连接同一时刻只有一种 track 语义。**只有存在至少一个 v1 文本
    客户端时手机才运行 legacy 后处理链**（BlendShape/眨眼/平滑/基线），全部客户端都是
    raw 模式时整条后处理链旁路，省 CPU。
+   **边界细化（android-raw 实现 + spec-arch 评审确认）**：旁路的精确条件是
+   「存在 RAW 推流客户端 **且** 没有任何 TEXT 客户端」；**零客户端 / 仅 IDLE（已协商未
+   startStream）保持 legacy 链** —— 手机本地 UI（MainActivity 的 onBlendShapesUpdate /
+   onHeadPoseUpdate / onVisualizationUpdate / onCalibrationStatusUpdate）订阅的是后处理
+   结果，彻底旁路会让纯手机场景 UI 全 0 / 定格。此差异只影响手机 CPU，**wire 无任何影响**
+   （无 RAW 推流就没有 raw_track；文本 track 只发 TEXT 客户端，报文逐字节不变）。纯 RAW
+   推流期间手机 UI 的 BS 列表不更新、头姿显示 rawPose，属「整条旁路省 CPU」的既有取舍。
 4. 同一连接重复发 hello：以最后一条为准，重算生效模式（切换时清发送缓冲，避免旧语义帧混入）。
 5. 未知 features 标记忽略；畸形 hello 宽容解析，绝不因畸形报文断连。
 
