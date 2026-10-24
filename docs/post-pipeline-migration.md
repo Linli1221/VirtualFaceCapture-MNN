@@ -301,6 +301,9 @@ resetTimeline 语义。
 rel 1e-3，系 win-postproc **误填**（未裁决项被写成裁决项），503f549 更正 —— **裁决本身
 从未改过**。golden-export 的帧数据 55d1b55→503f549 **一个数没变**，变的只有 meta 与
 SHA-256，哈希一律以 503f549 的 README 哈希表为准。
+**golden 差异排障顺序**（win-postproc 提议，spec-arch 采纳）：①先看 meta 的
+jsInternalReferenceAgreement 分辨「基准转录 vs Kotlin」哪一侧偏离；②再查画幅（宽高比）
+与时间戳口径（§7.6 观察项 5 / 附录 K dt 规则）；③最后才怀疑实现本身。
 
 - **状态机额外断言**：blink 6 态序列、眯眼锁值进入/退出、双眼同步触发时机必须**逐帧一致**
   （状态是离散的，不适用数值容差）。
