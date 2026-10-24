@@ -114,6 +114,7 @@ Kotlin 逐位一致；该缺口由②（真·Kotlin 输出对拍，容差 abs 1e
 | 门槛 | 验证命令 / 入口 | 判定标准 |
 |---|---|---|
 | android-ci 构建 + JVM 测试 | push 后看 android-ci.yml 两个 job | 全绿；debug 腿含 :app:testDebugUnitTest（**已修复**：此前只跑 assemble*，GoldenParityTest/TrackingProtocolTest/SendQueue/FrameBuffer 会被静默跳过，验收发现后由 Lead 修复） |
+| android-ci 首跑失败根因（已修复，待重跑确认） | 0685497 / b7b17e7 | ① app/build.gradle 的 `isReturnDefaultValues` Groovy DSL 属性名错误（配置阶段挂两腿）→ 改 `unitTests.returnDefaultValues`；② TrackingServer.kt:913 `recomputeUpperBodyPostV1(),` **语句位尾逗号**（Kotlin 语法错误，整个文件编译失败、assemble 两腿全挂）→ 删尾逗号。android-raw 已做 17 文件全量编译级核对（JNI 签名、数据类命名实参、成员存在性、尾逗号全仓扫描仅此一处），无其他问题 |
 | 真·Kotlin 对拍（三件套②） | 同上，GoldenParityTest 12 场景 | 全绿；容差 max(1e-4, 1e-4×|b|)；失败信息自带 jsInternalReferenceAgreement/t 序列（按 §4 排障顺序判读） |
 | 打包 exe smoke ready（三件套③） | windows-client-ci.yml「Smoke test packaged app」 | smoke-result.json 存在且 ready=true（含 --smoke 启动 + 渲染就绪 + selftest 步骤） |
 | v1 文本路径回归 | windows-client-ci 的 npm run selftest | 108/108（本地已验，CI 复核） |
@@ -130,9 +131,12 @@ Kotlin 逐位一致；该缺口由②（真·Kotlin 输出对拍，容差 abs 1e
 | 4 | 观察项 1/2 的行为修正 | 建议另立任务裁决（本次不修，见 §5） |
 | 5 | BodyFusion baseline load 注入路径 | loadBaseline API 已补（d6db95b）；如需 CalibFile 注入即生效可后续增强 |
 | 6 | android-raw JVM 测试本机无 JDK 未跑 | 与 #1/#2 同一出口，CI 判定 |
+| 7 | 首跑 CI 两处构建失败（Gradle DSL 属性名 / 语句位尾逗号） | **已修复**（0685497 / b7b17e7），待重跑 CI 确认。验收教训：无 JDK 环境的静态自查（符号存在性 + 括号平衡）抓不到语句位尾逗号这类纯语法笔误，编译级核对必须由 CI 承担 |
 
 **提交清单（验收范围）**：f19c2aa / a96dba5 / 96d2aba / 489272b / c5fccee / 42ec34c（规格）
 · 464acfe / 55d1b55 / 503f549 / d6db95b（win-postproc）
 · 1d3aafd / 3c85a3f / aaf0034（android-raw）
 · 81cc829（win-integrate）
-· android-ci.yml 修复（Lead）。
+· 85e4a16（android-ci.yml JVM 测试门槛，Lead）· 0685497（Gradle DSL 属性修复）· b7b17e7（语句位尾逗号修复）。
+
+> 注：首跑 CI 曾因上述两处构建失败全挂（见 §6 / §7 #7），修复后重跑结论以 Lead 转发为准。
