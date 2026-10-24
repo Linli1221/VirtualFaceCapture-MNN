@@ -94,6 +94,14 @@ android {
     kotlinOptions {
         jvmTarget = '11'
     }
+    testOptions {
+        unitTests {
+            // android.jar 桩返回默认值：JVM 单测里 VfcLog（android.util.Log / Process.myPid）
+            // 与校准窗口（SystemClock.uptimeMillis）不抛 "not mocked"。uptimeMillis 恒为 0，
+            // GoldenParityTest 用 fixture 时间戳驱动校准窗口（见该测试的时间线注释）。
+            isReturnDefaultValues = true
+        }
+    }
     buildFeatures {
         compose true
     }
