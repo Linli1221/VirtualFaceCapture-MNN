@@ -151,6 +151,8 @@ yuvLandmarkFrame ─────┤                              ├──► �
 | `app/` | **Android 采集端**：相机、面捕管线、调试 HUD、追踪数据 WebSocket 服务 |
 | `windows-client/` | **Windows 渲染端**：Electron + Cubism Web，连手机 WS 渲染 Live2D |
 | `docs/tracking-protocol.md` | **两端之间唯一的契约**：VFC Tracking Protocol v1 |
+| `docs/raw-track-protocol.md` | **rawTrackV1 二进制扩展契约**：raw_track 帧格式 / 协商 / 控制消息 / frameId 语义 |
+| `docs/post-pipeline-migration.md` | **后处理迁移设计**：Android 后处理链 → Windows（12 步链序 / 状态模块 / 校准 / golden 对齐） |
 | `docs/pipeline.md` | **动捕流水线架构**：一帧数据从相机到 Live2D 的完整路径（含延迟账与已知取舍） |
 | `docs/upper-body.md` | 上半身关键点采集的设计与接口契约（模块 API / 数据流 / 验收） |
 | `:MediapipeFaceLandmark` | **核心推理模块**：MNN + `.mnn` 模型 + 原生 C++ 流水线 + NEON 优化 |
@@ -292,6 +294,14 @@ pwsh -File tools/fetch-pose-model.ps1   # Windows
 两端之间只认 **[`docs/tracking-protocol.md`](docs/tracking-protocol.md)** 这一份契约：
 JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），手机端零图像编码。
 
+**rawTrackV1 二进制扩展**（[`docs/raw-track-protocol.md`](docs/raw-track-protocol.md)）：
+`hello.features` 协商 `rawTrackV1` 后手机**按客户端分发** —— rawTrackV1 客户端收
+**OP_BINARY raw_track**（72 B 帧头 + 478×6 B 量化关键点，**未滤波 MNN 输出**，约 2.9 KB/帧），
+v1 客户端继续收文本 track（bs/pose 为手机后处理结果，逐字节不变）。Windows 完整拥有
+后处理链（[`docs/post-pipeline-migration.md`](docs/post-pipeline-migration.md)）：
+重排 → 点域滤波 → BlendShape 提取 → 校准 → 眨眼 → 上半身融合 → 映射 → 固定 500 ms
+playout → Live2D。
+
 | 端点 / 消息 | 方向 | 说明 |
 |---|---|---|
 | `GET /` | PC → 手机 | 内嵌信息页，确认服务在线 |
@@ -301,7 +311,7 @@ JSON 文本帧、手写序列化、单帧约 0.5 KB（60 fps ≈ 240 kbps），�
 | `track` | 手机 → PC | 每帧：`seq` / `t` / `bs[52]` / `pose[3]` / `face` / `score` / `fps` / `calibrating`；开启上半身后**可选**带 `ubOk` / `ub[52]` / `ubT` / `body[2]`（纯增量，老客户端忽略） |
 | `calib` | 手机 → PC | 进入 / 离开首帧标定窗口 |
 | `ping` / `pong` | 双向 | 保活与 RTT 测量（客户端 5 s 一次，手机 30 s 主动 ping） |
-| `command` / `ack` | PC → 手机 | 目前只有 `recalibrate`（等价于手机上的「重置基线」） |
+| `command` / `ack` | PC → 手机 | `recalibrate` **已废止**（校准归 Windows；旧客户端仍发时手机兼容映射为 `resetTracking` 等价动作）；rawTrackV1 新增 `startStream` / `stopStream` / `resetTracking`（ack 带 requestId 幂等） |
 | `bye` | 手机 → PC | 主动告知停止推流的原因 |
 
 关键约定：`bs` 是 **MediaPipe 顺序的 52 项**（索引 0 恒为 neutral），`pose` 是**相对基线**的

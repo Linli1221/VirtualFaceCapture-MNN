@@ -163,6 +163,8 @@ A multi-module Gradle project plus a standalone Windows client:
 | `app/` | **Android capture app**: camera, face pipeline, debug HUD, WebSocket tracking server |
 | `windows-client/` | **Windows renderer**: Electron + Cubism Web, connects to the phone and draws Live2D |
 | `docs/tracking-protocol.md` | **The single contract** between both sides: VFC Tracking Protocol v1 |
+| `docs/raw-track-protocol.md` | **rawTrackV1 binary extension**: raw_track frame layout / negotiation / control messages / frameId semantics |
+| `docs/post-pipeline-migration.md` | **post-processing migration design**: Android post chain → Windows (12-step order / stateful modules / calibration / golden parity) |
 | `docs/upper-body.md` | upper-body capture design + interface contract (module API / data flow / acceptance) |
 | `:MediapipeFaceLandmark` | **core inference**: MNN + `.mnn` models + native C++ pipeline + NEON |
 | `:OpenSeeFaceProcess` | OpenSeeFace-style post-processing: smoothing, pose, blendshape solve |
@@ -248,7 +250,7 @@ pwsh -File tools/fetch-pose-model.ps1   # Windows
 | Control | What it does |
 |---------|--------------|
 | **Start / Stop** | camera + inference pipeline |
-| **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). Also remotely triggerable from the PC via `command: recalibrate` |
+| **Reset baseline** | current frame becomes the "neutral face" (pose / expression zero). In rawTrackV1 this is a **PC-side** action (`recalibrate` is deprecated; the phone only answers `resetTracking` / `startStream` / `stopStream`) |
 | **Network output** | start/stop the tracking server, copy the `ws://` address, see client count, output fps and the active frame-buffer length, open the `/status` page |
 | **Camera: front / back / external / ultra-wide** | enumerate and switch cameras, including physical ultra-wide / telephoto sensors hidden behind a logical multi-camera; re-calibrates after switching, remembers the choice; works in portrait and landscape |
 | **Backend: Vulkan / CPU** | runtime MNN backend switch (rebuilds the session, one-frame hiccup) |

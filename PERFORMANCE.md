@@ -128,6 +128,13 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeGetBackend(JN
 
 合计：后处理阶段 **≈650 → ≈509 对象/帧（-22%）**，且全部是等价改写（数值逐位一致）。
 
+> **rawTrackV1 原始输出模式**（docs/raw-track-protocol.md）：协商后手机旁路整条后处理链
+> 与原生时域滤波（`setPostProcessingEnabled(false)`：landmark `setSmoothingEnabled(false)`、
+> detection `setDetectionFilterType(NONE)`、head pose `nativeSetHeadPoseSmoothingEnabled(false)`
+> + 模式切换 `resetSmoothing()`），raw_track 发**未滤波 MNN 输出**；500 ms 发送缓冲在
+> raw 模式旁路，由 Windows `PlayoutBuffer` 承担（全链唯一人为延迟）。上面的后处理对象/帧
+> 数字描述的是 **legacy 文本路径**（v1 客户端与手机 UI 仍在用）；raw 模式下这段 CPU 整体省掉。
+
 ### 2.5 UI / 渲染 `app/src/main/java/com/example/virtualfacecapture/`
 
 | 文件 | 改动 |

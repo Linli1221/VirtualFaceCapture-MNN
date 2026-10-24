@@ -295,7 +295,12 @@ Hiyori 是 [-10,10]，不缩放的话写入值会被 Cubism clamp 到极值，�
 npm run selftest
 ```
 
-覆盖（当前 76 项）：协议 §8.1 的 eye/mouth/mouthForm/eyeBall 公式与 clamp、§8.2 自适应归一化
+rawTrackV1 后处理链另有专项测试：`node test/run-all.mjs`（**93 项**：frameId 重排 / 时间滤波 /
+BlendShape 提取 / 眨眼状态机 / 校准 / 上半身融合 / raw_track 解码 / playout）与
+`node tools/evals/golden-run.mjs`（golden 对齐 14 场景 + 4 个滤波/基线模块）；
+打包 exe 冒烟以 windows-client-ci.yml 的 `smoke-result.json ready` 为准。
+
+覆盖（当前 108 项）：协议 §8.1 的 eye/mouth/mouthForm/eyeBall 公式与 clamp、§8.2 自适应归一化
 首帧与收敛、本地姿态校准（offset 叠加 / 取反 / 截尾平均 / 持久化编解码 / 坏数据兜底）、
 reset 可复现性、apply(bs,pose) 与 apply(track) 等价、上半身（§4.2 / §5.3：13 点解析与长度校验、
 躯干 Z/X/Y 公式与 clamp、运动骨骼层级关节角（脊柱/锁骨/上臂/前臂/肘）、肩→腕抬臂角度、
