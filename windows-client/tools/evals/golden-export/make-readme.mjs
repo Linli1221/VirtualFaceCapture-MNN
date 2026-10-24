@@ -63,7 +63,7 @@ L.push("| frames[i] | poseDeg | number[3] | 原始头姿 [pitch, yaw, roll]（�
 L.push("| frames[i] | expectedBs52 | number[52] | extractFullBlendShapes 输出，含 blink 后的 [9]/[10] |");
 L.push("| frames[i] | expectedBlinkOut | number[2] | BlinkCurveProcessor 输出 [left, right] |");
 L.push("| meta | advancedMode | bool | 恒 false（第一阶段） |");
-L.push("| meta | tolerance | object | abs 1e-4 / rel 1e-3（跨端） |");
+L.push("| meta | tolerance | object | abs 1e-4 / rel 1e-4（跨端，Lead 终裁） |");
 L.push("| meta | dimOrder | string[52] | BS_INDEX 的 wire 顺序 |");
 L.push("| meta | landmarkEncoding | object | 编码与 JVM 解码方式 |");
 L.push("| meta | timing | object | nowMs / blink 时间戳的来源约定 |");
@@ -101,7 +101,7 @@ L.push("| 起始帧率 | 30 fps（longDt 场景 3.333） | 眨眼确认帧数 `f
 L.push("");
 L.push("## 容差");
 L.push("");
-L.push("- **Kotlin ↔ JS 跨端**：abs 1e-4 / rel 1e-3（Lead 裁决）——Kotlin 全程 Float32、JS 是 double，链式累积后放宽一档；");
+L.push("- **Kotlin ↔ JS 跨端**：abs 1e-4 / rel 1e-4（**Lead 终裁**）。断言写 " + BT + "|a-b| <= max(1e-4, 1e-4*|b|)" + BT + "；");
 L.push("- **JS ↔ JS 内部**：abs 1e-5 / rel 1e-4（见 `tools/evals/golden-run.mjs`）。");
 L.push("");
 L.push("## 比对口径：请拆成两条统计");

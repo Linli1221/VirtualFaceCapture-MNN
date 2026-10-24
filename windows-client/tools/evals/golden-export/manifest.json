@@ -1,111 +1,99 @@
 {
   "schemaVersion": "golden-fixture-manifest/v1",
   "generator": "windows-client/tools/evals/golden-export/export-golden.mjs",
-  "generatedAt": "2026-10-24T00:31:33.160Z",
+  "generatedAt": "2026-10-24T00:44:40.193Z",
   "command": "node windows-client/tools/evals/golden-export/export-golden.mjs",
   "width": 1280,
   "height": 720,
   "advancedMode": false,
   "tolerance": {
     "abs": 0.0001,
-    "rel": 0.001
+    "rel": 0.0001
   },
   "files": [
     {
       "file": "neutral.json",
       "scenario": "neutral",
       "frameCount": 40,
-      "bytes": 316691,
-      "sha256": "f426d440efade9ab38a116877f39814aa9bf387b2d317889708ddf85898fc9d2",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316700,
+      "sha256": "2fef8cbb0ddada27ca0338a659eb388a1634840135840452df4be963b51656b0"
     },
     {
       "file": "blink.json",
       "scenario": "blink",
       "frameCount": 40,
-      "bytes": 316689,
-      "sha256": "85940796a0e66cc2cbe346a9fad8196d786a30feecf7bfc0f97651fb25cdd2c5",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316698,
+      "sha256": "ceb9e7e14e7385d148dcaeddd49bd6ad78fb4d944fa12c045da75b26cb410d38"
     },
     {
       "file": "squint.json",
       "scenario": "squint",
       "frameCount": 40,
-      "bytes": 316690,
-      "sha256": "8a479fed406a0d73de157478cf1d945f5505527d2269f7390373804670b4eb3d",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316699,
+      "sha256": "3ffa4def8078c01a2810fb2c25c84900fa8fea6f9de75d6642f52e4ca1777b10"
     },
     {
       "file": "mouthOpen.json",
       "scenario": "mouthOpen",
       "frameCount": 40,
-      "bytes": 316853,
-      "sha256": "459788e9a2e45f6ad1ef10fbe1528c7403363e906b4544798f4d05d2342c5c44",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316862,
+      "sha256": "6c6b17fe5c3089669c637a606a11c1e22a03580fe00f883066e226ddd750b609"
     },
     {
       "file": "smile.json",
       "scenario": "smile",
       "frameCount": 40,
-      "bytes": 317089,
-      "sha256": "e0ac7ccfed07c9b37a1560cf60800f5a10d6bd4776822cab374ced53d7a27506",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 317098,
+      "sha256": "10676e7b24f768c38cb0dc6b193bd3222e8f38be01ec28593195b2a836d637b1"
     },
     {
       "file": "frown.json",
       "scenario": "frown",
       "frameCount": 40,
-      "bytes": 317089,
-      "sha256": "544c82caa8d07c8fcf040eb8238e13bada299e8df9a308cf1fdeb31efe365546",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 317098,
+      "sha256": "f5b6fb2075168fd11834c5764dc36a9d76e35a39094c2ea2ccdb089e57dac119"
     },
     {
       "file": "yawLeft.json",
       "scenario": "yawLeft",
       "frameCount": 40,
-      "bytes": 316731,
-      "sha256": "b4033030778d6d77bace32456e4c179cab70d2f92aa1f3714b67d4372db1275f",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316740,
+      "sha256": "db80388e8398db42a348dc5212be5a0341503e6fd145e8ab1d38150ee475c9aa"
     },
     {
       "file": "yawRight.json",
       "scenario": "yawRight",
       "frameCount": 40,
-      "bytes": 316772,
-      "sha256": "19c330f7ea0687d17bc4e8a3717b8ace0e479a424bc554f7ab45cd986bae135b",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316781,
+      "sha256": "b9913bd078350b77cdefa30fa36e6b79cb9d6788e8866d78265d442e2e344807"
     },
     {
       "file": "pitchDown.json",
       "scenario": "pitchDown",
       "frameCount": 40,
-      "bytes": 316733,
-      "sha256": "5128a5ea10f684ab9dfe307fcc69b775e9ee812aeb585d2524c1ccd0fbb7a742",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316742,
+      "sha256": "2e8568712c7e6c6dcd65b96e515d48c96522eabb31625d1521d1f6bfe2682c06"
     },
     {
       "file": "pitchUp.json",
       "scenario": "pitchUp",
       "frameCount": 40,
-      "bytes": 316771,
-      "sha256": "ed04522ced5f3c66e49d968712009ae2a62487594c5e91ab4d696a822811bd38",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316780,
+      "sha256": "4e8ffbd4dd39d8102483709f7071936918c94eba397653666aedf0395a167957"
     },
     {
       "file": "rollTilt.json",
       "scenario": "rollTilt",
       "frameCount": 40,
-      "bytes": 316732,
-      "sha256": "f0b76844894ca4641dc4d7727209d825d6ed5e07acc108d5b76c76404fb9b92a",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316741,
+      "sha256": "7526907f856499f6f7e655c037f33eecb12e1dc1f65348eae4d039694a33199d"
     },
     {
       "file": "longDt.json",
       "scenario": "longDt",
       "frameCount": 40,
-      "bytes": 316575,
-      "sha256": "bf89e35ff529908f527b6f6192fdc43585f32a6dc80283b54997b6865d48afbf",
-      "jsInternalReferenceAgreement": 2.38418636e-7
+      "bytes": 316584,
+      "sha256": "5073836adfa48179c719747e28ff68e5db79d3064697f8b9d020eee8ec1a53e3"
     }
   ]
 }

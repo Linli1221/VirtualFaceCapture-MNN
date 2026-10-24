@@ -18,19 +18,19 @@ BlendShapeExtractor / BlinkCurveProcessor，逐帧比对 expected，堵住
 
 | 文件 | 帧数 | 字节 | sha256 |
 | --- | ---: | ---: | --- |
-| neutral.json | 40 | 316691 | `f426d440efade9ab38a116877f39814aa9bf387b2d317889708ddf85898fc9d2` |
-| blink.json | 40 | 316689 | `85940796a0e66cc2cbe346a9fad8196d786a30feecf7bfc0f97651fb25cdd2c5` |
-| squint.json | 40 | 316690 | `8a479fed406a0d73de157478cf1d945f5505527d2269f7390373804670b4eb3d` |
-| mouthOpen.json | 40 | 316853 | `459788e9a2e45f6ad1ef10fbe1528c7403363e906b4544798f4d05d2342c5c44` |
-| smile.json | 40 | 317089 | `e0ac7ccfed07c9b37a1560cf60800f5a10d6bd4776822cab374ced53d7a27506` |
-| frown.json | 40 | 317089 | `544c82caa8d07c8fcf040eb8238e13bada299e8df9a308cf1fdeb31efe365546` |
-| yawLeft.json | 40 | 316731 | `b4033030778d6d77bace32456e4c179cab70d2f92aa1f3714b67d4372db1275f` |
-| yawRight.json | 40 | 316772 | `19c330f7ea0687d17bc4e8a3717b8ace0e479a424bc554f7ab45cd986bae135b` |
-| pitchDown.json | 40 | 316733 | `5128a5ea10f684ab9dfe307fcc69b775e9ee812aeb585d2524c1ccd0fbb7a742` |
-| pitchUp.json | 40 | 316771 | `ed04522ced5f3c66e49d968712009ae2a62487594c5e91ab4d696a822811bd38` |
-| rollTilt.json | 40 | 316732 | `f0b76844894ca4641dc4d7727209d825d6ed5e07acc108d5b76c76404fb9b92a` |
-| longDt.json | 40 | 316575 | `bf89e35ff529908f527b6f6192fdc43585f32a6dc80283b54997b6865d48afbf` |
-| manifest.json | - | 3443 | `43f0dbdf99ada3d8667d0bdac2352d278c707ec4ac5a893d24af119eec211c3c` |
+| neutral.json | 40 | 316700 | `2fef8cbb0ddada27ca0338a659eb388a1634840135840452df4be963b51656b0` |
+| blink.json | 40 | 316698 | `ceb9e7e14e7385d148dcaeddd49bd6ad78fb4d944fa12c045da75b26cb410d38` |
+| squint.json | 40 | 316699 | `3ffa4def8078c01a2810fb2c25c84900fa8fea6f9de75d6642f52e4ca1777b10` |
+| mouthOpen.json | 40 | 316862 | `6c6b17fe5c3089669c637a606a11c1e22a03580fe00f883066e226ddd750b609` |
+| smile.json | 40 | 317098 | `10676e7b24f768c38cb0dc6b193bd3222e8f38be01ec28593195b2a836d637b1` |
+| frown.json | 40 | 317098 | `f5b6fb2075168fd11834c5764dc36a9d76e35a39094c2ea2ccdb089e57dac119` |
+| yawLeft.json | 40 | 316740 | `db80388e8398db42a348dc5212be5a0341503e6fd145e8ab1d38150ee475c9aa` |
+| yawRight.json | 40 | 316781 | `b9913bd078350b77cdefa30fa36e6b79cb9d6788e8866d78265d442e2e344807` |
+| pitchDown.json | 40 | 316742 | `2e8568712c7e6c6dcd65b96e515d48c96522eabb31625d1521d1f6bfe2682c06` |
+| pitchUp.json | 40 | 316780 | `4e8ffbd4dd39d8102483709f7071936918c94eba397653666aedf0395a167957` |
+| rollTilt.json | 40 | 316741 | `7526907f856499f6f7e655c037f33eecb12e1dc1f65348eae4d039694a33199d` |
+| longDt.json | 40 | 316584 | `5073836adfa48179c719747e28ff68e5db79d3064697f8b9d020eee8ec1a53e3` |
+| manifest.json | - | 2808 | `83158bde22d12e0f8a2010c1273a5ccb74ee8034e5f8a1114c19c7ec8dcb4aa7` |
 
 整目录校验（Node，跨平台）：
 
@@ -50,7 +50,7 @@ BlendShapeExtractor / BlinkCurveProcessor，逐帧比对 expected，堵住
 | frames[i] | expectedBs52 | number[52] | extractFullBlendShapes 输出，含 blink 后的 [9]/[10] |
 | frames[i] | expectedBlinkOut | number[2] | BlinkCurveProcessor 输出 [left, right] |
 | meta | advancedMode | bool | 恒 false（第一阶段） |
-| meta | tolerance | object | abs 1e-4 / rel 1e-3（跨端） |
+| meta | tolerance | object | abs 1e-4 / rel 1e-4（跨端，Lead 终裁） |
 | meta | dimOrder | string[52] | BS_INDEX 的 wire 顺序 |
 | meta | landmarkEncoding | object | 编码与 JVM 解码方式 |
 | meta | timing | object | nowMs / blink 时间戳的来源约定 |
@@ -88,7 +88,7 @@ BlendShapeExtractor / BlinkCurveProcessor，逐帧比对 expected，堵住
 
 ## 容差
 
-- **Kotlin ↔ JS 跨端**：abs 1e-4 / rel 1e-3（Lead 裁决）——Kotlin 全程 Float32、JS 是 double，链式累积后放宽一档；
+- **Kotlin ↔ JS 跨端**：abs 1e-4 / rel 1e-4（**Lead 终裁**）。断言写 `|a-b| <= max(1e-4, 1e-4*|b|)`；
 - **JS ↔ JS 内部**：abs 1e-5 / rel 1e-4（见 `tools/evals/golden-run.mjs`）。
 
 ## 比对口径：请拆成两条统计

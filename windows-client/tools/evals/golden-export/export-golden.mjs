@@ -15,7 +15,7 @@
  *   width=1280 / height=720（各向异性像素转换会带 H/W 因子，必须同画幅）
  *   nowMs 与 blink 时间戳都用 t（fixture 约定；生产口径是
  *   nowMs=performance.now()、blink 用帧采集时间 t，见 README）
- *   比对容差：Kotlin↔JS 用 abs 1e-4 / rel 1e-3；JS↔JS 内部用 abs 1e-5 / rel 1e-4
+ *   比对容差：Kotlin↔JS 用 abs 1e-4 / rel 1e-4（Lead 终裁）；JS↔JS 内部用 abs 1e-5 / rel 1e-4
  *
  * ── 为什么要存「原始点位」而不是只存特征参数 ──────────────────────
  *   Kotlin 侧要驱动的是**它的** BlendShapeExtractor / BlinkCurveProcessor，
@@ -121,7 +121,7 @@ function runScenario(name, frames) {
       advancedMode: false,
       fps: FPS,
       frameCount: out.length,
-      tolerance: { abs: 1e-4, rel: 1e-3, note: "Kotlin↔JS 跨端口径；JS↔JS 内部用 abs 1e-5 / rel 1e-4" },
+      tolerance: { abs: 1e-4, rel: 1e-4, scope: "Kotlin↔JS 跨端", note: "Lead 终裁：|a-b| <= max(1e-4, 1e-4*|b|)。JS↔JS 内部另用 abs 1e-5 / rel 1e-4。" },
       dimOrder: Object.keys(BS_INDEX).sort((a, b) => BS_INDEX[a] - BS_INDEX[b]),
       landmarkEncoding: {
         format: "base64(Float32Array little-endian)",
@@ -152,7 +152,7 @@ const manifest = {
   width: IMAGE_W,
   height: IMAGE_H,
   advancedMode: false,
-  tolerance: { abs: 1e-4, rel: 1e-3 },
+  tolerance: { abs: 1e-4, rel: 1e-4 },
   files: [],
 };
 
