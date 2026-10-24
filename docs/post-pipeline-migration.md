@@ -304,6 +304,17 @@ resetTimeline 语义。
    BLINK_CLOSED 的空历史 fallback 分别是 baselineEAR / 0f —— 均以**代码行为**为准
    （表内已按代码写，注释不符处不跟注释）。
 4. 附录 C：yaw 补偿的远/近侧分支按代码（yaw>0 时 imageLeft=远侧），Kotlin 注释自相矛盾，不跟注释。
+5. **EAR / MAR 的画幅（宽高比）依赖（win-postproc 发现，保真复刻不修）**：
+   extractKeyPoints 的像素转换是**各向异性**的（x × imageWidth、y × imageHeight、z 不变），
+   因此「垂直距离 / 水平距离」型比值特征都带 **H/W 因子**：EAR = 归一化 EAR × (H/W)、
+   MAR 同理。例：归一化 EAR=0.18 在 1280×720 下变成 0.18×0.5625=0.10125，恰好压到默认
+   闭眼阈值 0.10，eyeBlink 从 ~0 跳到 ~0.98；同一张脸 720×1280 竖幅结果又不同。
+   含义：(a) 这是 Kotlin 真实行为，Windows **按源码复刻、不修**（与观察项 1 同一原则）；
+   (b) 自校准从同一坐标空间学阈值可自适应，但**默认阈值 0.10/0.18/0.26 只对特定画幅成立**；
+   (c) **golden 对齐的参考实现与被测实现必须喂同一 width/height**，画幅是 fixture 的一部分
+   （写进 .vfcraw metaJson 与合成 fixture），拿 16:9 与 9:16 的录数据对齐会得出「移植错了」
+   的错误结论。另：Float32 往返使「合成 EAR 恰好等于阈值」类用例留 ~2e-6 残余，
+   §7.5 的 abs 1e-5 / rel 1e-4 基线容差已覆盖。
 
 ---
 
@@ -643,8 +654,13 @@ TimeBasedEMA / TimeBasedEMAFilter3D，face_landmarker.cpp 对 478 点与 head po
     out = last + alpha * (v - last)
     首样本：透传并重置历史；v 非有限：返回 lastValue（无则 0）
 
-- tau 默认 **0.12 s**（face_landmarker.cpp 构造实参 DEFAULT_TIME_EMA_TAU = 0.12，**线上实跑值**；
-  0.08 是被覆盖的默认构造值，只作可配值）；**下限 0.01 s**；dt clamp **[0.001, 0.5] s**。
+- tau 默认 **0.12 s**（face_pipeline_filter.h:600 DEFAULT_TIME_EMA_TAU = 0.12，**线上实跑值**；
+  face_landmarker.cpp 里 config.time_ema_tau = 0.08f 一行是**注释掉的**，Kotlin
+  configureForHighFps(landmarkTau = 0.08f) 形参**全仓无调用点**，均从未生效；0.08 只作可配值）；
+  **头姿专用 tau = 0.3 s**（face_pipeline_filter.h:601 DEFAULT_TIME_EMA_TAU_HEAD_POSE，与
+  关键点域 0.12 不同，禁止混用）；tau **下限 0.01 s**（setTau 的 max(0.01, tau)）；
+  dt clamp **[0.001, 0.5] s**。face_pipeline_filter.h 的 One-Euro（minCutoff 0.05 / beta 80）
+  与 body-fusion 的 One-Euro（minCutoff 1.2 / beta 0.02）是**两套不同滤波器**，禁止混用。
 - **K.2 作用域**：478 点关键点域 + rawHeadPose；**不作用于 52 维 BlendShape 域**。
 - **K.3 bs 域平滑默认关闭**（可配挂点：filter.js 的 bs 组缺省 τ = 0）——Android bs 域
   无平滑（blink 曲线是整形不是平滑），这是黄金对齐基准。
