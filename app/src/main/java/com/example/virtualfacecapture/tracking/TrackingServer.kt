@@ -910,7 +910,7 @@ class TrackingServer(
                     // 客户端集合变了（可能影响 jitterBufferV1 协商结果），重算生效发送缓冲
                     recomputeEffectiveBuffer()
                     // 客户端集合变了也可能改变 upperBodyPostV1 的全体聚合结果（任务 M2）
-                    recomputeUpperBodyPostV1(),
+                    recomputeUpperBodyPostV1()
                     // 客户端集合变了也可能改变 rawTrackV1 流形态聚合（per-client 分发）
                     recomputeStreamModes()
                     // 最后一个客户端也走了：清掉缓冲里还没放行的帧，
