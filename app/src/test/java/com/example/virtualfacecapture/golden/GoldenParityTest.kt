@@ -99,9 +99,17 @@ class GoldenParityTest {
         return diff <= Math.max(TOL_ABS, TOL_REL * Math.abs(expected))
     }
 
-    /** 取 BlendShapeExtractor 私有 by-lazy 成员（mouth / smile 提取器未公开，测试需驱动其校准窗口）。 */
+    /**
+     * 取 BlendShapeExtractor 私有 by-lazy 成员（mouth / smile 提取器未公开，测试需驱动其校准窗口）。
+     * 注意：Kotlin 委托属性（by lazy）的 JVM 后备字段名是 "<属性名>$delegate" 而不是属性名，
+     * 两个名字都试，避免编译器版本差异。
+     */
     private fun lazyValue(target: Any, fieldName: String): Any {
-        val field = target.javaClass.getDeclaredField(fieldName)
+        val field = try {
+            target.javaClass.getDeclaredField(fieldName + "\$delegate")
+        } catch (e: NoSuchFieldException) {
+            target.javaClass.getDeclaredField(fieldName)
+        }
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         return (field.get(target) as Lazy<Any>).value

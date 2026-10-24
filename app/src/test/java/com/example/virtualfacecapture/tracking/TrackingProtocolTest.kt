@@ -705,8 +705,10 @@ class TrackingProtocolTest {
         assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(500L, 2, 2))
         assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(500L, 1, 0))
         assertEquals(2000L, TrackingProtocol.resolveEffectiveBufferMs(2000L, 1, 0))
-        // 非法配置先归一化成 500，仍走「配置 > 0 恒生效」
-        assertEquals(500L, TrackingProtocol.resolveEffectiveBufferMs(300L, 1, 0))
+        // 合法范围（SEND_BUFFER_MIN_MS..MAX，100~2000）内的正配置原样生效
+        assertEquals(300L, TrackingProtocol.resolveEffectiveBufferMs(300L, 1, 0))
+        // 非法配置（如 1~99）先归一化成 FRAME_BUFFER_MS，仍走「配置 > 0 恒生效」
+        assertEquals(TrackingProtocol.FRAME_BUFFER_MS, TrackingProtocol.resolveEffectiveBufferMs(30L, 1, 0))
     }
 
     @Test
