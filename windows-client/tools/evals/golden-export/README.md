@@ -18,19 +18,19 @@ BlendShapeExtractor / BlinkCurveProcessor，逐帧比对 expected，堵住
 
 | 文件 | 帧数 | 字节 | sha256 |
 | --- | ---: | ---: | --- |
-| neutral.json | 40 | 316700 | `2fef8cbb0ddada27ca0338a659eb388a1634840135840452df4be963b51656b0` |
-| blink.json | 40 | 316698 | `ceb9e7e14e7385d148dcaeddd49bd6ad78fb4d944fa12c045da75b26cb410d38` |
-| squint.json | 40 | 316699 | `3ffa4def8078c01a2810fb2c25c84900fa8fea6f9de75d6642f52e4ca1777b10` |
-| mouthOpen.json | 40 | 316862 | `6c6b17fe5c3089669c637a606a11c1e22a03580fe00f883066e226ddd750b609` |
-| smile.json | 40 | 317098 | `10676e7b24f768c38cb0dc6b193bd3222e8f38be01ec28593195b2a836d637b1` |
-| frown.json | 40 | 317098 | `f5b6fb2075168fd11834c5764dc36a9d76e35a39094c2ea2ccdb089e57dac119` |
-| yawLeft.json | 40 | 316740 | `db80388e8398db42a348dc5212be5a0341503e6fd145e8ab1d38150ee475c9aa` |
-| yawRight.json | 40 | 316781 | `b9913bd078350b77cdefa30fa36e6b79cb9d6788e8866d78265d442e2e344807` |
-| pitchDown.json | 40 | 316742 | `2e8568712c7e6c6dcd65b96e515d48c96522eabb31625d1521d1f6bfe2682c06` |
-| pitchUp.json | 40 | 316780 | `4e8ffbd4dd39d8102483709f7071936918c94eba397653666aedf0395a167957` |
-| rollTilt.json | 40 | 316741 | `7526907f856499f6f7e655c037f33eecb12e1dc1f65348eae4d039694a33199d` |
-| longDt.json | 40 | 316584 | `5073836adfa48179c719747e28ff68e5db79d3064697f8b9d020eee8ec1a53e3` |
-| manifest.json | - | 2808 | `83158bde22d12e0f8a2010c1273a5ccb74ee8034e5f8a1114c19c7ec8dcb4aa7` |
+| neutral.json | 40 | 316567 | `ffc0fa80d5abe9635338f5705ec0e7d9d836fb6c78237acf4dac9ac0ffb72586` |
+| blink.json | 40 | 316565 | `bb5528c1d0e11dcfc9a22d8590b0fd03c6a5679249baf47e5b3e60f71a7d4911` |
+| squint.json | 40 | 316566 | `eea6cb1272a0e105bde5aad23db2c53b7fe2099078df1be85d2d285f3afbadbf` |
+| mouthOpen.json | 40 | 316729 | `ac04e39c5d5022e3f90761d97346cc21555b99006504993d4b9b5357cdda5a40` |
+| smile.json | 40 | 316965 | `f7dbc75ac6129a87ee336bb696180bff12139cc570f63358ff72e9a882985603` |
+| frown.json | 40 | 316965 | `daff4ba0363dbc571d71496119447e4ae04661003a9862f2117fbc69adaa70b2` |
+| yawLeft.json | 40 | 316607 | `1b7dad209cf94bfa98c91c15a39df65ae023a98a648bf65e7c521b1f9d3cf2df` |
+| yawRight.json | 40 | 316648 | `6b92314face37756da01ae5ec2b65defb3e9e029a7917e934d59e75a3951cb16` |
+| pitchDown.json | 40 | 316609 | `8daff93e4c4369b52c63f21ab3dd9c0a59daf2f5f8ac65f909b5341f756eb95b` |
+| pitchUp.json | 40 | 316647 | `d52287e3076febce70feb15e63876450f194000266265520122833663aae4ed4` |
+| rollTilt.json | 40 | 316608 | `977bfc0bda06e4aa16a524982ff0b9d56f73585dc150374702ae7d0cca4652ee` |
+| longDt.json | 40 | 316392 | `929859dd79ac68c477dba410eea6f70f9fa1239124335ae3b0560cf5d11e92d1` |
+| manifest.json | - | 3444 | `55dfc47d41390d951631f1d99f79d695134aff8de5d76094f2986d132fa7b774` |
 
 整目录校验（Node，跨平台）：
 
@@ -85,6 +85,23 @@ BlendShapeExtractor / BlinkCurveProcessor，逐帧比对 expected，堵住
 | nowMs | 用 `t` | fixture 约定；生产口径是 performance.now() |
 | blink 时间戳 | 用 `t` | 与生产口径一致 |
 | 起始帧率 | 30 fps（longDt 场景 3.333） | 眨眼确认帧数 `floor(2*33.3/interval)` 依赖它 |
+
+## ⚠️ 时间戳必须是整数毫秒（跨端对拍的必要口径）
+
+fixture 的 `t` 全部是**整数毫秒**，这不是格式偏好，是硬约束：
+
+- Kotlin 的 `BlinkCurveProcessor.process(currentTimeMs: Long)` 只收 Long；
+  若给小数 t（如 33.3333333），JS 侧 delta = 33.3333…、Kotlin 侧 delta = 33/34 交替，
+  眨眼曲线 `curveProgress += deltaMs / duration` 会逐步累积出 **~1e-2 量级**偏差，
+  是 1e-4 容差的百倍 —— 这不是实现差异，是时间量化差，必须从源头消除。
+- 同理，squint 的 300ms 严格比较、自校准的 1000ms 窗口都卡在边界上；
+  小数 t 会造成**整帧位移**（实测 longDt 场景 SQUINT_HOLD 提前/推迟一帧，输出差 0.5）。
+
+生成器用 `Math.round(i * dtMs)`（累计后取整，避免逐帧累加漂移），
+并在 `export-golden.mjs` 里加了整数断言，非整数直接抛错。
+
+JVM 侧请勿再做 `t.roundToLong()` 之类的二次处理 —— 落盘的就是最终值，
+直接用即可，保证两端消费**同一份整数时间线**（delta 序列逐位相同）。
 
 ## 容差
 

@@ -149,6 +149,49 @@ export class TorsoBaseline {
   get baseline() { return [this._baselineRoll, this._baselineYaw]; }
 
   /**
+   * 序列化基线（供 CalibFile 落盘）。
+   * @returns {{calibrationFrames:number, collected:number, baselineRoll:number, baselineYaw:number}}
+   */
+  serialize() {
+    return {
+      calibrationFrames: this.calibrationFrames,
+      collected: this._collected,
+      baselineRoll: this._baselineRoll,
+      baselineYaw: this._baselineYaw,
+    };
+  }
+
+  /**
+   * 载入已保存的基线，跳过冷启动重新校准。
+   *
+   * 接受 serialize() 的输出，或简写 {roll, yaw} / {baselineRoll, baselineYaw}。
+   * 载入后立即视为已校准（collected 补满 effectiveFrames），下一帧直接用
+   * 「当前值 - 基线」，不再走 10 帧混合过渡。
+   *
+   * @param {object} obj
+   * @returns {boolean} 是否成功载入（非法输入返回 false 并保持原状态）
+   */
+  load(obj) {
+    if (!obj || typeof obj !== "object") return false;
+    const roll = Number.isFinite(obj.baselineRoll) ? obj.baselineRoll
+      : (Number.isFinite(obj.roll) ? obj.roll : NaN);
+    const yaw = Number.isFinite(obj.baselineYaw) ? obj.baselineYaw
+      : (Number.isFinite(obj.yaw) ? obj.yaw : NaN);
+    if (!Number.isFinite(roll) || !Number.isFinite(yaw)) return false;
+
+    if (Number.isFinite(obj.calibrationFrames) && obj.calibrationFrames > 0) {
+      this.calibrationFrames = Math.floor(obj.calibrationFrames);
+    }
+    this._baselineRoll = roll;
+    this._baselineYaw = yaw;
+    // 补满收集数，让 isCalibrated 为 true
+    this._collected = this._effectiveFrames;
+    this._sumRoll = roll * this._collected;
+    this._sumYaw = yaw * this._collected;
+    return true;
+  }
+
+  /**
    * 把原始躯干角转成相对基线的角度。
    * @param {number} roll @param {number} yaw 原始（未减基线）躯干角
    * @param {Float32Array|number[]} out 长度 >= 2，就地写 [roll, yaw]
@@ -383,6 +426,24 @@ export class BodyFusion {
       quality: q,
       ubT: ubT === undefined ? 0 : ubT,
     };
+  }
+
+  /**
+   * 载入已保存的躯干基线（CalibFile["torsoBaseline"]），跳过冷启动重新校准。
+   *
+   * win-integrate 的适配层留了 `loadBaseline?.()` 挂点，直接调这个。
+   * 接受 TorsoBaseline.serialize() 的输出，或简写 {roll, yaw}。
+   *
+   * @param {object} baseline
+   * @returns {boolean} 是否成功载入
+   */
+  loadBaseline(baseline) {
+    return this.baseline.load(baseline);
+  }
+
+  /** 导出当前躯干基线（写 CalibFile 用）。 */
+  serializeBaseline() {
+    return this.baseline.serialize();
   }
 
   reset() {

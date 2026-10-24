@@ -85,6 +85,17 @@ function runScenario(name, frames) {
   const out = [];
   let maxJsDivergence = 0;
 
+  // 【硬约束】时间戳必须是整数毫秒。Kotlin BlinkCurveProcessor.process(currentTimeMs: Long)
+  // 只收 Long，小数 t 会让 delta 序列在两端分叉（33.3333… vs 33/34 交替），
+  // 眨眼曲线 curveProgress 逐步累积出 ~1e-2 级偏差，直接打爆 1e-4 容差。
+  // 同理 squint 的 300ms 严格比较、校准的 1000ms 窗口都在边界上，量化差会造成整帧位移。
+  for (let i = 0; i < frames.length; i++) {
+    if (!Number.isInteger(frames[i].t)) {
+      throw new Error(name + " 第 " + i + " 帧 t=" + frames[i].t + " 不是整数毫秒；" +
+        "golden-fixtures.mjs 的 makeSequence 必须用 Math.round(i * dtMs)");
+    }
+  }
+
   for (const fr of frames) {
     const ctx = { width: IMAGE_W, height: IMAGE_H, nowMs: fr.t };
     const raw = fr.landmarks;
@@ -102,7 +113,7 @@ function runScenario(name, frames) {
     outOpt[9] = ol; outOpt[10] = or;
 
     out.push({
-      t: r9(fr.t),
+      t: fr.t, // 整数毫秒，原样落盘（勿做 r9 舍入）
       landmarks: f32ToBase64(raw),
       poseDeg: [r9(fr.pose[0]), r9(fr.pose[1]), r9(fr.pose[2])],
       expectedBs52: Array.from(outOpt, r9),

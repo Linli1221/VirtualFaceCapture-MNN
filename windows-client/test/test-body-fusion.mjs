@@ -249,4 +249,50 @@ export const tests = [
       assert(Number.isFinite(r.torso[0]) && Number.isFinite(r.torso[1]), "torso 有限");
     },
   },
+  {
+    name: "BodyFusion.loadBaseline：载入后立即生效，跳过 10 帧冷启动过渡",
+    fn() {
+      const bf = new BodyFusion();
+      assert(bf.baseline.isCalibrated === false, "初始未校准");
+      const ok = bf.loadBaseline({ roll: 3, yaw: -2 });
+      assert(ok === true, "载入应成功");
+      assert(bf.baseline.isCalibrated === true, "载入后应立即视为已校准");
+
+      const p = frame();
+      // 肩线给一个已知角：dx=0.2, dy=0.1, dz=-0.1 -> roll=yaw=26.565°
+      p[5 * 4] = 0.4; p[5 * 4 + 1] = 0.5; p[5 * 4 + 2] = 0; p[5 * 4 + 3] = 0.9;
+      p[6 * 4] = 0.6; p[6 * 4 + 1] = 0.6; p[6 * 4 + 2] = -0.1; p[6 * 4 + 3] = 0.9;
+      const r = bf.process(p, 0.033, 0);
+      // 首帧 One-Euro 直通 -> 躯干角即 26.565°，减基线得 23.565 / 28.565
+      assertClose(r.torso[0], 26.565051177 - 3, 1e-3, "roll 应为 原始-基线");
+      assertClose(r.torso[1], 26.565051177 - (-2), 1e-3, "yaw 应为 原始-基线");
+    },
+  },
+  {
+    name: "BodyFusion.serializeBaseline / loadBaseline 往返一致",
+    fn() {
+      const a = new BodyFusion({ calibrationFrames: 7 });
+      a.loadBaseline({ roll: 1.25, yaw: -3.5 });
+      const s = a.serializeBaseline();
+      assertClose(s.baselineRoll, 1.25, 1e-12, "baselineRoll");
+      assertClose(s.baselineYaw, -3.5, 1e-12, "baselineYaw");
+      assert(s.calibrationFrames === 7, "calibrationFrames 应保留");
+
+      const b = new BodyFusion();
+      assert(b.loadBaseline(s) === true, "往返载入应成功");
+      assertClose(b.baseline.baseline[0], 1.25, 1e-12, "roll 往返");
+      assertClose(b.baseline.baseline[1], -3.5, 1e-12, "yaw 往返");
+      assert(b.baseline.isCalibrated === true, "往返后仍应校准");
+    },
+  },
+  {
+    name: "BodyFusion.loadBaseline：非法输入返回 false 且不改状态",
+    fn() {
+      const bf = new BodyFusion();
+      assert(bf.loadBaseline(null) === false, "null");
+      assert(bf.loadBaseline({}) === false, "空对象");
+      assert(bf.loadBaseline({ roll: NaN, yaw: 1 }) === false, "NaN");
+      assert(bf.baseline.isCalibrated === false, "失败后不应变成已校准");
+    },
+  },
 ];

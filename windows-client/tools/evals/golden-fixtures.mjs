@@ -197,7 +197,11 @@ export function makeSequence(spec) {
     const pose = spec.pose
       ? (typeof spec.pose === "function" ? spec.pose(i, frames) : spec.pose)
       : [0, 0, 0];
-    out.push({ t: i * dtMs, landmarks: lm, pose: [pose[0], pose[1], pose[2]] });
+    // 【关键】时间戳必须是**整数毫秒**：Kotlin BlinkCurveProcessor.process(currentTimeMs: Long)
+    // 只收 Long，小数 t 会让 delta 序列在两端分叉（33.3333… vs 33/34 交替），
+    // 眨眼曲线 curveProgress 逐步累积出 ~1e-2 级偏差，直接打爆 1e-4 容差。
+    // 取 Math.round(i * dtMs)（累计后取整）而非逐帧累加，避免漂移。
+    out.push({ t: Math.round(i * dtMs), landmarks: lm, pose: [pose[0], pose[1], pose[2]] });
   }
   return out;
 }
