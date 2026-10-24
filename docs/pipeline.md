@@ -17,6 +17,17 @@
 > 文中 `file:line` 是 `feat/mediapipe-upper-body` 分支上的锚点，用来「顺藤摸瓜」定位代码；
 > 函数名比行号更稳定，行号漂移时以函数名为准。
 
+> **rawTrackV1 旁路边界（P1 新增，契约见 [`raw-track-protocol.md`](./raw-track-protocol.md)）**：
+> 当**全部**客户端都在 raw 推流（hello.features 声明 `rawTrackV1` 且 `startStream(rawMode=rawTrackV1)`）时，
+> 本文 §4-§7 描述的手机端后处理链 —— 姿态基线、BlendShape 自标定平滑、眨眼曲线、
+> relativePose —— 与三路原生时域滤波（关键点 EMA / 检测框 / 头姿）**整体旁路**，手机只发
+> 真·未滤波感知输出（OP_BINARY raw_track，含 rawHeadPose / 原始 478 点 / 上半身原始 13 点），
+> 校准、平滑、映射全部归 Windows（500 ms playout 也归 Windows，见 [`jitter-buffer.md`](./jitter-buffer.md)）。
+> 以下场景本文链路照常运行、legacy 文本 track（bs / pose 为后处理结果）语义逐字节不变：
+> ①存在未声明 rawTrackV1 或显式走文本的客户端；②零客户端 / 仅协商未推流（IDLE）——
+> 手机本地 UI（BS 面板 / 头姿调试）依赖后处理结果，纯手机场景不旁路（与协议 §2.2.3
+> 字面的有意差异，wire 无影响，详见 TrackingServer.recomputeStreamModes 注释）。
+
 ---
 
 ## 1. 一句话概括

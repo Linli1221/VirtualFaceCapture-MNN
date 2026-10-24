@@ -23,12 +23,16 @@ import org.junit.Test
  *  1. ARKitBlendShapes.toMediaPipeArray() 的 52 项长度与 §5.1 索引顺序
  *  2. track 报文能被 org.json 解析、字段齐全、小数位 <= 4、单帧 < 1KB
  *  3. hello / status / calib / pong / ack / bye 的 JSON 合法性
- *  4. 客户端上行 ping / command / 畸形 JSON 的分类（必须是 PING / RECALIBRATE / IGNORED，且不抛异常）
+ *  4. 客户端上行 ping / command / startStream / stopStream / resetTracking / 畸形 JSON 的分类
+ *     （PING / RECALIBRATE / START_STREAM / STOP_STREAM / RESET_TRACKING / IGNORED，且不抛异常）
  *  5. 上半身增量字段（hello.upperBody、track.ubOk/ub/ubT/body）的开关、边界与数值清洗
  *  6. 客户端 hello 协商（§4.5）：CLIENT_HELLO 归类与 features 解析（宽容、纯函数）
  *  7. send.bufferMs 配置归一化与生效缓冲回落规则（§7.1 的纯函数）
  *  8. 任务 M2：upperBodyPostV1 协商（features 数组 / 顶层布尔兜底）与 ubRaw / ubRawBody
  *     报文语义（未协商逐字节不变、raw 帧 body 与 ubRawBody 同值、ubOk=false 结构稳定）
+ *  9. rawTrackV1（docs/raw-track-protocol.md §4-§7）：raw_track 二进制帧头逐偏移、量化公式、
+ *     裁剪 / NaN、FACE_VALID=0 结构恒定、ubRaw 128B 扩展块布局、hello rawTrackV1 字段、
+ *     ackResult（requestId / ok / error / sessionId）与 status 可选 sessionId
  */
 class TrackingProtocolTest {
 

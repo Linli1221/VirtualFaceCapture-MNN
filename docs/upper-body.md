@@ -211,6 +211,10 @@ fun submitUpperBodySnapshot(frame: UpperBodyPoseFrame)
 - `submitFrame(...)` 签名**不变**；`TrackingServer.submitTrack` 在序列化时读取最新快照。
 - 快照过期（`now - timestampMs > 1500`）时按 `ubOk = false` 发（客户端回默认姿态）。
 - 未开启上半身时，`track` 报文里**完全不出现** `ub`/`ubOk`/`ubT`/`body`（保持 0.5KB 级别）。
+- **rawTrackV1（P1）**：检测器的 `rawOutput` 是「M2 协商 ∪ raw 推流」的**合并开关**（任一生效
+  即发原始 13 点）；raw 推流期间上半身原始点走 raw_track 的 **ubRaw 扩展块**（13×8B + ubT +
+  torsoRaw + quality + ubTracking，见 [`raw-track-protocol.md`](./raw-track-protocol.md) §5），
+  该连接不再发文本 track。
 
 ### 3.5 App 侧（`app/`）
 
@@ -269,6 +273,12 @@ PC，手机只保留「推理 → 抽 13 点 → isTracking」。
 声明，不存在「字段名没变但语义变了」）。未协商成功时手机继续走原有完整后处理链，报文
 与 v1 老语义逐字节一致。多客户端时只有**所有**已连接客户端都声明能力才启用（track 是
 广播同一条报文，混合客户端时全体回退旧链）。
+
+**rawTrackV1（P1）增量**：raw 推流连接的 ubRaw **扩展块**（[`raw-track-protocol.md`](./raw-track-protocol.md)
+§5）携带**未平滑** 13 点与原始躯干角 `torsoRaw`（One-Euro / TorsoBaseline 全部归 PC），块内
+`ubTracking=0` 时 13 点全 0、`torso=[0,0]`（结构恒定）。扩展块只在「上半身开启 ∧ raw 推流」时
+出现（帧头 flags bit1），与本文 `track.ubRaw:true` 是文本 / 二进制两种形态各自的原始通道，
+互不混发。
 
 **责任划分**：
 

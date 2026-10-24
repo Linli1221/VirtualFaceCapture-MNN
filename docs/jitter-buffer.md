@@ -1,5 +1,11 @@
 # M1：自适应抖动缓冲（手机 500 ms 发送缓冲迁移到 PC）
 
+> **rawTrackV1 增量（P1）**：raw 推流连接的 raw_track 二进制帧**旁路手机端本缓冲**
+> （[`raw-track-protocol.md`](./raw-track-protocol.md) §2.5）——帧序由 facecapture-sdk 的
+> FrameReorderBuffer 保障、延迟与播放控制全部归 Windows 的 500 ms playout。per-client
+> 发送队列（§8）的 control 保序规则原样适用于二进制条目（hello / ack / bye / pong 绝不被
+> raw 帧挤掉或乱序）。本页的 500 ms 缓冲只服务文本 track / calib（legacy / v1 文本路径）。
+
 > 目标：端到端延迟从约 0.58 s 降到良好网络下 < 200 ms，同时在网络抖动时保持稳定。
 > 不改变手机推理链路，不改协议已有字段语义（只做纯增量扩展）。
 

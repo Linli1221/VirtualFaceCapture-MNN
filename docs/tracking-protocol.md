@@ -9,6 +9,14 @@
 >
 > 想知道「这些字段是流水线里的哪一步算出来的」，看
 > [`docs/pipeline.md`](./pipeline.md)（动捕流水线架构）。
+>
+> **rawTrackV1 二进制旁路（P1 增量）**：客户端 hello.features 声明 `rawTrackV1` 并
+> `startStream(rawMode=rawTrackV1)` 后，该连接改收 **OP_BINARY raw_track** 原始感知帧
+> （真·未滤波输出，契约见 [`raw-track-protocol.md`](./raw-track-protocol.md)）。本文的文本
+> `track`（`bs` / `pose` 为手机后处理结果）只发给未声明或显式走文本的客户端，两种形态
+> per-client 并存、互不混发；**本文 legacy 文本报文语义逐字节不变**。手机后处理链
+> （姿态基线 / BlendShape 自标定 / 眨眼曲线）仅在存在文本客户端时运行（旁路边界见
+> [`pipeline.md`](./pipeline.md)）。
 
 ---
 
