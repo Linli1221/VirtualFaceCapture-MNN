@@ -222,6 +222,16 @@ data class CameraFrame(
  *                              reported by the Landmark model.
  * @property isCalibrating      `true` while still inside the calibration window.
  * @property fps                Rolling inference FPS reported by the engine.
+ * @property timestampMs        Capture timestamp: wall-clock Unix ms sampled in the
+ *                              camera callback (rawTrackV1 frame header `t`).
+ * @property inferenceMs        Perception inference duration for this frame in ms
+ *                              (landmark + head pose; 0 when unavailable).
+ * @property cameraFps          Camera capture rate (0 until the first stats window
+ *                              elapses; rawTrackV1 frame header `cameraFps`).
+ * @property postProcessed      `false` when the phone-side post-processing chain is
+ *                              bypassed (rawTrackV1 raw mode): [blendShapes] /
+ *                              [relativeHeadPose] / [isCalibrating] are zero placeholders
+ *                              and must be ignored; the raw layer stays valid.
  */
 data class FaceCaptureResult(
     val frameId: Long,
@@ -235,4 +245,8 @@ data class FaceCaptureResult(
     val presenceScore: Float,
     val isCalibrating: Boolean,
     val fps: Float,
+    val timestampMs: Long = 0L,
+    val inferenceMs: Float = 0f,
+    val cameraFps: Float = 0f,
+    val postProcessed: Boolean = true,
 )

@@ -13,6 +13,12 @@ import org.junit.Test
  */
 class TrackingFrameBufferTest {
 
+    /**
+     * 测试适配器：[TrackingFrameBuffer.poll] 现在返回带显式 control 标记的 Entry，
+     * 老用例只关心报文文本，这里取 .message。
+     */
+    private fun TrackingFrameBuffer.pollMessage(nowNanos: Long): String? = poll(nowNanos)?.message
+
     /** 测试用假时钟起点（非 0，顺便验证实现没有把 0 当成有效时间戳的假设）。 */
     private val t0 = 1_000_000_000L
 
@@ -30,21 +36,21 @@ class TrackingFrameBufferTest {
         buffer.enqueue("f0", t0)
 
         // 差 1 ns 都不能发：缓冲时间内必须一帧都不放行
-        assertNull(buffer.poll(t0 + bufferNanos - 1L))
-        assertEquals("f0", buffer.poll(t0 + bufferNanos))
+        assertNull(buffer.pollMessage(t0 + bufferNanos - 1L))
+        assertEquals("f0", buffer.pollMessage(t0 + bufferNanos))
     }
 
     @Test
     fun rebuffersFullDelayAfterAStall() {
         val buffer = TrackingFrameBuffer(bufferMs = 500)
         buffer.enqueue("f0", t0)
-        assertEquals("f0", buffer.poll(t0 + bufferNanos))
+        assertEquals("f0", buffer.pollMessage(t0 + bufferNanos))
 
         // 断流 10 s 后重新开始推流：新帧同样要重新攒满 0.5 s
         val t1 = t0 + 10_000_000_000L
         buffer.enqueue("f1", t1)
-        assertNull(buffer.poll(t1 + bufferNanos - 1L))
-        assertEquals("f1", buffer.poll(t1 + bufferNanos))
+        assertNull(buffer.pollMessage(t1 + bufferNanos - 1L))
+        assertEquals("f1", buffer.pollMessage(t1 + bufferNanos))
     }
 
     // ---------------------------------------------------------- 匀速放行
@@ -56,11 +62,11 @@ class TrackingFrameBufferTest {
         buffer.enqueue("f1", t0 + step)
         buffer.enqueue("f2", t0 + step * 2)
 
-        assertEquals("f0", buffer.poll(t0 + bufferNanos))
+        assertEquals("f0", buffer.pollMessage(t0 + bufferNanos))
         // 下一帧的到期时刻 = 入队时间 + 0.5s = 上一次放行 + 一个帧间隔
-        assertNull(buffer.poll(t0 + bufferNanos + step - 1L))
-        assertEquals("f1", buffer.poll(t0 + bufferNanos + step))
-        assertEquals("f2", buffer.poll(t0 + bufferNanos + step * 2))
+        assertNull(buffer.pollMessage(t0 + bufferNanos + step - 1L))
+        assertEquals("f1", buffer.pollMessage(t0 + bufferNanos + step))
+        assertEquals("f2", buffer.pollMessage(t0 + bufferNanos + step * 2))
     }
 
     @Test
@@ -70,13 +76,13 @@ class TrackingFrameBufferTest {
         for (index in 0 until 5) buffer.enqueue("f$index", t0)
 
         // 第一帧照常攒满 0.5 s 后放行
-        assertEquals("f0", buffer.poll(t0 + bufferNanos))
+        assertEquals("f0", buffer.pollMessage(t0 + bufferNanos))
         // 其余 4 帧不能一口气全发，而是按一个帧间隔一帧
-        assertNull(buffer.poll(t0 + bufferNanos))
-        assertEquals("f1", buffer.poll(t0 + bufferNanos + step))
-        assertEquals("f2", buffer.poll(t0 + bufferNanos + step * 2))
-        assertEquals("f3", buffer.poll(t0 + bufferNanos + step * 3))
-        assertEquals("f4", buffer.poll(t0 + bufferNanos + step * 4))
+        assertNull(buffer.pollMessage(t0 + bufferNanos))
+        assertEquals("f1", buffer.pollMessage(t0 + bufferNanos + step))
+        assertEquals("f2", buffer.pollMessage(t0 + bufferNanos + step * 2))
+        assertEquals("f3", buffer.pollMessage(t0 + bufferNanos + step * 3))
+        assertEquals("f4", buffer.pollMessage(t0 + bufferNanos + step * 4))
     }
 
     @Test
@@ -87,18 +93,18 @@ class TrackingFrameBufferTest {
 
         // 起播，并按节奏把 f0 ~ f10 放出去
         var now = t0 + bufferNanos
-        assertEquals("f0", buffer.poll(now))
+        assertEquals("f0", buffer.pollMessage(now))
         for (index in 1..10) {
             now += step
-            assertEquals("f$index", buffer.poll(now))
+            assertEquals("f$index", buffer.pollMessage(now))
         }
 
         // 推理卡了 100 ms：f11 迟到，但它的到达时刻仍然远早于它该上场的时刻
         buffer.enqueue("f11", t0 + step * 11 + 100_000_000L)
 
         // 到点就发。若按「入队时间 + 0.5 s」放行，这里会多出 100 ms 的空洞（返回 null）
-        assertNull(buffer.poll(now + step - 1L))
-        assertEquals("f11", buffer.poll(now + step))
+        assertNull(buffer.pollMessage(now + step - 1L))
+        assertEquals("f11", buffer.pollMessage(now + step))
     }
 
     @Test
@@ -110,9 +116,9 @@ class TrackingFrameBufferTest {
         for (index in 0 until 24) buffer.enqueue("f$index", t0 + slowStep * index)
 
         var now = t0 + bufferNanos
-        assertEquals("f0", buffer.poll(now))
+        assertEquals("f0", buffer.pollMessage(now))
         // 放行一帧后，下一帧至少隔一个「生产间隔」（允许 EMA 还没完全收敛的误差）
-        assertNull(buffer.poll(now + 20_000_000L))
+        assertNull(buffer.pollMessage(now + 20_000_000L))
     }
 
     // ------------------------------------------------------------ 保护逻辑
@@ -136,7 +142,7 @@ class TrackingFrameBufferTest {
                 seq++
                 nextProduce = now + step
             }
-            if (buffer.poll(now) != null) {
+            if (buffer.pollMessage(now) != null) {
                 if (lastReleaseNanos != 0L) {
                     maxGapNanos = maxOf(maxGapNanos, now - lastReleaseNanos)
                 }
@@ -159,20 +165,20 @@ class TrackingFrameBufferTest {
         assertEquals(3, buffer.size)
         assertEquals(2L, buffer.droppedCount)
         // f0 / f1 被丢掉，队头变成 f2
-        assertEquals("f2", buffer.poll(t0 + step * 2 + bufferNanos))
-        assertEquals("f3", buffer.poll(t0 + step * 3 + bufferNanos))
-        assertEquals("f4", buffer.poll(t0 + step * 4 + bufferNanos))
+        assertEquals("f2", buffer.pollMessage(t0 + step * 2 + bufferNanos))
+        assertEquals("f3", buffer.pollMessage(t0 + step * 3 + bufferNanos))
+        assertEquals("f4", buffer.pollMessage(t0 + step * 4 + bufferNanos))
     }
 
     @Test
     fun zeroBufferReleasesImmediatelyButKeepsPacing() {
         val buffer = TrackingFrameBuffer(bufferMs = 0)
         buffer.enqueue("f0", t0)
-        assertEquals("f0", buffer.poll(t0))
+        assertEquals("f0", buffer.pollMessage(t0))
 
         buffer.enqueue("f1", t0)
-        assertNull(buffer.poll(t0))
-        assertEquals("f1", buffer.poll(t0 + step))
+        assertNull(buffer.pollMessage(t0))
+        assertEquals("f1", buffer.pollMessage(t0 + step))
     }
 
     @Test
@@ -182,11 +188,11 @@ class TrackingFrameBufferTest {
         buffer.clear()
 
         assertEquals(0, buffer.size)
-        assertNull(buffer.poll(t0 + bufferNanos))
+        assertNull(buffer.pollMessage(t0 + bufferNanos))
 
         // 清空后新来的帧仍然要重新攒满 0.5 s
         buffer.enqueue("f1", t0)
-        assertEquals("f1", buffer.poll(t0 + bufferNanos))
+        assertEquals("f1", buffer.pollMessage(t0 + bufferNanos))
     }
 
     @Test
@@ -197,7 +203,22 @@ class TrackingFrameBufferTest {
         buffer.enqueue("f0", t0)
         assertEquals(t0 + bufferNanos, buffer.nextDueNanos())
 
-        buffer.poll(t0 + bufferNanos)
+        buffer.pollMessage(t0 + bufferNanos)
         assertEquals(Long.MAX_VALUE, buffer.nextDueNanos())
+    }
+
+    @Test
+    fun entryCarriesExplicitControlFlag() {
+        val buffer = TrackingFrameBuffer(bufferMs = 500)
+        buffer.enqueue("f0", t0, control = false)
+        buffer.enqueue("c0", t0 + step, control = true)
+
+        // control 判定用条目自带的显式类型字段（rawTrackV1 §2.5：不再 parseType 解析内容）
+        val first = buffer.poll(t0 + bufferNanos)
+        assertEquals("f0", first?.message)
+        assertEquals(false, first?.control)
+        val second = buffer.poll(t0 + bufferNanos + step)
+        assertEquals("c0", second?.message)
+        assertEquals(true, second?.control)
     }
 }

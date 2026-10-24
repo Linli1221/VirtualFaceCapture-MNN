@@ -2,11 +2,14 @@ package com.example.virtualfacecapture.tracking
 
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.BodyPoint
+import com.example.commondata.Point3D
 import com.example.commondata.TorsoAngles
 import com.example.commondata.UpperBodyLandmarkIndex
 import com.example.commondata.UpperBodyPoseFrame
 import org.json.JSONArray
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -918,5 +921,290 @@ class TrackingProtocolTest {
         assertNull(TrackingProtocol.parseBoolField("""{"a":truex}""", "a"))
         assertNull(TrackingProtocol.parseBoolField("""{"a":falsex}""", "a"))
         assertNull(TrackingProtocol.parseBoolField("", "a"))
+    }
+
+    // ================================ rawTrackV1（docs/raw-track-protocol.md §4/§5/§6/§7）
+
+    /** 478 个确定性测试点（原始索引序），坐标覆盖 [0,1] 内与 z 正负半轴。 */
+    private fun sampleLandmarks(count: Int = TrackingRawProtocol.LANDMARK_COUNT): List<Point3D> =
+        List(count) { index ->
+            Point3D(
+                x = (index % 100) / 100f,
+                y = ((index * 7) % 100) / 100f,
+                z = if (index % 2 == 0) 0.5f else -2.5f,
+            )
+        }
+
+    private fun le(bytes: ByteArray): ByteBuffer =
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+
+    private fun encodeSample(
+        faceValid: Boolean = true,
+        landmarks: List<Point3D>? = sampleLandmarks(),
+        posePitch: Float = -3.5f,
+        poseYaw: Float = 8.25f,
+        poseRoll: Float = 0.4f,
+        upperBody: UpperBodyPoseFrame? = null,
+    ): ByteArray = TrackingRawProtocol.encodeRawTrack(
+        frameId = 0x123456789L,
+        timestampMs = 1730000000123L,
+        cameraFps = 59.5f,
+        width = 1280,
+        height = 720,
+        presence = 0.875f,
+        inferenceMs = 12.5f,
+        posePitch = posePitch,
+        poseYaw = poseYaw,
+        poseRoll = poseRoll,
+        boxLeft = -0.1f,
+        boxTop = 0.2f,
+        boxRight = 1.1f,
+        boxBottom = 0.9f,
+        boxScore = 1.5f,
+        faceValid = faceValid,
+        landmarks = landmarks,
+        upperBody = upperBody,
+    )
+
+    @Test
+    fun rawTrackHeaderMatchesProtocolByteOffsets() {
+        val bytes = encodeSample()
+        assertEquals(
+            TrackingRawProtocol.HEADER_BYTES + TrackingRawProtocol.LANDMARK_BLOCK_BYTES,
+            bytes.size,
+        )
+        val b = le(bytes)
+
+        // 帧头逐字段对照协议 §4.2 偏移表（little-endian）
+        assertEquals('V'.code, b.get(0).toInt() and 0xFF)
+        assertEquals('F'.code, b.get(1).toInt() and 0xFF)
+        assertEquals('C'.code, b.get(2).toInt() and 0xFF)
+        assertEquals('R'.code, b.get(3).toInt() and 0xFF)
+        assertEquals(1, b.get(4).toInt() and 0xFF) // frameVersion
+        assertEquals(0x01, b.get(5).toInt() and 0xFF) // msgType = RAW_TRACK
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertEquals(
+            TrackingRawProtocol.FLAG_FACE_VALID or TrackingRawProtocol.FLAG_POSE_VALID,
+            flags,
+        )
+        assertEquals(0x23456789, b.getInt(8)) // frameId（u32，取低 32 位）
+        assertEquals(59.5f, b.getFloat(12), 1e-6f) // cameraFps
+        assertEquals(1730000000123L, b.getLong(16)) // t
+        assertEquals(1280, b.getShort(24).toInt() and 0xFFFF) // width
+        assertEquals(720, b.getShort(26).toInt() and 0xFFFF) // height
+        assertEquals(0.875f, b.getFloat(28), 1e-6f) // presence
+        assertEquals(12.5f, b.getFloat(32), 1e-6f) // inferenceMs
+        assertEquals(-3.5f, b.getFloat(36), 1e-6f) // poseRaw（rawHeadPose）
+        assertEquals(8.25f, b.getFloat(40), 1e-6f)
+        assertEquals(0.4f, b.getFloat(44), 1e-6f)
+        assertEquals(-0.1f, b.getFloat(48), 1e-6f) // box.left（可越界，原样写）
+        assertEquals(0.2f, b.getFloat(52), 1e-6f)
+        assertEquals(1.1f, b.getFloat(56), 1e-6f)
+        assertEquals(0.9f, b.getFloat(60), 1e-6f)
+        assertEquals(478, b.getShort(64).toInt() and 0xFFFF) // landmarkCount
+        assertEquals(6, b.getShort(66).toInt() and 0xFFFF) // landmarkStride
+        // box.score 裁剪 [0,1]（§8.4）
+        assertEquals(1.0f, b.getFloat(68), 1e-6f)
+    }
+
+    @Test
+    fun rawTrackLandmarkQuantizationMatchesFormula() {
+        val bytes = encodeSample()
+        val b = le(bytes)
+        val base = TrackingRawProtocol.HEADER_BYTES
+        for (index in 0 until TrackingRawProtocol.LANDMARK_COUNT) {
+            val offset = base + index * TrackingRawProtocol.LANDMARK_STRIDE
+            // 与 TrackingRawProtocol.quantizeXy / quantizeZ 逐式一致（§4.3）
+            val expectedX = Math.round(((index % 100) / 100f).toDouble() * 65535.0).toInt()
+            val expectedY = Math.round((((index * 7) % 100) / 100f).toDouble() * 65535.0).toInt()
+            val expectedZ = if (index % 2 == 0) {
+                Math.round((0.5f / TrackingRawProtocol.Z_SCALE).toDouble() * 32767.0).toInt()
+            } else {
+                Math.round((-2.5f / TrackingRawProtocol.Z_SCALE).toDouble() * 32767.0).toInt()
+            }
+            assertEquals("x_q @ " + index, expectedX, b.getShort(offset).toInt() and 0xFFFF)
+            assertEquals("y_q @ " + index, expectedY, b.getShort(offset + 2).toInt() and 0xFFFF)
+            assertEquals("z_q @ " + index, expectedZ, b.getShort(offset + 4).toInt())
+        }
+    }
+
+    @Test
+    fun rawTrackClampsOutOfRangeAndSetsClampedFlag() {
+        val landmarks = List(TrackingRawProtocol.LANDMARK_COUNT) { index ->
+            if (index == 0) Point3D(1.5f, -0.25f, 9.0f) else Point3D(0.5f, 0.5f, 0f)
+        }
+        val b = le(encodeSample(landmarks = landmarks))
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertTrue((flags and TrackingRawProtocol.FLAG_LANDMARKS_CLAMPED) != 0)
+        val offset = TrackingRawProtocol.HEADER_BYTES
+        assertEquals(65535, b.getShort(offset).toInt() and 0xFFFF) // x 裁剪到 1
+        assertEquals(0, b.getShort(offset + 2).toInt() and 0xFFFF) // y 裁剪到 0
+        assertEquals(32767, b.getShort(offset + 4).toInt()) // z/Z_SCALE 裁剪到 1
+    }
+
+    @Test
+    fun rawTrackNonFiniteValuesQuantizeToZeroAndFlagClamped() {
+        val landmarks = List(TrackingRawProtocol.LANDMARK_COUNT) { index ->
+            if (index == 0) Point3D(Float.NaN, Float.POSITIVE_INFINITY, Float.NaN)
+            else Point3D(0.5f, 0.5f, 0f)
+        }
+        val b = le(encodeSample(landmarks = landmarks))
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertTrue((flags and TrackingRawProtocol.FLAG_LANDMARKS_CLAMPED) != 0)
+        val offset = TrackingRawProtocol.HEADER_BYTES
+        assertEquals(0, b.getShort(offset).toInt() and 0xFFFF)
+        assertEquals(0, b.getShort(offset + 2).toInt() and 0xFFFF)
+        assertEquals(0, b.getShort(offset + 4).toInt())
+    }
+
+    @Test
+    fun rawTrackFaceInvalidKeepsConstantStructure() {
+        val bytes = encodeSample(faceValid = false)
+        assertEquals(
+            TrackingRawProtocol.HEADER_BYTES + TrackingRawProtocol.LANDMARK_BLOCK_BYTES,
+            bytes.size,
+        )
+        val b = le(bytes)
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertEquals(TrackingRawProtocol.FLAG_POSE_VALID, flags) // FACE_VALID 未置位
+        // 关键点块结构长度恒定、内容全 0（§4.3）
+        for (index in intArrayOf(0, 1, 237, 477)) {
+            val offset = TrackingRawProtocol.HEADER_BYTES + index * TrackingRawProtocol.LANDMARK_STRIDE
+            assertEquals(0, b.getShort(offset).toInt() and 0xFFFF)
+            assertEquals(0, b.getShort(offset + 2).toInt() and 0xFFFF)
+            assertEquals(0, b.getShort(offset + 4).toInt())
+        }
+    }
+
+    @Test
+    fun rawTrackNonFinitePoseClearsPoseValid() {
+        val b = le(encodeSample(posePitch = Float.NaN))
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertEquals(TrackingRawProtocol.FLAG_FACE_VALID, flags) // POSE_VALID 未置位
+        assertEquals(0f, b.getFloat(36), 0f)
+        assertEquals(0f, b.getFloat(40), 0f)
+        assertEquals(0f, b.getFloat(44), 0f)
+    }
+
+    @Test
+    fun rawTrackUpperBodyExtensionBlockLayout() {
+        val bytes = encodeSample(upperBody = sampleUpperBody())
+        assertEquals(
+            TrackingRawProtocol.HEADER_BYTES + TrackingRawProtocol.LANDMARK_BLOCK_BYTES +
+                TrackingRawProtocol.UB_EXT_BYTES,
+            bytes.size,
+        )
+        val b = le(bytes)
+        val flags = b.getShort(6).toInt() and 0xFFFF
+        assertTrue((flags and TrackingRawProtocol.FLAG_UB_EXT_PRESENT) != 0)
+
+        val base = TrackingRawProtocol.HEADER_BYTES + TrackingRawProtocol.LANDMARK_BLOCK_BYTES
+        // 13 × 8 B 原始点：x_q/y_q u16、z_q i16、vis_q u16（§5）
+        val expectedX = Math.round(0.1f.toDouble() * 65535.0).toInt()
+        assertEquals(expectedX, b.getShort(base).toInt() and 0xFFFF)
+        val expectedVis = Math.round(0.9f.toDouble() * 65535.0).toInt()
+        assertEquals(expectedVis, b.getShort(base + 6).toInt() and 0xFFFF)
+        assertEquals(1730000000100L, b.getLong(base + 104)) // ubT
+        assertEquals(2.5f, b.getFloat(base + 112), 1e-6f) // torsoRaw.roll
+        assertEquals(-4.25f, b.getFloat(base + 116), 1e-6f) // torsoRaw.yaw
+        assertEquals(0.85f, b.getFloat(base + 120), 1e-6f) // quality
+        assertEquals(1, b.get(base + 124).toInt() and 0xFF) // ubTracking
+        assertEquals(0, b.get(base + 125).toInt() and 0xFF) // 保留位必须为 0
+        assertEquals(0, b.get(base + 126).toInt() and 0xFF)
+        assertEquals(0, b.get(base + 127).toInt() and 0xFF)
+    }
+
+    @Test
+    fun rawTrackUpperBodyNotTrackingWritesZeroBlock() {
+        val b = le(encodeSample(upperBody = sampleUpperBody().copy(tracking = false)))
+        val base = TrackingRawProtocol.HEADER_BYTES + TrackingRawProtocol.LANDMARK_BLOCK_BYTES
+        assertEquals(0, b.get(base + 124).toInt() and 0xFF) // ubTracking = 0
+        // 13 点全 0、torso = [0,0]、ubT = 0（结构稳定，§5）
+        for (index in 0 until 13) {
+            val offset = base + index * 8
+            assertEquals(0, b.getShort(offset).toInt() and 0xFFFF)
+            assertEquals(0, b.getShort(offset + 2).toInt() and 0xFFFF)
+            assertEquals(0, b.getShort(offset + 4).toInt())
+            assertEquals(0, b.getShort(offset + 6).toInt() and 0xFFFF)
+        }
+        assertEquals(0L, b.getLong(base + 104))
+        assertEquals(0f, b.getFloat(base + 112), 0f)
+        assertEquals(0f, b.getFloat(base + 116), 0f)
+        assertEquals(0f, b.getFloat(base + 120), 0f)
+    }
+
+    @Test
+    fun helloDeclaresRawTrackV1OnlyWhenRequested() {
+        val legacy = TrackingProtocol.buildHello(device = "d", app = "a")
+        assertFalse(legacy.contains("rawTrackV1"))
+        val raw = TrackingProtocol.buildHello(device = "d", app = "a", rawTrackV1 = true)
+        assertTrue(raw.contains("\"rawTrackV1\":true"))
+    }
+
+    @Test
+    fun ackResultEchoesRequestIdAndCarriesOkErrorSession() {
+        val ok = JSONObject(TrackingProtocol.buildAckResult("startStream", "r-1", ok = true))
+        assertEquals("ack", ok.getString("type"))
+        assertEquals("startStream", ok.getString("name"))
+        assertEquals("r-1", ok.getString("requestId"))
+        assertTrue(ok.getBoolean("ok"))
+        assertFalse(ok.has("error"))
+        assertFalse(ok.has("sessionId"))
+
+        val fail = JSONObject(
+            TrackingProtocol.buildAckResult(
+                "startStream", null, ok = false, error = "rawMode not negotiated",
+            ),
+        )
+        assertFalse(fail.has("requestId"))
+        assertFalse(fail.getBoolean("ok"))
+        assertEquals("rawMode not negotiated", fail.getString("error"))
+
+        val reset = JSONObject(
+            TrackingProtocol.buildAckResult("resetTracking", "r-4", ok = true, sessionId = 7L),
+        )
+        assertEquals(7L, reset.getLong("sessionId"))
+
+        // legacy ack 形状逐字节不变（旧客户端路径回归）
+        assertEquals("{\"type\":\"ack\",\"name\":\"recalibrate\"}", TrackingProtocol.buildAck("recalibrate"))
+    }
+
+    @Test
+    fun classifiesStreamControlMessages() {
+        val start = """{"type":"startStream","rawMode":"rawTrackV1","requestId":"r-0001"}"""
+        assertEquals(TrackingProtocol.ClientMessage.START_STREAM, TrackingProtocol.classifyClientMessage(start))
+        assertEquals("rawTrackV1", TrackingProtocol.parseRawMode(start))
+        assertEquals("r-0001", TrackingProtocol.parseRequestId(start))
+
+        val stop = """{"type":"stopStream","requestId":"r-0003"}"""
+        assertEquals(TrackingProtocol.ClientMessage.STOP_STREAM, TrackingProtocol.classifyClientMessage(stop))
+        assertNull(TrackingProtocol.parseRawMode(stop))
+
+        val reset = """{"type":"resetTracking","requestId":"r-0004"}"""
+        assertEquals(TrackingProtocol.ClientMessage.RESET_TRACKING, TrackingProtocol.classifyClientMessage(reset))
+
+        // rawMode 缺省 / 未知值 → null（调用方按 legacy 处理，§2.3）
+        assertNull(TrackingProtocol.parseRawMode("""{"type":"startStream"}"""))
+
+        // 未知 type / 畸形 JSON 一律 IGNORED（不抛异常）
+        assertEquals(
+            TrackingProtocol.ClientMessage.IGNORED,
+            TrackingProtocol.classifyClientMessage("""{"type":"startStreamX"}"""),
+        )
+        assertEquals(
+            TrackingProtocol.ClientMessage.IGNORED,
+            TrackingProtocol.classifyClientMessage("""{"type":"startStream"""),
+        )
+    }
+
+    @Test
+    fun statusCarriesOptionalSessionId() {
+        val legacy = TrackingProtocol.buildStatus(true, true, 1, 60f, "dev", 42L)
+        assertFalse(legacy.contains("sessionId"))
+        val withSession = JSONObject(
+            TrackingProtocol.buildStatus(true, true, 1, 60f, "dev", 42L, sessionId = 7L),
+        )
+        assertEquals(7L, withSession.getLong("sessionId"))
+        assertEquals(42L, withSession.getLong("seq"))
     }
 }

@@ -314,6 +314,7 @@ class MediaPipeFaceDetector(private val context: Context) {
         emaAlpha: Float
     )
     private external fun nativeSetHeadPoseFilterType(filterType: Int)
+    private external fun nativeSetHeadPoseSmoothingEnabled(enabled: Boolean)
 
     // ========== YUV Direct Input Native Methods ==========
     // These allow direct YUV processing without intermediate RGB conversion
@@ -509,6 +510,24 @@ class MediaPipeFaceDetector(private val context: Context) {
         if (isInitialized) {
             nativeSetHeadPoseFilterType(type)
             Log.i(TAG, "Head pose filter type set to $type")
+        }
+    }
+
+    /**
+     * 开关 head pose 时域平滑（rawTrackV1 主口径旁路，docs/raw-track-protocol.md §4.3 /
+     * docs/post-pipeline-migration.md 附录 K.4）。
+     *
+     * false = estimateHeadPose 直接返回 Procrustes 原始欧拉角（真·未滤波）；true = 恢复
+     * 原 TIME_BASED_EMA。这是本次迁移唯一的 C++ 绑定新增（nativeSetHeadPoseSmoothingEnabled
+     * 是既有 FaceLandmarker::setHeadPoseSmoothingEnabled 的纯胶水）。
+     *
+     * 模式切换时调用方应连带 [resetSmoothing]（清掉关键点/检测/头姿三路滤波历史），
+     * 避免上一模式的滤波状态跨模式串味。
+     */
+    fun setHeadPoseSmoothingEnabled(enabled: Boolean) {
+        if (isInitialized) {
+            nativeSetHeadPoseSmoothingEnabled(enabled)
+            Log.i(TAG, "Head pose smoothing " + if (enabled) "enabled" else "disabled")
         }
     }
 

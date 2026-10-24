@@ -14,6 +14,7 @@ import com.example.commondata.Point3D
 import com.example.mediapipefacelandmark.Camera2Manager
 import com.example.mediapipefacelandmark.MediaPipeFaceDetector
 import com.example.mediapipefacelandmark.MnnBackend
+import com.example.mediapipefacelandmark.SmoothingFilterType
 import com.example.mediapipefacelandmark.YuvFrameData
 import com.live2d.facecapture.BlinkCurveProcessor
 import com.live2d.facecapture.FaceCapturePipeline
@@ -313,6 +314,42 @@ class PipelineFaceTracker(private val context: Context) {
     @Volatile private var isInitialized = false
     private var lastHeadPose = HeadPoseData()
 
+    // ---------------------------------------------------------------- rawTrackV1 支撑字段
+
+    /**
+     * 相机采集帧率（约 5 s 窗口统计，rawTrackV1 帧头 cameraFps）；首轮窗口未满前为 0
+     * （协议要求「无统计时写 0」）。相机回调线程写、处理阶段读，@Volatile 保证可见性。
+     */
+    @Volatile private var cameraFpsValue = 0f
+
+    /**
+     * frameId 计数器（rawTrackV1 帧头主键，协议 §7）：**在相机回调处**递增（采集时刻分配，
+     * 先于任何排队/并行推理），[resetPerceptionState] 时随会话重置。
+     */
+    private val frameIdCounter = AtomicLong(0L)
+
+    /**
+     * 感知层会话代次：[resetPerceptionState]（resetTracking）时 +1，各阶段消费侧据此丢弃
+     * 重置前的在途旧帧，防止旧 frameId 与新会话（从 0 起）在重排缓冲里交叉。
+     *
+     * AtomicInteger：resetTracking 可能来自任意 WS 读线程，自增必须原子。
+     */
+    private val pipelineSession = AtomicInteger(0)
+
+    /**
+     * 后处理旁路开关（rawTrackV1 主口径，docs/post-pipeline-migration.md 附录 K.4）：
+     * false = 跳过 FaceCapturePipeline（姿态基线 / BlendShape 校准平滑 / relativePose）与
+     * 眨眼曲线，并旁路原生关键点 / 检测框 / 头姿时域滤波 —— 输出真·未滤波 MNN 感知结果。
+     * 见 [setPostProcessingEnabled]。
+     */
+    @Volatile private var postProcessingOn = true
+
+    /** raw 滤波旁路的挂起状态：初始化之前请求也能生效（[initialize] 末尾补挂）。 */
+    @Volatile private var rawFilterBypass = false
+
+    /** 进入 raw 旁路前的检测框滤波类型（切回 legacy 时恢复）。 */
+    private var savedDetectionFilterType: SmoothingFilterType = SmoothingFilterType.TIME_BASED_EMA
+
     /** 初始化时实际使用的 MNN 推理线程数（仅用于性能日志）。 */
     private var mnnThreadCount = 0
 
@@ -388,6 +425,19 @@ class PipelineFaceTracker(private val context: Context) {
         val presenceScore: Float,
         val isCalibrating: Boolean,
         val fps: Float,
+        /** 采集时间戳：相机回调处 System.currentTimeMillis() 的 wall-clock 毫秒（rawTrackV1 帧头 t）。 */
+        val timestampMs: Long = 0L,
+        /** 本帧感知推理耗时（ms，rawTrackV1 帧头 inferenceMs；无统计时 0）。 */
+        val inferenceMs: Float = 0f,
+        /** 相机采集帧率（rawTrackV1 帧头 cameraFps；无统计时 0）。 */
+        val cameraFps: Float = 0f,
+        /**
+         * false = 手机端后处理已旁路（rawTrackV1 主口径）：[blendShapes] / [relativeHeadPose] /
+         * [isCalibrating] 为全 0 / false 占位，消费方必须忽略；原始层（[landmarks] / [rawHeadPose] /
+         * [detectionBox] / [presenceScore] / [imageWidth] / [imageHeight] / [timestampMs] /
+         * [inferenceMs] / [cameraFps]）永远有效。
+         */
+        val postProcessed: Boolean = true,
     )
 
     // ============================================================================
@@ -400,12 +450,15 @@ class PipelineFaceTracker(private val context: Context) {
         val width: Int,
         val height: Int,
         val timestamp: Long = System.currentTimeMillis(),
+        /** 感知层会话代次（[resetPerceptionState] 时 +1）：消费侧丢弃重置前的在途旧帧。 */
+        val session: Int = 0,
     )
 
     private data class YuvFrameDataInternal(
         val frameId: Long,
         val yuvData: YuvFrameData,
         val timestamp: Long = System.currentTimeMillis(),
+        val session: Int = 0,
     )
 
     private data class LandmarkData(
@@ -416,6 +469,9 @@ class PipelineFaceTracker(private val context: Context) {
         val timestamp: Long,
         val headPose: Triple<Float, Float, Float>?,
         val presenceScore: Float = 1f,
+        /** 本帧「关键点 + 头姿」感知推理耗时（ms），rawTrackV1 帧头 inferenceMs。 */
+        val inferenceMs: Float = 0f,
+        val session: Int = 0,
     )
 
     /** 一帧的完整后处理结果，用于派发到下游回调。 */
@@ -430,6 +486,14 @@ class PipelineFaceTracker(private val context: Context) {
         val presenceScore: Float,
         val isCalibrating: Boolean,
         val fps: Float,
+        /** 采集时间戳：相机回调 wall-clock 毫秒（rawTrackV1 帧头 t）。 */
+        val timestampMs: Long = 0L,
+        /** 感知推理耗时（ms，rawTrackV1 帧头 inferenceMs）。 */
+        val inferenceMs: Float = 0f,
+        /** 相机采集帧率（rawTrackV1 帧头 cameraFps；无统计时 0）。 */
+        val cameraFps: Float = 0f,
+        /** false = 后处理旁路（raw 模式）：blendShapes/headPose/isCalibrating 为占位，必须忽略。 */
+        val postProcessed: Boolean = true,
     )
 
     /** 相机预览（调试画面）的 RGB 帧是否需要生成。默认关闭，按需打开。 */
@@ -544,6 +608,9 @@ class PipelineFaceTracker(private val context: Context) {
                 "(requested Vulkan), GPU parallel channels: $activeChannelCount / $gpuChannelCount",
         )
 
+        // 若 raw 滤波旁路在初始化之前就已被请求（协商先于相机启动），此处补挂。
+        if (rawFilterBypass) applyRawFilterBypass()
+
         isInitialized = true
         Log.i(TAG, "Pipeline face tracker initialized with parallel stages")
         return true
@@ -610,8 +677,6 @@ class PipelineFaceTracker(private val context: Context) {
         startProcessingStage()
         startOutputStage()
 
-        var frameId = 0L
-
         if (useDirectYuvMode) {
             camera2Manager.useDirectYuvMode = true
             // 预览 RGB 帧默认不生成：整帧 YUV→RGB 是相机线程上的大头开销，
@@ -631,9 +696,15 @@ class PipelineFaceTracker(private val context: Context) {
                     Log.i(TAG, "Camera input rate: %.1f FPS (YUV direct mode)".format(cameraFps))
                     cameraFrameCount.set(0)
                     lastCameraFpsTime = now
+                    cameraFpsValue = cameraFps
                 }
 
-                val data = YuvFrameDataInternal(frameId = frameId++, yuvData = yuvData)
+                // frameId 在此处（相机回调、进推理通道之前）打点（协议 §7：采集时刻分配）
+                val data = YuvFrameDataInternal(
+                    frameId = frameIdCounter.getAndIncrement(),
+                    yuvData = yuvData,
+                    session = pipelineSession.get(),
+                )
                 yuvFrameChannel.trySend(data)
                 yuvLandmarkFrameChannel.trySend(data.copy())
 
@@ -675,10 +746,18 @@ class PipelineFaceTracker(private val context: Context) {
                     Log.i(TAG, "Camera input rate: %.1f FPS".format(cameraFps))
                     cameraFrameCount.set(0)
                     lastCameraFpsTime = now
+                    cameraFpsValue = cameraFps
                 }
 
                 val buffer = copyBuffer(frameData)
-                val data = FrameData(frameId = frameId++, buffer = buffer, width = width, height = height)
+                // frameId 在此处（相机回调、进推理通道之前）打点（协议 §7：采集时刻分配）
+                val data = FrameData(
+                    frameId = frameIdCounter.getAndIncrement(),
+                    buffer = buffer,
+                    width = width,
+                    height = height,
+                    session = pipelineSession.get(),
+                )
                 frameChannel.trySend(data)
                 landmarkFrameChannel.trySend(data.copy(buffer = copyBuffer(frameData)))
             }
@@ -1093,6 +1172,81 @@ class PipelineFaceTracker(private val context: Context) {
         Log.i(TAG, "✅ All baselines reset, auto-calibration will start on next frames")
     }
 
+    // ---------------------------------------------------------------- rawTrackV1
+
+    /**
+     * 开关手机端后处理链（rawTrackV1 主口径，docs/raw-track-protocol.md §2.2.3 /
+     * docs/post-pipeline-migration.md 附录 K.4）。
+     *
+     * enabled = false（raw 模式）时：
+     *  - 处理阶段跳过 FaceCapturePipeline.processWithPose（姿态基线 / BlendShape 校准平滑 /
+     *    relativePose）与 BlinkCurveProcessor（眨眼曲线）；
+     *  - 旁路原生时域滤波：landmark setSmoothingEnabled(false)、detection
+     *    setDetectionFilterType(NONE)、head pose setHeadPoseSmoothingEnabled(false) ——
+     *    rawTrackV1 帧携带真·未滤波 MNN 输出（flags bit5 = 0），平滑归 Windows；
+     *  - 伴生 [MediaPipeFaceDetector.resetSmoothing]，清掉上一模式的滤波历史，防状态串味；
+     *  - [SdkFaceCaptureFrame.postProcessed] = false，后处理字段为占位（消费方必须忽略）。
+     *
+     * enabled = true（切回 legacy）时反向恢复三路滤波开关（detection 恢复进入前的类型）
+     * 并同样 resetSmoothing()。
+     *
+     * 幂等；初始化前调用也会记住状态并在 [initialize] 末尾生效。
+     */
+    fun setPostProcessingEnabled(enabled: Boolean) {
+        if (postProcessingOn == enabled) return
+        postProcessingOn = enabled
+        rawFilterBypass = !enabled
+        if (isInitialized) applyRawFilterBypass()
+        Log.i(TAG, "Post-processing " + if (enabled) "enabled (legacy chain)" else "bypassed (rawTrackV1 raw mode)")
+    }
+
+    /** 当前后处理是否启用（true = legacy 链在跑；false = rawTrackV1 旁路）。 */
+    val isPostProcessingEnabled: Boolean
+        get() = postProcessingOn
+
+    /** 按 [rawFilterBypass] 把三路原生时域滤波切到位（含滤波历史复位）。 */
+    private fun applyRawFilterBypass() {
+        val detector = faceDetector
+        if (rawFilterBypass) {
+            savedDetectionFilterType = detector.getDetectionFilterType()
+            detector.setSmoothingEnabled(false)
+            detector.setDetectionFilterType(SmoothingFilterType.NONE)
+            detector.setHeadPoseSmoothingEnabled(false)
+        } else {
+            detector.setSmoothingEnabled(true)
+            detector.setDetectionFilterType(savedDetectionFilterType)
+            detector.setHeadPoseSmoothingEnabled(true)
+        }
+        // 关键点 / 检测框 / 头姿三路滤波历史一起清（含多路并行引擎），避免跨模式串味
+        detector.resetSmoothing()
+    }
+
+    /**
+     * 重置感知层状态（协议 §6.2 resetTracking）：清多路并行排队（会话代次作废在途帧）、
+     * FrameReorderBuffer、检测 / 跟踪状态、frameId 会话序（下一次相机回调从 0 重新分配，
+     * 由 ack 的 sessionId 通告会话边界）。
+     *
+     * 与「校准」无关：不碰 FaceCapturePipeline 的基线（那属于 legacy 链状态，由
+     * [resetAdaptiveBaseline] 管）。
+     */
+    fun resetPerceptionState() {
+        pipelineSession.incrementAndGet()
+        frameIdCounter.set(0L)
+        // 注意：reorderBuffer（FrameReorderBuffer，非线程安全）由重排阶段线程在检测到
+        // 会话代次变化时自行复位，这里绝不从外部线程碰它。
+        trackingConfidenceDetector.reset()
+        synchronized(faceBoxLock) {
+            lastFaceBox = null
+            lastFaceBoxTimestampMs = 0L
+        }
+        faceDetector.resetSmoothing()
+        Log.i(TAG, "Perception state reset (session=" + pipelineSession.get() + ")")
+    }
+
+    /** 当前感知层会话代次（resetTracking 时递增；ack 的 sessionId 用它）。 */
+    val perceptionSession: Int
+        get() = pipelineSession.get()
+
     @Deprecated("Use resetAdaptiveBaseline() instead")
     fun recalibrateHeadPose() {
         Log.i(TAG, "Resetting head pose calibration via pipeline...")
@@ -1108,6 +1262,7 @@ class PipelineFaceTracker(private val context: Context) {
             Log.i(TAG, "Face detection stage started")
             for (frame in frameChannel) {
                 if (!isRunning.get()) break
+                if (frame.session != pipelineSession.get()) continue // resetTracking 前的在途旧帧
                 try {
                     val startTime = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
                     val box = faceDetector.detectFaceOnly(frame.buffer, frame.width, frame.height)
@@ -1137,9 +1292,12 @@ class PipelineFaceTracker(private val context: Context) {
             Log.i(TAG, "Landmark detection stage started")
             for (frame in landmarkFrameChannel) {
                 if (!isRunning.get()) break
+                if (frame.session != pipelineSession.get()) continue // resetTracking 前的在途旧帧
                 try {
                     val box = synchronized(faceBoxLock) { lastFaceBox } ?: continue
                     val startTime = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
+                    // rawTrackV1 帧头 inferenceMs：无条件计时（两次 nanoTime，开销可忽略）
+                    val inferenceStartNanos = System.nanoTime()
                     val landmarks = faceDetector.detectLandmarksWithBox(
                         frame.buffer, frame.width, frame.height, box,
                     )
@@ -1154,6 +1312,8 @@ class PipelineFaceTracker(private val context: Context) {
                             height = frame.height,
                             timestamp = frame.timestamp,
                             headPose = headPose,
+                            inferenceMs = (System.nanoTime() - inferenceStartNanos) / 1_000_000f,
+                            session = frame.session,
                         )
                         landmarkOutputCount.incrementAndGet()
                         val now = System.currentTimeMillis()
@@ -1185,6 +1345,7 @@ class PipelineFaceTracker(private val context: Context) {
             var lastDetectionMs = 0L
             for (frame in yuvFrameChannel) {
                 if (!isRunning.get()) break
+                if (frame.session != pipelineSession.get()) continue // resetTracking 前的在途旧帧
                 try {
                     // 检测节流：脸框在 100ms 内变化极小，但每次检测都要跑一遍完整
                     // 推理并和 landmark 抢算力。稳定追踪时按固定节奏刷新脸框即可；
@@ -1273,6 +1434,7 @@ class PipelineFaceTracker(private val context: Context) {
             val outChannel = if (directToProcessing) landmarkChannel else mergeChannel
             for (frame in inputChannel) {
                 if (!isRunning.get()) break
+                if (frame.session != pipelineSession.get()) continue // resetTracking 前的在途旧帧
                 try {
                     val box = synchronized(faceBoxLock) { lastFaceBox }
                     if (box == null) {
@@ -1280,6 +1442,8 @@ class PipelineFaceTracker(private val context: Context) {
                         continue
                     }
                     val startTime = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
+                    // rawTrackV1 帧头 inferenceMs：无条件计时（两次 nanoTime，开销可忽略）
+                    val inferenceStartNanos = System.nanoTime()
                     val yuvData = frame.yuvData
                     val landmarkResult = faceDetector.detectLandmarksFromYuvWithScore(
                         yuvData.yBuffer, yuvData.uBuffer, yuvData.vBuffer,
@@ -1317,6 +1481,8 @@ class PipelineFaceTracker(private val context: Context) {
                             timestamp = frame.timestamp,
                             headPose = headPose,
                             presenceScore = presenceScore,
+                            inferenceMs = (System.nanoTime() - inferenceStartNanos) / 1_000_000f,
+                            session = frame.session,
                         )
 
                         landmarkOutputCount.incrementAndGet()
@@ -1356,7 +1522,15 @@ class PipelineFaceTracker(private val context: Context) {
             // 同 worker：绑定本轮 start() 创建的通道实例。
             val mergeChannel = landmarkMergeChannel
             val outChannel = landmarkChannel
+            var seenSession = pipelineSession.get()
             while (isRunning.get()) {
+                // 会话代次变化（resetTracking）：在**本线程**复位重排缓冲（FrameReorderBuffer
+                // 非线程安全，只有拥有它的线程能清），旧会话缓存帧一并作废。
+                val sessionNow = pipelineSession.get()
+                if (sessionNow != seenSession) {
+                    reorderBuffer.reset()
+                    seenSession = sessionNow
+                }
                 val waitingForGap = reorderBuffer.size > 0
                 val next: LandmarkData? = if (!waitingForGap) {
                     mergeChannel.receiveCatching().getOrNull()
@@ -1368,8 +1542,12 @@ class PipelineFaceTracker(private val context: Context) {
                 }
 
                 if (next != null) {
-                    val ready = reorderBuffer.offer(next.frameId, next, System.currentTimeMillis())
-                    for (item in ready) outChannel.trySend(item)
+                    // resetTracking 前的在途旧帧绝不入重排缓冲：旧 frameId 会把 lastEmittedId
+                    // 顶高，导致新会话（frameId 从 0 起）的帧被整批误判为过期。
+                    if (next.session == pipelineSession.get()) {
+                        val ready = reorderBuffer.offer(next.frameId, next, System.currentTimeMillis())
+                        for (item in ready) outChannel.trySend(item)
+                    }
                 } else {
                     val ready = reorderBuffer.poll(System.currentTimeMillis())
                     for (item in ready) outChannel.trySend(item)
@@ -1385,6 +1563,7 @@ class PipelineFaceTracker(private val context: Context) {
             Log.i(TAG, "Processing stage started")
             for (data in landmarkChannel) {
                 if (!isRunning.get()) break
+                if (data.session != pipelineSession.get()) continue // resetTracking 前的在途旧帧
                 try {
                     // 丢掉已经过期的帧：算力应该花在最新一帧上，否则延迟会累积
                     val ageMs = System.currentTimeMillis() - data.timestamp
@@ -1395,69 +1574,99 @@ class PipelineFaceTracker(private val context: Context) {
 
                     val stageStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
                     val headPose = data.headPose
-                    val bsStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
                     val rawPitch = headPose?.first ?: 0f
                     val rawYaw = headPose?.second ?: 0f
                     val rawRoll = headPose?.third ?: 0f
+                    // processWithPose 的 rawPose 就是输入三轴原样；提前构造，raw 旁路也用它
+                    val rawPoseData = HeadPoseData(rawPitch, rawYaw, rawRoll)
 
-                    val result = faceCapturePipeline.processWithPose(
-                        data.landmarks, data.width, data.height,
-                        rawPitch, rawYaw, rawRoll,
-                    )
-                    val blendShapes = result.blendShapes
-
-                    onCalibrationStatusUpdate?.invoke(result.isCalibrating)
-
-                    if (ENABLE_PERF_PROFILING) {
-                        synchronized(perfLock) {
-                            perfBlendShape.add((System.nanoTime() - bsStart) / 1_000_000.0)
-                        }
-                    }
-
-                    val relativePose = result.relativePose
-                    val headPoseData = HeadPoseData(
-                        relativePose.pitch, relativePose.yaw, relativePose.roll,
-                    )
-                    val rawPoseData = HeadPoseData(
-                        result.rawPose.pitch, result.rawPose.yaw, result.rawPose.roll,
-                    )
-                    lastHeadPose = headPoseData
-
-                    updateFps()
-
-                    // 眨眼曲线按真实帧率推进（之前写死 60fps，实际帧率不足时曲线
-                    // 会被拉长/压缩，眨眼的起落时间就不准了）
-                    blinkCurveProcessor.updateFrameRate(currentFps.coerceIn(15f, 120f))
-
-                    val processedBlendShapes = if (blinkCurveProcessor.isEnabled) {
-                        val (leftBlink, rightBlink) = blinkCurveProcessor.process(
-                            blendShapes.eyeBlinkLeft,
-                            blendShapes.eyeBlinkRight,
-                            System.currentTimeMillis(),
+                    if (postProcessingOn) {
+                        // ===== legacy 链（v1 文本客户端 / 手机 UI 场景才跑，协议 §2.2.3）=====
+                        val bsStart = if (ENABLE_PERF_PROFILING) System.nanoTime() else 0L
+                        val result = faceCapturePipeline.processWithPose(
+                            data.landmarks, data.width, data.height,
+                            rawPitch, rawYaw, rawRoll,
                         )
-                        blendShapes.copy(
-                            eyeBlinkLeft = leftBlink,
-                            eyeBlinkRight = rightBlink,
+                        val blendShapes = result.blendShapes
+
+                        onCalibrationStatusUpdate?.invoke(result.isCalibrating)
+
+                        if (ENABLE_PERF_PROFILING) {
+                            synchronized(perfLock) {
+                                perfBlendShape.add((System.nanoTime() - bsStart) / 1_000_000.0)
+                            }
+                        }
+
+                        val relativePose = result.relativePose
+                        val headPoseData = HeadPoseData(
+                            relativePose.pitch, relativePose.yaw, relativePose.roll,
+                        )
+                        lastHeadPose = headPoseData
+
+                        updateFps()
+
+                        // 眨眼曲线按真实帧率推进（之前写死 60fps，实际帧率不足时曲线
+                        // 会被拉长/压缩，眨眼的起落时间就不准了）
+                        blinkCurveProcessor.updateFrameRate(currentFps.coerceIn(15f, 120f))
+
+                        val processedBlendShapes = if (blinkCurveProcessor.isEnabled) {
+                            val (leftBlink, rightBlink) = blinkCurveProcessor.process(
+                                blendShapes.eyeBlinkLeft,
+                                blendShapes.eyeBlinkRight,
+                                System.currentTimeMillis(),
+                            )
+                            blendShapes.copy(
+                                eyeBlinkLeft = leftBlink,
+                                eyeBlinkRight = rightBlink,
+                            )
+                        } else {
+                            blendShapes
+                        }
+
+                        // 只把结果推给派发阶段，本阶段不再创建协程、不碰 UI/渲染
+                        outputChannel.trySend(
+                            OutputFrame(
+                                frameId = data.frameId,
+                                blendShapes = processedBlendShapes,
+                                headPose = headPoseData,
+                                rawPose = rawPoseData,
+                                landmarks = data.landmarks,
+                                width = data.width,
+                                height = data.height,
+                                presenceScore = data.presenceScore,
+                                isCalibrating = result.isCalibrating,
+                                fps = currentFps,
+                                timestampMs = data.timestamp,
+                                inferenceMs = data.inferenceMs,
+                                cameraFps = cameraFpsValue,
+                                postProcessed = true,
+                            )
                         )
                     } else {
-                        blendShapes
-                    }
-
-                    // 只把结果推给派发阶段，本阶段不再创建协程、不碰 UI/渲染
-                    outputChannel.trySend(
-                        OutputFrame(
-                            frameId = data.frameId,
-                            blendShapes = processedBlendShapes,
-                            headPose = headPoseData,
-                            rawPose = rawPoseData,
-                            landmarks = data.landmarks,
-                            width = data.width,
-                            height = data.height,
-                            presenceScore = data.presenceScore,
-                            isCalibrating = result.isCalibrating,
-                            fps = currentFps,
+                        // ===== rawTrackV1 旁路（docs/post-pipeline-migration.md 附录 K.4）=====
+                        // 不跑姿态基线 / BlendShape 校准平滑 / 眨眼曲线，不算 relativePose 与
+                        // 最终 Live2D 参数；输出真·未滤波 MNN 感知结果（原生时域滤波已在
+                        // [setPostProcessingEnabled] 旁路）。
+                        updateFps()
+                        outputChannel.trySend(
+                            OutputFrame(
+                                frameId = data.frameId,
+                                blendShapes = ARKitBlendShapes(),
+                                headPose = HeadPoseData(),
+                                rawPose = rawPoseData,
+                                landmarks = data.landmarks,
+                                width = data.width,
+                                height = data.height,
+                                presenceScore = data.presenceScore,
+                                isCalibrating = false,
+                                fps = currentFps,
+                                timestampMs = data.timestamp,
+                                inferenceMs = data.inferenceMs,
+                                cameraFps = cameraFpsValue,
+                                postProcessed = false,
+                            )
                         )
-                    )
+                    }
 
                     if (ENABLE_PERF_PROFILING) {
                         var logNow = false
@@ -1509,8 +1718,11 @@ class PipelineFaceTracker(private val context: Context) {
     }
 
     private fun dispatchOutput(frame: OutputFrame) {
-        // 1) avatar 驱动：主链路，先派发
-        onFaceCaptureFrame?.invoke(frame.blendShapes, frame.headPose)
+        // 1) avatar 驱动：主链路，先派发（只在后处理有效时；raw 旁路模式下 blendShapes /
+        //    relativeHeadPose 是占位，喂给 avatar 只会输出错误表情）
+        if (frame.postProcessed) {
+            onFaceCaptureFrame?.invoke(frame.blendShapes, frame.headPose)
+        }
 
         // 2) 检测框是每帧 O(478) 的额外遍历，只有真的有人订阅时才计算
         val wantsResult = onFaceCaptureResult != null
@@ -1524,7 +1736,8 @@ class PipelineFaceTracker(private val context: Context) {
         if (wantsResult) {
             // SDK-facing atomic snapshot: raw landmarks + post-processed
             // BlendShape / head-pose in a single payload, guaranteed to
-            // belong to the same frame.
+            // belong to the same frame. postProcessed=false（rawTrackV1 旁路）时
+            // 后处理字段为占位，原始层 + timestampMs / inferenceMs / cameraFps 有效。
             onFaceCaptureResult?.invoke(
                 SdkFaceCaptureFrame(
                     frameId = frame.frameId,
@@ -1538,6 +1751,10 @@ class PipelineFaceTracker(private val context: Context) {
                     presenceScore = frame.presenceScore,
                     isCalibrating = frame.isCalibrating,
                     fps = frame.fps,
+                    timestampMs = frame.timestampMs,
+                    inferenceMs = frame.inferenceMs,
+                    cameraFps = frame.cameraFps,
+                    postProcessed = frame.postProcessed,
                 )
             )
         }
@@ -1547,15 +1764,22 @@ class PipelineFaceTracker(private val context: Context) {
                 FaceVisualizationData(
                     landmarks = frame.landmarks,
                     detectionBox = detectionBox,
-                    headPose = frame.headPose,
+                    // raw 旁路模式下用原始姿态喂调试叠加层（relative 为占位 0，显示会失真）
+                    headPose = if (frame.postProcessed) frame.headPose else frame.rawPose,
                     imageWidth = frame.width,
                     imageHeight = frame.height,
                 )
             )
         }
 
-        onBlendShapesUpdate?.invoke(frame.blendShapes)
-        onHeadPoseUpdate?.invoke(frame.headPose)
+        if (frame.postProcessed) {
+            onBlendShapesUpdate?.invoke(frame.blendShapes)
+            onHeadPoseUpdate?.invoke(frame.headPose)
+        } else {
+            // raw 旁路：BS 调试列表没有有效数据（不发占位 0 造成「表情全无」假象），
+            // 头姿调试显示改用原始姿态。
+            onHeadPoseUpdate?.invoke(frame.rawPose)
+        }
     }
 
     // ============================================================================

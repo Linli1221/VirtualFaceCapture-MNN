@@ -1143,6 +1143,23 @@ Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetHeadPoseFi
     LOGI("Head pose filter type set to %d", filterType);
 }
 
+/**
+ * Enable/disable head-pose temporal smoothing (rawTrackV1 主口径旁路，协议 raw-track-protocol.md §4.3)。
+ *
+ * 纯胶水：转发到既有的 FaceLandmarker::setHeadPoseSmoothingEnabled（face_landmarker.cpp），
+ * estimateHeadPose 在关闭时直接跳过时域滤波、返回 Procrustes 原始欧拉角。
+ * head pose 滤波状态是 process-global static，与多路并行引擎无关。
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_mediapipefacelandmark_MediaPipeFaceDetector_nativeSetHeadPoseSmoothingEnabled(
+        JNIEnv* env,
+        jobject /* this */,
+        jboolean enabled) {
+
+    FaceLandmarker::setHeadPoseSmoothingEnabled(enabled != JNI_FALSE);
+    LOGI("Head pose smoothing %s", enabled ? "enabled" : "disabled");
+}
+
 // ============================================================================
 // YUV Direct Input Support - Zero-copy pipeline optimization
 // ============================================================================

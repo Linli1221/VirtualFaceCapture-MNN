@@ -5,6 +5,7 @@ import com.vfc.log.VfcLog as Log
 import com.example.commondata.ARKitBlendShapes
 import com.example.commondata.HeadPoseData
 import com.example.commondata.UpperBodyPoseFrame
+import com.facecapture.sdk.PipelineFaceTracker
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -49,17 +50,50 @@ import kotlin.concurrent.withLock
  * 见 docs/jitter-buffer.md），否则回落 [TrackingProtocol.FRAME_BUFFER_MS]。规则的纯函数实现在
  * [TrackingProtocol.resolveEffectiveBufferMs]，当前生效值见 [effectiveBufferMs]。
  */
+/**
+ * 每个 WS 连接的 track 流形态（docs/raw-track-protocol.md §2.2.3 per-client 分发）。
+ *
+ *  - [TEXT]：v1 文本 JSON track（bs / pose 为手机后处理结果）——**未协商 rawTrackV1 的
+ *    老客户端默认**（连接即推流，legacy 行为逐字节不变），以及显式 startStream(rawMode=legacy)。
+ *  - [RAW]：OP_BINARY raw_track（真·未滤波感知输出）——需协商 rawTrackV1 且
+ *    startStream(rawMode=rawTrackV1)。
+ *  - [IDLE]：已协商 rawTrackV1 但还没 startStream（或已 stopStream）：不发任何 track，
+ *    控制面照常。绝不能给 raw 客户端发文本 track —— PC 见到文本 track 会误判降级。
+ *
+ * 同一连接同一时刻只有一种 track 语义（协议 §2.2.3）。
+ */
+enum class TrackMode { TEXT, RAW, IDLE }
+
 class TrackingServer(
     private val port: Int = TrackingProtocol.PORT,
     private val deviceName: String,
     private val appName: String,
-    private val onRecalibrate: () -> Unit = {},
     /**
-     * 「全局 upperBodyPostV1 协商」结果变化时的通知回调（任务 M2，照 [onRecalibrate] 的
+     * 「全局 upperBodyPostV1 协商」结果变化时的通知回调（任务 M2，照 [onResetTracking] 的
      * 接线模式）：true = 全体客户端都声明了 upperBodyPostV1，上层把检测器切到原始输出
      * （One-Euro / 躯干角 / 基线迁 PC）；false = 回到 M1 的手机端后处理链。
      */
     private val onUpperBodyPostV1: (Boolean) -> Unit = {},
+    /**
+     * rawTrackV1 流形态聚合（§2.2.3）：true = 存在 RAW 推流客户端且**没有** TEXT 客户端
+     * —— 此时手机旁路整条后处理链（[PipelineFaceTracker.setPostProcessingEnabled](false)）
+     * 且上半身检测器切原始输出；false = 保持 legacy 链。
+     *
+     * 规则边界：无客户端 / 仅 IDLE（已协商未 startStream）时按 false 处理 —— 手机本地 UI
+     * 依赖后处理结果（MainActivity 的 BS / 头姿调试），纯手机场景不能被旁路。
+     */
+    private val onRawStreamActive: (Boolean) -> Unit = {},
+    /**
+     * 手机后处理链是否仍被需要（true = 至少要为 v1 文本客户端 / 手机 UI 跑 legacy 链）。
+     * 与 [onRawStreamActive] 互补（false ⇔ raw 旁路生效）。零客户端 / 仅 IDLE 时为 true ——
+     * 与协议 §2.2.3 字面的有意差异（为手机 UI 保留链，wire 无影响），见 [recomputeStreamModes]。
+     */
+    private val onPostProcessingNeeded: (Boolean) -> Unit = {},
+    /**
+     * resetTracking（§6.2）：重置感知层状态并返回**新会话 id**（ack 与 /status 用）。
+     * 由上层接到 PipelineFaceTracker.resetPerceptionState / perceptionSession。
+     */
+    private val onResetTracking: () -> Long = { 0L },
     /**
      * 发送缓冲配置 `send.bufferMs`（毫秒）：0 = 算完即发（能否真正旁路还要看客户端协商），
      * 100~2000 = 保守模式的固定缓冲时长；非法值回落 [TrackingProtocol.FRAME_BUFFER_MS]。
@@ -243,6 +277,25 @@ class TrackingServer(
      */
     @Volatile
     private var upperBodyPostV1Active: Boolean = false
+
+    /**
+     * rawTrackV1 流形态聚合（§2.2.3）：true = 全体客户端都是 RAW 推流（旁路手机后处理）。
+     * 由 [recomputeStreamModes] 在连接增删 / hello / startStream / stopStream 时重算。
+     */
+    @Volatile
+    private var rawStreamActive: Boolean = false
+
+    /** 当前后处理是否被需要（!rawStreamActive 时恒 true，含无客户端场景）。 */
+    @Volatile
+    private var postProcessingNeeded: Boolean = true
+
+    /** 最新一帧的 frameId（GET /status 的 seq，协议 §7.6）。 */
+    @Volatile
+    private var latestFrameId: Long = 0L
+
+    /** 当前感知层会话 id（resetTracking 时更新；GET /status 的 sessionId，§7.6）。 */
+    @Volatile
+    private var sessionId: Long = 0L
 
     /** @return 是否成功监听；失败原因见 [lastError]。 */
     fun start(): Boolean {
@@ -434,7 +487,7 @@ class TrackingServer(
      * 重算全局 upperBodyPostV1 协商结果（任务 M2）：客户端连入 / 断开 / 收到 hello 时调用。
      *
      * 聚合规则见 [upperBodyPostV1Active]：`wsClients.isNotEmpty() && 全部 upperBodyPostV1`。
-     * 值变化时通过 [onUpperBodyPostV1] 通知上层切换检测器的原始输出（照 [onRecalibrate]
+     * 值变化时通过 [onUpperBodyPostV1] 通知上层切换检测器的原始输出（照 [onResetTracking]
      * 的接线模式）；回调在调用线程直接触发（协议线程），上层自己决定要不要切线程。
      */
     private fun recomputeUpperBodyPostV1() {
@@ -462,70 +515,151 @@ class TrackingServer(
     }
 
     /**
-     * 面捕管线每处理完一帧调用一次（协议 §4.2）。
+     * 面捕管线每处理完一帧调用一次（协议 §4.2 / rawTrackV1 §4）。
      *
-     * [headPose] 必须是**已减去首帧标定基线**的相对姿态（pose 字段，单位度）。
-     * [fps] 为手机端处理帧率，仅供客户端展示。
+     * per-client 分发（docs/raw-track-protocol.md §2.2.3）：
+     *  - TEXT 客户端收文本 JSON track（bs = 后处理 BlendShape、pose = relativeHeadPose，
+     *    legacy 语义逐字节不变）与 calib；只在存在 TEXT 客户端时才序列化；
+     *  - RAW 客户端收 OP_BINARY raw_track（真·未滤波感知输出，帧头携带 frameId / t /
+     *    cameraFps / inferenceMs），**旁路手机端 TrackingFrameBuffer 500 ms 缓冲**（§2.5，
+     *    延迟归 Windows），per-client 发送队列的 control 保序规则保留；
+     *  - IDLE 客户端不收任何 track。
      */
-    fun submitTrack(
-        blendShapes: ARKitBlendShapes,
-        headPose: HeadPoseData,
-        presenceScore: Float,
-        fps: Float,
-        calibrating: Boolean,
-    ) {
+    fun submitTrack(frame: PipelineFaceTracker.SdkFaceCaptureFrame) {
         val seq = sequence.getAndIncrement()
         val now = System.currentTimeMillis()
+        latestFrameId = frame.frameId
 
-        // 校准窗口边界：进入 / 结束各发一次 calib（协议 §4.3）。
-        // calib 也走帧缓冲，否则它会被提前 0.5 s 送出去、和 track 的顺序错开。
-        if (calibrating != lastCalibActive) {
-            lastCalibActive = calibrating
-            if (wsClients.isNotEmpty()) {
-                dispatch(TrackingProtocol.buildCalib(calibrating, seq, now), control = true)
+        // per-client 形态统计（CopyOnWriteArrayList 快照遍历，无锁安全）
+        var anyText = false
+        var anyRaw = false
+        for (client in wsClients) {
+            when (client.trackMode) {
+                TrackMode.TEXT -> anyText = true
+                TrackMode.RAW -> anyRaw = true
+                TrackMode.IDLE -> Unit
             }
         }
 
-        // 没有客户端时连 JSON 都不生成（协议要求手机端零额外开销）
+        // 校准窗口边界：进入 / 结束各发一次 calib（协议 §4.3，仅 legacy 文本客户端）。
+        // raw 模式不发 calib（§6.4：手机无校准）；calib 也走帧缓冲，否则它会被提前 0.5 s
+        // 送出去、和 track 的顺序错开。
+        if (frame.isCalibrating != lastCalibActive) {
+            lastCalibActive = frame.isCalibrating
+            if (anyText) {
+                dispatch(TrackingProtocol.buildCalib(frame.isCalibrating, seq, now), control = true)
+            }
+        }
+
+        // 没有客户端时连序列化都不做（协议要求手机端零额外开销）
         if (wsClients.isEmpty()) return
 
-        val face = presenceScore >= FACE_PRESENCE_THRESHOLD
+        // ===== 文本 JSON track（v1 客户端，legacy 语义逐字节不变）=====
+        if (anyText && frame.postProcessed) {
+            val face = frame.presenceScore >= FACE_PRESENCE_THRESHOLD
 
-        // 上半身是可选增量（协议 §4.2）：未启用时一个 ub* 字段都不出现；
-        // 启用后即使本帧没结果（从未收到 / 超过 1500 ms 未更新 / tracking=false）也发
-        // ubOk:false，ub / body 全 0，保证结构稳定，客户端可安全回默认姿态。
-        // 任务 M2：占位帧跟随当前 raw 模式，协商生效期间 ubRaw 逐帧一致出现。
-        val rawActive = upperBodyPostV1Active
-        val upperBodyFrame = if (upperBodyOn) {
-            upperBodySnapshot ?: if (rawActive) emptyRawUpperBodyFrame else emptyUpperBodyFrame
-        } else {
-            null
+            // 上半身是可选增量（协议 §4.2）：未启用时一个 ub* 字段都不出现；
+            // 启用后即使本帧没结果（从未收到 / 超过 1500 ms 未更新 / tracking=false）也发
+            // ubOk:false，ub / body 全 0，保证结构稳定，客户端可安全回默认姿态。
+            // 任务 M2：占位帧跟随当前 raw 模式，协商生效期间 ubRaw 逐帧一致出现。
+            val rawActive = upperBodyPostV1Active
+            val upperBodyFrame = if (upperBodyOn) {
+                upperBodySnapshot ?: if (rawActive) emptyRawUpperBodyFrame else emptyUpperBodyFrame
+            } else {
+                null
+            }
+            val upperBodyOk = upperBodyFrame != null &&
+                upperBodyFrame.tracking &&
+                now - upperBodyFrame.timestampMs <= UPPER_BODY_STALE_MS
+
+            val message = TrackingProtocol.buildTrack(
+                seq = seq,
+                timestampMs = now,
+                blendShapes = frame.blendShapes,
+                pitch = frame.relativeHeadPose.pitch,
+                yaw = frame.relativeHeadPose.yaw,
+                roll = frame.relativeHeadPose.roll,
+                face = face,
+                score = frame.presenceScore,
+                fps = frame.fps,
+                calibrating = frame.isCalibrating,
+                upperBody = upperBodyFrame,
+                upperBodyOk = upperBodyOk,
+                // 广播同一条报文，协商状态只能取全体聚合值（见 [upperBodyPostV1Active]）
+                upperBodyPostV1 = rawActive,
+            )
+            dispatch(message)
         }
-        val upperBodyOk = upperBodyFrame != null &&
-            upperBodyFrame.tracking &&
-            now - upperBodyFrame.timestampMs <= UPPER_BODY_STALE_MS
 
-        val message = TrackingProtocol.buildTrack(
-            seq = seq,
-            timestampMs = now,
-            blendShapes = blendShapes,
-            pitch = headPose.pitch,
-            yaw = headPose.yaw,
-            roll = headPose.roll,
-            face = face,
-            score = presenceScore,
-            fps = fps,
-            calibrating = calibrating,
-            upperBody = upperBodyFrame,
-            upperBodyOk = upperBodyOk,
-            // 广播同一条报文，协商状态只能取全体聚合值（见 [upperBodyPostV1Active]）
-            upperBodyPostV1 = rawActive,
-        )
-        dispatch(message)
+        // ===== OP_BINARY raw_track（rawTrackV1 客户端，旁路 500 ms 发送缓冲）=====
+        if (anyRaw) {
+            val rawBytes = buildRawTrack(frame, now)
+            if (rawBytes != null) {
+                for (client in wsClients) {
+                    if (client.trackMode == TrackMode.RAW) client.offerBinary(rawBytes)
+                }
+                framesInWindow.incrementAndGet()
+            }
+        }
     }
 
     /**
-     * 把一条已序列化的报文投给发送链路（协议 §7.1）。
+     * 打包一帧 raw_track（docs/raw-track-protocol.md §4 / §5，逐字节契约）。
+     *
+     * ubRaw 扩展块只在**上半身原始输出生效**（rawStreamActive 且检测器 rawOutput）时携带：
+     * 混合客户端场景下检测器处于 legacy 模式、没有原始点可用，此时不发块（flags bit1 = 0，
+     * 协议 §5「v1 保留，P1 可先不发送」）。发送侧一旦启用就整块发送（全有或全无）。
+     */
+    private fun buildRawTrack(
+        frame: PipelineFaceTracker.SdkFaceCaptureFrame,
+        now: Long,
+    ): ByteArray? {
+        val faceValid = frame.presenceScore >= FACE_PRESENCE_THRESHOLD &&
+            frame.landmarks.size == TrackingRawProtocol.LANDMARK_COUNT
+        val box = frame.detectionBox
+        val ubFrame = if (upperBodyOn && rawStreamActive) {
+            val snapshot = upperBodySnapshot
+            if (snapshot != null && snapshot.rawMode &&
+                snapshot.tracking && now - snapshot.timestampMs <= UPPER_BODY_STALE_MS
+            ) {
+                snapshot
+            } else {
+                // 结构稳定占位：ubTracking=0、13 点全 0、torso=[0,0]（协议 §5）
+                emptyRawUpperBodyFrame
+            }
+        } else {
+            null
+        }
+        return TrackingRawProtocol.encodeRawTrack(
+            frameId = frame.frameId,
+            timestampMs = frame.timestampMs,
+            cameraFps = frame.cameraFps,
+            width = frame.imageWidth,
+            height = frame.imageHeight,
+            presence = frame.presenceScore,
+            inferenceMs = frame.inferenceMs,
+            posePitch = frame.rawHeadPose.pitch,
+            poseYaw = frame.rawHeadPose.yaw,
+            poseRoll = frame.rawHeadPose.roll,
+            boxLeft = box.x1,
+            boxTop = box.y1,
+            boxRight = box.x2,
+            boxBottom = box.y2,
+            boxScore = box.score,
+            faceValid = faceValid,
+            landmarks = frame.landmarks,
+            // 主口径：原生关键点 / 头姿 EMA 已在 PipelineFaceTracker 旁路（附录 K.4），
+            // flags bit5 = LANDMARKS_PRE_SMOOTHED 恒 0，点域平滑归 Windows
+            preSmoothed = false,
+            upperBody = ubFrame,
+        )
+    }
+
+    /**
+     * 把一条已序列化的**文本**报文投给发送链路（协议 §7.1）。
+     *
+     * **只服务 TEXT 形态的客户端**（rawTrackV1 §2.2.3 per-client 分发）：raw_track 走
+     * [TrackingWsConnection.offerBinary] 直投、旁路 [TrackingFrameBuffer]（§2.5，延迟归 Windows）。
      *
      * [activeBufferMs] > 0 时先入帧缓冲（calib 与 track 同队，顺序天然保持），由
      * [playoutThread] 攒够延迟后匀速放行；为 0（旁路模式）时直接投进每个客户端的
@@ -533,11 +667,12 @@ class TrackingServer(
      * 因此不需要「槽位」也不会出现 calib / track 错配。
      *
      * @param control true = calib 这类控制消息；走 [TrackingWsConnection.offerControl]，
-     *   溢出时保证不会被 track 挤掉。
+     *   溢出时保证不会被 track 挤掉；入缓冲时随条目显式携带类型（不再解析内容判类型）。
      */
     private fun dispatch(message: String, control: Boolean = false) {
         if (activeBufferMs <= 0L) {
             for (client in wsClients) {
+                if (client.trackMode != TrackMode.TEXT) continue
                 if (control) client.offerControl(message) else client.offerTrack(message)
             }
             if (!control) framesInWindow.incrementAndGet()
@@ -545,7 +680,7 @@ class TrackingServer(
         }
         frameBufferLock.withLock {
             // 缓冲队列是单生产者（面捕派发线程）写入的 FIFO，calib 与 track 的顺序天然保持
-            frameBuffer.enqueue(message, System.nanoTime())
+            frameBuffer.enqueue(message, System.nanoTime(), control = control)
             // 放行线程可能正睡在 await() 里，入队后立刻叫醒它重算到期时间
             frameBufferCondition.signalAll()
         }
@@ -561,13 +696,13 @@ class TrackingServer(
         Log.i(TAG, "帧缓冲放行线程已启动（配置 send.bufferMs=" + configuredBufferMs + " ms）")
         // 旧线程（上一轮 start 起的）看到的代次已经不同，必须立刻退出，不能抢新会话的帧
         while (running && playoutGeneration.get() == playoutId) {
-            var message: String? = null
+            var entry: TrackingFrameBuffer.Entry? = null
             var interrupted = false
 
             frameBufferLock.withLock {
                 val now = System.nanoTime()
-                message = frameBuffer.poll(now)
-                if (message == null) {
+                entry = frameBuffer.poll(now)
+                if (entry == null) {
                     val due = frameBuffer.nextDueNanos()
                     val waitNanos = if (due == Long.MAX_VALUE) {
                         PLAYOUT_IDLE_WAIT_NANOS
@@ -585,14 +720,19 @@ class TrackingServer(
             }
 
             if (interrupted) break
-            val frame = message ?: continue
+            val released = entry ?: continue
 
-            // 从缓冲放行的既有 track 也有 calib（control）：按 JSON 的 type 分流到对应投递口，
-            // 让每个客户端的 [TrackingSendQueue] 知道哪条可丢（track）、哪条绝不丢（control）。
-            // 非 "track" 一律按 control 保护处理（缓冲里只会有 track / calib，未知类型宁可不丢）。
-            val control = TrackingProtocol.parseType(frame) != "track"
+            // 从缓冲放行的既有 track 也有 calib（control）：按条目自带的**显式类型字段**
+            // 分流到对应投递口（不再 parseType 解析内容），让每个客户端的 [TrackingSendQueue]
+            // 知道哪条可丢（track）、哪条绝不丢（control）。
+            // 只投给 TEXT 形态客户端：缓冲里只有文本 track / calib（raw 帧旁路缓冲，§2.5）。
             for (client in wsClients) {
-                if (control) client.offerControl(frame) else client.offerTrack(frame)
+                if (client.trackMode != TrackMode.TEXT) continue
+                if (released.control) {
+                    client.offerControl(released.message)
+                } else {
+                    client.offerTrack(released.message)
+                }
             }
             // 缓冲里混着极少数 calib（每次会话最多 2 条），一并在 sentFps 里计数，影响可忽略
             framesInWindow.incrementAndGet()
@@ -770,7 +910,9 @@ class TrackingServer(
                     // 客户端集合变了（可能影响 jitterBufferV1 协商结果），重算生效发送缓冲
                     recomputeEffectiveBuffer()
                     // 客户端集合变了也可能改变 upperBodyPostV1 的全体聚合结果（任务 M2）
-                    recomputeUpperBodyPostV1()
+                    recomputeUpperBodyPostV1(),
+                    // 客户端集合变了也可能改变 rawTrackV1 流形态聚合（per-client 分发）
+                    recomputeStreamModes()
                     // 最后一个客户端也走了：清掉缓冲里还没放行的帧，
                     // 否则下一个客户端一连上会先收到 0.5 s 之前的老表情。
                     if (wsClients.isEmpty()) {
@@ -787,6 +929,9 @@ class TrackingServer(
         recomputeEffectiveBuffer()
         // 新连接未协商 upperBodyPostV1，聚合结果必然为 false（任务 M2）
         recomputeUpperBodyPostV1()
+        // 新连接默认 TEXT（§2.2.2：还没发 hello 的新连接保持 v1 文本 track；发 hello 声明
+        // rawTrackV1 后由 setTrackMode 切 IDLE 并清队列，早期文本帧不会混进 raw 会话）
+        recomputeStreamModes()
         connection.start()
 
         // §4.1：连接建立后立即发 hello
@@ -800,6 +945,9 @@ class TrackingServer(
                 // 任务 M2：上半身启用即声明支持（手机端可按 ubRaw 发原始点，后处理迁 PC）
                 upperBodyPostV1 = upperBodyOn,
                 timestampMs = System.currentTimeMillis(),
+                // rawTrackV1 §2.1：手机支持发送二进制原始追踪帧（客户端 hello.features 声明
+                // "rawTrackV1" 并 startStream(rawMode=rawTrackV1) 后启用）
+                rawTrackV1 = true,
             )
         )
 
@@ -807,7 +955,10 @@ class TrackingServer(
         return true
     }
 
-    /** 客户端上行：只认 ping / command / hello（协议 §3 / §4.4 / §4.5），其余一律忽略。 */
+    /**
+     * 客户端上行：ping / command / hello / startStream / stopStream / resetTracking
+     * （协议 §3 / §4.4 / §4.5 与 rawTrackV1 §6），其余一律忽略。
+     */
     private fun handleClientMessage(connection: TrackingWsConnection, text: String) {
         when (TrackingProtocol.classifyClientMessage(text)) {
             TrackingProtocol.ClientMessage.PING -> {
@@ -818,7 +969,11 @@ class TrackingServer(
             }
 
             TrackingProtocol.ClientMessage.RECALIBRATE -> {
-                onRecalibrate()
+                // rawTrackV1 §6.3：command:recalibrate 语义已废止（校准所有权在 Windows）。
+                // 旧客户端仍可能发 —— 兼容接受但只做 resetTracking 的等价动作（清感知层状态），
+                // 绝不再做任何基线减除；ack 保持 legacy 形状（逐字节不变）。
+                Log.w(TAG, "command:recalibrate 已废弃（校准归 Windows）：按 resetTracking 等价处理")
+                sessionId = onResetTracking()
                 connection.offerControl(
                     TrackingProtocol.buildAck(TrackingProtocol.COMMAND_RECALIBRATE)
                 )
@@ -835,16 +990,129 @@ class TrackingServer(
                     features.contains(TrackingProtocol.FEATURE_UPPER_BODY_POST_V1) ||
                         TrackingProtocol.parseBoolField(text, "upperBodyPostV1") == true
                 connection.upperBodyPostV1 = upperBodyPostV1
+                // rawTrackV1 协商（docs/raw-track-protocol.md §2.1）：features 含 "rawTrackV1"
+                val rawTrackV1 = features.contains(TrackingProtocol.FEATURE_RAW_TRACK_V1)
+                connection.rawTrackV1 = rawTrackV1
                 Log.i(
                     TAG,
                     "客户端 hello 协商: features=" + features.sorted().joinToString(",", "[", "]") +
-                        " upperBodyPostV1=" + upperBodyPostV1,
+                        " upperBodyPostV1=" + upperBodyPostV1 + " rawTrackV1=" + rawTrackV1,
+                )
+                // §2.2.4：重复 hello 以最后一条为准，重算生效形态（切换时清发送缓冲）。
+                // 未带 rawTrackV1 的 hello = 中途降级，立即切回文本 JSON（§2.4）；
+                // 已协商但未 startStream 的连接是 IDLE —— 绝不能给它发文本 track（PC 会误判降级）。
+                setTrackMode(
+                    connection,
+                    when {
+                        rawTrackV1 && connection.trackMode == TrackMode.RAW -> TrackMode.RAW
+                        rawTrackV1 -> TrackMode.IDLE
+                        else -> TrackMode.TEXT
+                    },
                 )
                 recomputeEffectiveBuffer()
                 recomputeUpperBodyPostV1()
             }
 
+            TrackingProtocol.ClientMessage.START_STREAM -> {
+                val requestId = TrackingProtocol.parseRequestId(text)
+                val rawMode = TrackingProtocol.parseRawMode(text)
+                if (rawMode == TrackingProtocol.FEATURE_RAW_TRACK_V1) {
+                    if (connection.rawTrackV1) {
+                        // 幂等：重复调用同参数 → setTrackMode 无副作用，直接回同结果 ack（§6.2）
+                        setTrackMode(connection, TrackMode.RAW)
+                        connection.offerControl(
+                            TrackingProtocol.buildAckResult("startStream", requestId, ok = true),
+                        )
+                    } else {
+                        connection.offerControl(
+                            TrackingProtocol.buildAckResult(
+                                "startStream", requestId, ok = false,
+                                error = "rawMode not negotiated",
+                            ),
+                        )
+                    }
+                } else {
+                    // rawMode 缺省或 "legacy"：即使协商成功也继续发文本 JSON（§2.3，供排障 / 降级演练）
+                    setTrackMode(connection, TrackMode.TEXT)
+                    connection.offerControl(
+                        TrackingProtocol.buildAckResult("startStream", requestId, ok = true),
+                    )
+                }
+            }
+
+            TrackingProtocol.ClientMessage.STOP_STREAM -> {
+                // 停止推流（不关 WS）：清该连接发送缓冲；未在推流时也回 ack ok（§6.2）
+                val requestId = TrackingProtocol.parseRequestId(text)
+                setTrackMode(connection, TrackMode.IDLE)
+                connection.offerControl(
+                    TrackingProtocol.buildAckResult("stopStream", requestId, ok = true),
+                )
+            }
+
+            TrackingProtocol.ClientMessage.RESET_TRACKING -> {
+                val requestId = TrackingProtocol.parseRequestId(text)
+                val newSession = onResetTracking()
+                sessionId = newSession
+                connection.offerControl(
+                    TrackingProtocol.buildAckResult(
+                        "resetTracking", requestId, ok = true, sessionId = newSession,
+                    ),
+                )
+            }
+
             TrackingProtocol.ClientMessage.IGNORED -> Unit
+        }
+    }
+
+    /**
+     * 切换某连接的 track 形态：变更时清它的发送队列（§2.2.4 / §2.5 —— 切换时清发送缓冲，
+     * 避免旧语义帧混入）并重算聚合状态。幂等（同形态直接返回）。
+     */
+    private fun setTrackMode(connection: TrackingWsConnection, mode: TrackMode) {
+        if (connection.trackMode == mode) return
+        connection.trackMode = mode
+        connection.clearSendQueue()
+        Log.i(TAG, "客户端 track 形态切换 -> " + mode + "（剩余 " + wsClients.size + " 个客户端）")
+        recomputeStreamModes()
+    }
+
+    /**
+     * 重算 rawTrackV1 流形态聚合（docs/raw-track-protocol.md §2.2.3）并在变化时通知上层：
+     *
+     *  - rawStreamActive = 存在 RAW 推流客户端 **且** 没有 TEXT 客户端 —— 手机后处理整链
+     *    旁路（[PipelineFaceTracker.setPostProcessingEnabled](false)）与上半身原始输出的条件；
+     *  - 无客户端 / 仅 IDLE（已协商未 startStream）按 false 处理：手机本地 UI 依赖后处理
+     *    结果（MainActivity 的 BS / 头姿调试），纯手机场景不能被旁路。
+     *
+     * **与协议 §2.2.3 字面的有意差异**（spec-arch 评审确认）：协议说「只有存在至少一个 v1
+     * 文本客户端时才跑 legacy 后处理链」；本实现在「无 TEXT 客户端但也没有 RAW 推流」
+     * （零客户端 / 仅 IDLE）时仍保留链，为手机本地 UI/HUD 供数。差异只影响手机 CPU，
+     * **线上报文无任何影响**（无 RAW 推流 = 无 raw_track；文本 track 只发 TEXT 客户端）。
+     */
+    private fun recomputeStreamModes() {
+        var anyRaw = false
+        var anyText = false
+        for (client in wsClients) {
+            when (client.trackMode) {
+                TrackMode.RAW -> anyRaw = true
+                TrackMode.TEXT -> anyText = true
+                TrackMode.IDLE -> Unit
+            }
+        }
+        val rawActive = anyRaw && !anyText
+        if (rawActive != rawStreamActive) {
+            rawStreamActive = rawActive
+            Log.i(
+                TAG,
+                "rawTrackV1 流形态: rawStreamActive=" + rawActive +
+                    "（RAW=" + anyRaw + " TEXT=" + anyText + "）",
+            )
+            onRawStreamActive(rawActive)
+        }
+        val needed = !rawActive
+        if (needed != postProcessingNeeded) {
+            postProcessingNeeded = needed
+            onPostProcessingNeeded(needed)
         }
     }
 
@@ -898,7 +1166,9 @@ class TrackingServer(
             clients = wsClients.size,
             fps = sentFps,
             device = deviceName,
-            seq = latestSeq,
+            // §7.6：seq 保留字段 = 最新 frameId（文本兼容）；sessionId 为可选新增
+            seq = latestFrameId,
+            sessionId = sessionId,
         )
         writeSimpleResponse(output, "200 OK", "application/json; charset=utf-8", body)
     }
@@ -1085,6 +1355,25 @@ internal class TrackingWsConnection(
     var upperBodyPostV1: Boolean = false
 
     /**
+     * 该连接是否已协商 rawTrackV1（docs/raw-track-protocol.md §2.1）：hello.features 含
+     * `rawTrackV1` 时置 true。startStream(rawMode=rawTrackV1) 只有在它为 true 时才生效。
+     * reader 线程写、[TrackingServer] 各处读，@Volatile 保证可见性。
+     */
+    @Volatile
+    var rawTrackV1: Boolean = false
+
+    /**
+     * 该连接当前的 track 流形态（per-client 分发，§2.2.3）：
+     *  - [TrackMode.TEXT]（默认）：v1 文本 JSON track —— 老客户端（含还没发 hello 的新连接）
+     *    连接即推流，legacy 行为逐字节不变；
+     *  - [TrackMode.IDLE]：已协商 rawTrackV1 但未 startStream（或已 stopStream）：不发 track；
+     *  - [TrackMode.RAW]：OP_BINARY raw_track。
+     * 只由 [TrackingServer.setTrackMode] 修改（变更时清发送队列）。
+     */
+    @Volatile
+    var trackMode: TrackMode = TrackMode.TEXT
+
+    /**
      * writer 线程的唤醒信号。
      *
      * 之前 writer 空闲时阻塞 poll(20ms)，而 [offerTrack] 只写一个覆盖槽位、不会唤醒它 ——
@@ -1137,6 +1426,24 @@ internal class TrackingWsConnection(
     fun offerControl(message: String) {
         if (closed) return
         sendQueue.offer(message, control = true)
+        signalWriter()
+    }
+
+    /**
+     * 投递一帧二进制 raw_track（rawTrackV1，docs/raw-track-protocol.md §2.5）。
+     *
+     * 与文本 track / control 同队严格保序（hello / ack / bye / pong 绝不被 raw 帧挤掉或
+     * 乱序），溢出丢最旧 track。writer 按条目类型发 OP_BINARY（服务端出帧不带掩码）。
+     */
+    fun offerBinary(payload: ByteArray) {
+        if (closed) return
+        sendQueue.offerBinary(payload)
+        signalWriter()
+    }
+
+    /** 清空发送队列（track 形态切换时调用，避免旧语义帧混入，§2.2.4 / §2.5）。 */
+    fun clearSendQueue() {
+        sendQueue.clear()
         signalWriter()
     }
 
@@ -1199,9 +1506,16 @@ internal class TrackingWsConnection(
                 }
                 // 应用消息（track 与 hello / calib / pong / ack / bye）：同一个 FIFO 严格按
                 // 投递顺序发送，杜绝 calib / track 错配；溢出丢弃已经在 offer 时按策略完成。
-                val message = sendQueue.poll()
-                if (message != null) {
-                    sendFrame(OP_TEXT, message.toByteArray(Charsets.UTF_8))
+                // 按条目自带的显式载荷类型选 opcode：raw_track → OP_BINARY，其余 → OP_TEXT。
+                val outgoing = sendQueue.poll()
+                if (outgoing != null) {
+                    val binary = outgoing.binary
+                    if (binary != null) {
+                        sendFrame(OP_BINARY, binary)
+                    } else {
+                        val text = outgoing.text
+                        if (text != null) sendFrame(OP_TEXT, text.toByteArray(Charsets.UTF_8))
+                    }
                     continue
                 }
 

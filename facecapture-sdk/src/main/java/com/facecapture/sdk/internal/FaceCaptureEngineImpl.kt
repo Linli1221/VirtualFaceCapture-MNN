@@ -63,6 +63,10 @@ internal class FaceCaptureEngineImpl : FaceCaptureEngine {
                 presenceScore = snap.presenceScore,
                 isCalibrating = snap.isCalibrating,
                 fps = snap.fps,
+                timestampMs = snap.timestampMs,
+                inferenceMs = snap.inferenceMs,
+                cameraFps = snap.cameraFps,
+                postProcessed = snap.postProcessed,
             )
             // frameCounter kept for back-compat consumers that relied on a
             // strictly engine-local id; not used in the emitted result.

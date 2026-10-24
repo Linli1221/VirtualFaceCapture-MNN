@@ -19,6 +19,12 @@ import java.util.concurrent.TimeUnit
  */
 class TrackingSendQueueTest {
 
+    /**
+     * 测试适配器：[TrackingSendQueue.poll] 现在返回带显式类型的 Outgoing 条目
+     * （文本 / 二进制 + control 标记），老用例只关心文本载荷，这里取 .text。
+     */
+    private fun TrackingSendQueue.pollText(): String? = poll()?.text
+
     // ------------------------------------------------------------- 顺序保持
 
     @Test
@@ -31,20 +37,20 @@ class TrackingSendQueueTest {
         queue.offer("c2", control = true)
 
         // 旧实现里 control 走优先队列会先出 c1/c2，把 t1 甩在后面 —— 这里必须按投递顺序
-        assertEquals("t1", queue.poll())
-        assertEquals("c1", queue.poll())
-        assertEquals("t2", queue.poll())
-        assertEquals("c2", queue.poll())
-        assertNull(queue.poll())
+        assertEquals("t1", queue.pollText())
+        assertEquals("c1", queue.pollText())
+        assertEquals("t2", queue.pollText())
+        assertEquals("c2", queue.pollText())
+        assertNull(queue.pollText())
     }
 
     @Test
     fun pollOnEmptyQueueReturnsNull() {
         val queue = TrackingSendQueue()
-        assertNull(queue.poll())
+        assertNull(queue.pollText())
         queue.offer("t1", control = false)
-        assertEquals("t1", queue.poll())
-        assertNull(queue.poll())
+        assertEquals("t1", queue.pollText())
+        assertNull(queue.pollText())
     }
 
     // ------------------------------------------------------- 溢出：丢最旧 track
@@ -60,12 +66,12 @@ class TrackingSendQueueTest {
         // 最旧的 t0 被丢掉，其余按序保留
         assertEquals(TrackingSendQueue.MAX_TRACK, queue.size)
         assertEquals(1L, queue.droppedTrackCount)
-        assertEquals("t1", queue.poll())
+        assertEquals("t1", queue.pollText())
         repeat(TrackingSendQueue.MAX_TRACK - 2) { index ->
-            assertEquals("t" + (index + 2), queue.poll())
+            assertEquals("t" + (index + 2), queue.pollText())
         }
-        assertEquals("t-new", queue.poll())
-        assertNull(queue.poll())
+        assertEquals("t-new", queue.pollText())
+        assertNull(queue.pollText())
     }
 
     @Test
@@ -87,7 +93,7 @@ class TrackingSendQueueTest {
         // 出队顺序仍然严格：control 插在它投递时的位置上
         val drained = ArrayList<String>()
         while (true) {
-            val message = queue.poll() ?: break
+            val message = queue.pollText() ?: break
             drained.add(message)
         }
         assertEquals("hello", drained.first())
@@ -112,10 +118,10 @@ class TrackingSendQueueTest {
         assertEquals(5L, queue.droppedControlCount)
         assertEquals(0L, queue.droppedTrackCount)
         // 丢掉的是最旧的 5 条，剩下的从 c5 起按序排到最后一条
-        assertEquals("c5", queue.poll())
+        assertEquals("c5", queue.pollText())
         var last = ""
         while (true) {
-            val message = queue.poll() ?: break
+            val message = queue.pollText() ?: break
             last = message
         }
         assertEquals("c" + (TrackingSendQueue.MAX_CONTROL + 4), last)
@@ -151,7 +157,7 @@ class TrackingSendQueueTest {
         assertEquals(0, queue.size)
         assertEquals(0, queue.queuedTracks)
         assertEquals(0, queue.queuedControls)
-        assertNull(queue.poll())
+        assertNull(queue.pollText())
     }
 
     // ------------------------------------------------------------- 并发安全
@@ -184,8 +190,65 @@ class TrackingSendQueueTest {
         assertEquals(total, queue.queuedTracks + queue.queuedControls)
 
         var drained = 0
-        while (queue.poll() != null) drained++
+        while (queue.pollText() != null) drained++
         assertEquals(total, drained)
         assertEquals(0, queue.size)
+    }
+
+    // --------------------------------------------- rawTrackV1：二进制条目（§2.5）
+
+    @Test
+    fun binaryEntriesShareFifoWithTextAndControl() {
+        val queue = TrackingSendQueue()
+        val raw1 = byteArrayOf(1, 2, 3)
+        val raw2 = byteArrayOf(9, 9)
+
+        queue.offer("t-text", control = false)
+        queue.offerBinary(raw1)
+        queue.offer("hello", control = true)
+        queue.offerBinary(raw2)
+
+        // 严格 FIFO：hello / ack / bye / pong 绝不被 raw 帧挤掉或乱序（§2.5）
+        val first = queue.poll()
+        assertEquals("t-text", first?.text)
+        assertEquals(false, first?.isBinary)
+
+        val second = queue.poll()
+        assertEquals(true, second?.isBinary)
+        assertTrue(raw1 === second?.binary) // 同一载荷引用，不做拷贝
+        assertEquals(false, second?.control)
+
+        val third = queue.poll()
+        assertEquals("hello", third?.text)
+        assertEquals(true, third?.control)
+
+        val fourth = queue.poll()
+        assertEquals(true, fourth?.isBinary)
+        assertTrue(raw2 === fourth?.binary)
+        assertNull(queue.poll())
+    }
+
+    @Test
+    fun binaryOverflowDropsOldestTrackAndNeverControl() {
+        val queue = TrackingSendQueue()
+        queue.offer("hello", control = true)
+        repeat(TrackingSendQueue.MAX_TRACK + 3) { index ->
+            queue.offerBinary(byteArrayOf(index.toByte()))
+        }
+        queue.offer("bye", control = true)
+
+        // 二进制也走 track 语义：溢出丢最旧，总量有界，control 一条不丢
+        assertEquals(TrackingSendQueue.MAX_TRACK + 2, queue.size)
+        assertEquals(3L, queue.droppedTrackCount)
+        assertEquals(0L, queue.droppedControlCount)
+
+        assertEquals("hello", queue.pollText())
+        var last: TrackingSendQueue.Outgoing? = null
+        while (true) {
+            val entry = queue.poll() ?: break
+            last = entry
+        }
+        assertEquals("bye", last?.text)
+        assertEquals(true, last?.control)
     }
 }

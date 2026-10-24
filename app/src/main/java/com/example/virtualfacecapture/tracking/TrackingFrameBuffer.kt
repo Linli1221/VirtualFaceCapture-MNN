@@ -28,7 +28,11 @@ class TrackingFrameBuffer(
     private val maxQueued: Int = MAX_QUEUED_MESSAGES,
 ) {
 
-    private class Entry(val message: String, val enqueueNanos: Long)
+    /**
+     * 缓冲条目。[control] 是**显式消息类型**（true = calib 等控制消息）：放行侧按它分流，
+     * 不再解析 payload 内容判类型（rawTrackV1 的二进制条目根本不进本缓冲，见 §2.5）。
+     */
+    class Entry(val message: String, val control: Boolean, val enqueueNanos: Long)
 
     /** 待发报文（track / calib），按入队顺序放行。 */
     private val queue = ArrayDeque<Entry>()
@@ -86,7 +90,7 @@ class TrackingFrameBuffer(
      *
      * @param nowNanos 入队时刻，必须是单调时钟（`System.nanoTime()`），不能是墙钟。
      */
-    fun enqueue(message: String, nowNanos: Long) {
+    fun enqueue(message: String, nowNanos: Long, control: Boolean = false) {
         // 队列本来已经空了、而且距离上一帧很久：说明中间真断流了，
         // 重新进入预缓冲，否则缓冲每垫一帧就放一帧，延迟回不来。
         if (queue.isEmpty() && primed && hasEnqueueHistory &&
@@ -101,7 +105,7 @@ class TrackingFrameBuffer(
             queue.removeFirst()
             droppedCount++
         }
-        queue.addLast(Entry(message, nowNanos))
+        queue.addLast(Entry(message, control, nowNanos))
 
         if (hasEnqueueHistory) {
             val delta = nowNanos - lastEnqueueNanos
@@ -117,14 +121,14 @@ class TrackingFrameBuffer(
     }
 
     /**
-     * 到期则弹出一条报文并返回，否则返回 null。
+     * 到期则弹出一条条目并返回，否则返回 null。条目自带显式 control 标记（[Entry.control]）。
      *
      * 预缓冲阶段：队头攒够 [bufferMs] 才起播；
      * 起播之后：只看播放时钟（[nextReleaseNanos]），与每帧的到达时刻无关。
      *
      * @param nowNanos 当前时刻（`System.nanoTime()`）。
      */
-    fun poll(nowNanos: Long): String? {
+    fun poll(nowNanos: Long): Entry? {
         val head = queue.firstOrNull() ?: return null
 
         if (!primed) {
@@ -145,7 +149,7 @@ class TrackingFrameBuffer(
         adjustPace()
         // 正常情况下按生产节奏推进；卡顿 / 饿死之后以「现在」为起点重新计时，最多补发当前一帧
         nextReleaseNanos = maxOf(nextReleaseNanos + releaseIntervalNanos, nowNanos)
-        return head.message
+        return head
     }
 
     /**

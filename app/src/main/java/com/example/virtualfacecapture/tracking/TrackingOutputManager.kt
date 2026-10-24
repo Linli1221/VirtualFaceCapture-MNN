@@ -9,9 +9,8 @@ import android.os.Looper
 import com.vfc.log.VfcLog as Log
 import android.view.WindowManager
 import androidx.compose.runtime.mutableStateOf
-import com.example.commondata.ARKitBlendShapes
-import com.example.commondata.HeadPoseData
 import com.example.commondata.UpperBodyPoseFrame
+import com.facecapture.sdk.PipelineFaceTracker
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import kotlin.math.roundToInt
@@ -32,12 +31,25 @@ import kotlin.math.roundToInt
 class TrackingOutputManager(
     private val context: Context,
     /**
-     * 全局 upperBodyPostV1 协商结果变化时的通知回调（任务 M2，照 [onRecalibrate] 的接线
+     * 全局 upperBodyPostV1 协商结果变化时的通知回调（任务 M2，照 [onResetTracking] 的接线
      * 模式）：true = 全体客户端都声明支持「上半身后处理迁 PC」，检测器切原始输出
      * （[com.example.mediapipeupperbody.UpperBodyPoseDetector.rawOutput]）；false = 回 M1 旧链。
+     *
+     * 注意：上半身检测器的 rawOutput 是「M2 协商 ∪ rawTrackV1 raw 推流」的**合并开关**，
+     * 合并取或在上层做（MainActivity），见 [rawStreamActive]。
      */
     private val onUpperBodyPostV1: (Boolean) -> Unit = {},
-    private val onRecalibrate: () -> Unit = {},
+    /**
+     * rawTrackV1 流形态变化（docs/raw-track-protocol.md §2.2.3）：true = 全部客户端都在 raw
+     * 推流，手机后处理整链旁路（PipelineFaceTracker.setPostProcessingEnabled(false)）且上半身
+     * 走原始输出；false = 恢复 legacy 链。零客户端 / 仅 IDLE 恒 false（手机 UI 依赖后处理）。
+     */
+    private val onRawStreamActive: (Boolean) -> Unit = {},
+    /**
+     * resetTracking（§6.2）：重置感知层状态（PipelineFaceTracker.resetPerceptionState）并返回
+     * 新会话 id（ack 与 GET /status 用）。command:recalibrate 的废止语义也走这里（§6.3）。
+     */
+    private val onResetTracking: () -> Long = { 0L },
 ) {
 
     companion object {
@@ -109,6 +121,13 @@ class TrackingOutputManager(
     @Volatile
     var upperBodyPostV1: Boolean = false
         private set
+    /**
+     * rawTrackV1 流形态快照（docs/raw-track-protocol.md §2.2.3）：true = 全部客户端都在 raw
+     * 推流（手机后处理旁路 + 上半身原始输出）。HUD / 上层合并开关用。
+     */
+    @Volatile
+    var rawStreamActive: Boolean = false
+        private set
 
     private val deviceName: String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android"
 
@@ -146,11 +165,16 @@ class TrackingOutputManager(
             port = PORT,
             deviceName = deviceName,
             appName = appName,
-            onRecalibrate = onRecalibrate,
+            onResetTracking = onResetTracking,
             // 任务 M2：协商聚合（全体客户端 upperBodyPostV1）→ 记录状态 → 通知上层切检测器
             onUpperBodyPostV1 = { enabled ->
                 upperBodyPostV1 = enabled
                 onUpperBodyPostV1(enabled)
+            },
+            // rawTrackV1 流形态聚合 → 记录状态 → 通知上层旁路 / 恢复后处理链
+            onRawStreamActive = { active ->
+                rawStreamActive = active
+                onRawStreamActive(active)
             },
             frameBufferMs = sendBufferMs.value,
         )
@@ -254,26 +278,21 @@ class TrackingOutputManager(
     }
 
     /**
-     * 每处理完一帧调用一次（协议 §4.2）。
+     * 每处理完一帧调用一次（协议 §4.2 / rawTrackV1 §4）。
      *
      * 服务没开时这里只做一次 volatile 判空就直接返回，不产生任何额外开销。
      *
-     * @param headPose 必须是相对姿态（已减首帧基线），即 pose 字段。
-     * @param presenceScore 人脸存在置信度 [0,1]。
+     * [frame] 是同帧原子快照（SdkFaceCaptureFrame）：文本 track 用后处理字段
+     * （relativeHeadPose / blendShapes，legacy 语义逐字节不变），raw_track 用原始层 +
+     * timestampMs / inferenceMs / cameraFps（per-client 分发见 [TrackingServer.submitTrack]）。
      */
-    fun submitFrame(
-        blendShapes: ARKitBlendShapes,
-        headPose: HeadPoseData,
-        presenceScore: Float,
-        fps: Float,
-        calibrating: Boolean,
-    ) {
+    fun submitFrame(frame: PipelineFaceTracker.SdkFaceCaptureFrame) {
         if (!running) return
         val current = server ?: return
         // hello 里的 targetFps 用实际处理帧率上报（协议 §4.1）
-        val target = fps.roundToInt().coerceIn(1, 120)
+        val target = frame.fps.roundToInt().coerceIn(1, 120)
         if (target != current.targetFps) current.targetFps = target
-        current.submitTrack(blendShapes, headPose, presenceScore, fps, calibrating)
+        current.submitTrack(frame)
     }
 
     // ---------------------------------------------------------------- 地址/杂项

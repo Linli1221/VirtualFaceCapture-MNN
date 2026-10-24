@@ -13,12 +13,18 @@ package com.example.virtualfacecapture.tracking
  * 本类把 track 与 control（hello / calib / pong / ack / bye）放进**同一个 FIFO**，严格按
  * 投递顺序出队，从根上消灭顺序反转；同时保持「慢客户端绝不拖慢推理线程」这条铁律：
  *
- *  - [offer] **非阻塞**、均摊 O(1)、**不碰任何网络 IO** —— 推理线程调用它只做几条指针操作；
+ *  - [offer] / [offerBinary] **非阻塞**、均摊 O(1)、**不碰任何网络 IO** —— 推理线程调用它
+ *    只做几条指针操作；
  *  - 容量有硬上限：最多 [MAX_TRACK] 条 track + [MAX_CONTROL] 条 control（总量 [MAX_TOTAL]），
  *    内存占用恒定有界，writer 再慢也不会把队列滚雪球；
  *  - 溢出策略**保 control 弃 track**：track 满了丢**最旧的 track**（保最新帧，PC 也会按
- *    `seq` 丢旧帧）；绝不丢 control —— hello / calib / ack / bye 丢了协议就错乱了。
+ *    frameId 丢旧帧）；绝不丢 control —— hello / calib / ack / bye 丢了协议就错乱了。
  *    只有 control 自己爆掉（超过 32 条，几乎不可能）才丢最旧的 control 兜底。
+ *
+ * rawTrackV1（docs/raw-track-protocol.md §2.5）：二进制 raw_track 与文本 track 共用同一 FIFO
+ * 与同一溢出策略 —— hello / ack / bye / pong 绝不被 raw 帧挤掉或乱序（calib 与 track 错配
+ * 的历史坑不允许在 raw 模式重现）。条目自带显式载荷类型（[Outgoing.isBinary]），writer 据此
+ * 选 OP_BINARY / OP_TEXT，**不再解析 payload 内容判类型**。
  *
  * 线程安全：所有公开方法都在同一把内部锁下完成（工作量都是常数上界，锁内没有任何 IO /
  * 睡眠 / 回调），因此并发 [offer] 与 [poll] 不会互相拖住。
@@ -30,14 +36,30 @@ class TrackingSendQueue(
     private val maxControl: Int = MAX_CONTROL,
 ) {
 
-    /** 队列条目：[control] 决定溢出时是否允许被丢弃（false = track，可丢；true = control，尽量不丢）。 */
-    private class Entry(val message: String, val control: Boolean)
+    /**
+     * 队列条目：payload 二选一 —— [text]（文本 JSON）或 [binary]（rawTrackV1 OP_BINARY 载荷，
+     * [TrackingRawProtocol.encodeRawTrack] 的整条 WS message payload）。
+     *
+     * [control] 决定溢出时是否允许被丢弃（false = track，可丢；true = control，尽量不丢）。
+     */
+    class Outgoing(val text: String?, val binary: ByteArray?, val control: Boolean) {
+        /** 是否二进制载荷（writer 据此选 OP_BINARY / OP_TEXT）。 */
+        val isBinary: Boolean get() = binary != null
+
+        companion object {
+            /** 文本载荷条目（legacy track / 控制消息）。 */
+            fun text(message: String, control: Boolean): Outgoing = Outgoing(message, null, control)
+
+            /** 二进制载荷条目（raw_track；永远是 track 语义，可丢）。 */
+            fun binary(payload: ByteArray): Outgoing = Outgoing(null, payload, control = false)
+        }
+    }
 
     /** 保护 [queue] 与两个计数的内部锁；锁内只有常数上界的工作，绝不做 IO。 */
     private val lock = Any()
 
     /** 单一 FIFO，按投递顺序出队，track 与 control 严格交错保序。 */
-    private val queue = ArrayDeque<Entry>()
+    private val queue = ArrayDeque<Outgoing>()
 
     private var trackCount = 0
     private var controlCount = 0
@@ -70,19 +92,32 @@ class TrackingSendQueue(
         get() = synchronized(lock) { droppedControls }
 
     /**
-     * 非阻塞投递一条已序列化的报文。
+     * 非阻塞投递一条已序列化的文本报文。
      *
      * @param control true = hello / calib / pong / ack / bye 这类控制消息；false = track 数据帧。
      */
     fun offer(message: String, control: Boolean) {
+        enqueue(Outgoing.text(message, control))
+    }
+
+    /**
+     * 非阻塞投递一条二进制 raw_track（rawTrackV1，docs/raw-track-protocol.md §2.5）。
+     *
+     * 永远是 track 语义（溢出可丢最旧），与文本 track / control 同队严格保序。
+     */
+    fun offerBinary(payload: ByteArray) {
+        enqueue(Outgoing.binary(payload))
+    }
+
+    private fun enqueue(entry: Outgoing) {
         synchronized(lock) {
-            if (control) {
+            if (entry.control) {
                 // control 爆仓（>32 条）才丢最旧的 control 兜底；正常情况下永远走不到这里
                 while (controlCount >= maxControl) {
                     if (!dropOldestControl()) break
                     droppedControls++
                 }
-                queue.addLast(Entry(message, true))
+                queue.addLast(entry)
                 controlCount++
             } else {
                 // track 爆仓：丢最旧的 track（保最新帧），绝不挤掉 control
@@ -90,22 +125,22 @@ class TrackingSendQueue(
                     if (!dropOldestTrack()) break
                     droppedTracks++
                 }
-                queue.addLast(Entry(message, false))
+                queue.addLast(entry)
                 trackCount++
             }
         }
     }
 
     /** 弹出队头（最旧的一条）；空队列返回 null。调用方（writer 线程）负责真正发送。 */
-    fun poll(): String? {
+    fun poll(): Outgoing? {
         synchronized(lock) {
             val entry = queue.removeFirstOrNull() ?: return null
             if (entry.control) controlCount-- else trackCount--
-            return entry.message
+            return entry
         }
     }
 
-    /** 清空（连接关闭 / 服务停止时调用），计数与丢弃统计一并复位。 */
+    /** 清空（连接关闭 / 服务停止 / 模式切换时调用），计数与丢弃统计一并复位。 */
     fun clear() {
         synchronized(lock) {
             queue.clear()
@@ -150,7 +185,7 @@ class TrackingSendQueue(
     companion object {
         /**
          * track 上限（条）。60 fps 下约 133 ms 的突发余量：writer 偶尔卡一下不会丢帧，
-         * 卡得久了就丢最旧的 track —— 反正 PC 按 `seq` 丢旧帧、且低延迟模式下 PC 侧
+         * 卡得久了就丢最旧的 track —— 反正 PC 按 frameId 丢旧帧、且低延迟模式下 PC 侧
          * 还有自适应抖动缓冲兜着，「保最新」比「一帧不漏」更重要。
          */
         const val MAX_TRACK = 8

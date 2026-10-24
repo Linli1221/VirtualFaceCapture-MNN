@@ -382,21 +382,33 @@ class MainActivity : ComponentActivity() {
         // （One-Euro / 躯干角 / 基线迁到 PC 侧做），否则保持 M1 的手机端后处理链。
         trackingOutput = TrackingOutputManager(
             context = this,
-            onUpperBodyPostV1 = { enabled -> upperBody.setRawOutput(enabled) },
-            onRecalibrate = {
-                runOnUiThread { faceTracker.resetAdaptiveBaseline() }
+            // 上半身检测器原始输出 = M2 协商 ∪ rawTrackV1 raw 推流（任一生效即发原始 13 点）
+            onUpperBodyPostV1 = { enabled ->
+                upperBody.setRawOutput(enabled || trackingOutput.rawStreamActive)
+            },
+            // rawTrackV1 raw 推流期间旁路手机端后处理链（含原生关键点/头姿 EMA，
+            // 附录 K.4）；切回 legacy 时恢复三路滤波开关 + resetSmoothing（见
+            // PipelineFaceTracker.setPostProcessingEnabled）。切 UI 线程执行，与
+            // resetAdaptiveBaseline 同一接线惯例。
+            onRawStreamActive = { active ->
+                runOnUiThread {
+                    faceTracker.setPostProcessingEnabled(!active)
+                    upperBody.setRawOutput(active || trackingOutput.upperBodyPostV1)
+                }
+            },
+            // resetTracking / 已废止的 command:recalibrate（§6.2 / §6.3）：只清感知层状态，
+            // 不再做任何基线减除；返回新会话 id 供 ack 与 GET /status
+            onResetTracking = {
+                faceTracker.resetPerceptionState()
+                faceTracker.perceptionSession.toLong()
             },
         )
 
         // 每处理完一帧就把追踪数据喂给网络输出；服务未开启时 submitFrame 只做一次判空即返回。
+        // SdkFaceCaptureFrame 是同帧原子快照：raw_track 用原始层 + timestampMs / inferenceMs /
+        // cameraFps，文本 track 用后处理层（relativeHeadPose / blendShapes，legacy 逐字节不变）。
         faceTracker.onFaceCaptureResult = { frame ->
-            trackingOutput.submitFrame(
-                blendShapes = frame.blendShapes,
-                headPose = frame.relativeHeadPose,
-                presenceScore = frame.presenceScore,
-                fps = frame.fps,
-                calibrating = frame.isCalibrating,
-            )
+            trackingOutput.submitFrame(frame)
         }
 
         // 上半身结果 → 网络输出（协议组：内部只存最新快照，track 报文按需带 ub / ubOk / body）。

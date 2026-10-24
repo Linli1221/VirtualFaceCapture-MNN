@@ -86,6 +86,15 @@ object TrackingProtocol {
      */
     const val FEATURE_UPPER_BODY_POST_V1 = "upperBodyPostV1"
 
+    /**
+     * 客户端能力标记：PC 侧实现了 rawTrackV1 二进制解析与完整 Windows 后处理
+     * （docs/raw-track-protocol.md §2.1）。手机 hello 的可选字段名同名。
+     *
+     * 协商成功只是**前提**；真正开 raw 推流还需要客户端发 startStream(rawMode=rawTrackV1)
+     * （§2.3），未 startStream 的已协商连接不发任何 track（IDLE）。
+     */
+    const val FEATURE_RAW_TRACK_V1 = "rawTrackV1"
+
     /** 唯一的 command 名，等价于 UI 上的 Reset Baseline。 */
     const val COMMAND_RECALIBRATE = "recalibrate"
 
@@ -237,6 +246,7 @@ object TrackingProtocol {
         upperBody: Boolean = false,
         upperBodyPostV1: Boolean = false,
         timestampMs: Long = System.currentTimeMillis(),
+        rawTrackV1: Boolean = false,
     ): String {
         val builder = StringBuilder(160)
         builder.jsonString("type", "hello", first = true)
@@ -250,6 +260,8 @@ object TrackingProtocol {
         if (upperBody) builder.jsonBool("upperBody", true)
         // 任务 M2 可选能力声明：默认不发，老客户端/老链路的报文逐字节不变。
         if (upperBodyPostV1) builder.jsonBool("upperBodyPostV1", true)
+        // rawTrackV1 能力声明（docs/raw-track-protocol.md §2.1）：手机支持发送二进制原始帧
+        if (rawTrackV1) builder.jsonBool(FEATURE_RAW_TRACK_V1, true)
         builder.jsonLong("t", timestampMs)
         builder.append('}')
         return builder.toString()
@@ -408,6 +420,35 @@ object TrackingProtocol {
         return builder.toString()
     }
 
+    /**
+     * §6.4 rawTrackV1 控制消息的 ack：
+     * {"type":"ack","name":"<消息名>","requestId":"...","ok":true[,"sessionId":N]}
+     * 失败时 "ok":false + "error":"<原因>"。
+     *
+     * requestId 只在客户端带了的时候原样回显（§6.2）；resetTracking 成功时额外携带
+     * 新会话 id（§6.2「ack 携带新的 sessionId」）。
+     *
+     * 与 [buildAck]（legacy command:recalibrate 的老 ack，逐字节不变）分开，
+     * 保证 v1 老路径的报文形状零变化。
+     */
+    fun buildAckResult(
+        name: String,
+        requestId: String?,
+        ok: Boolean,
+        error: String? = null,
+        sessionId: Long? = null,
+    ): String {
+        val builder = StringBuilder(96)
+        builder.jsonString("type", "ack", first = true)
+        builder.jsonString("name", name)
+        if (requestId != null) builder.jsonString("requestId", requestId)
+        builder.jsonBool("ok", ok)
+        if (!ok && error != null) builder.jsonString("error", error)
+        if (sessionId != null) builder.jsonLong("sessionId", sessionId)
+        builder.append('}')
+        return builder.toString()
+    }
+
     /** §4.4 bye：停止服务 / 退出前主动告知客户端。 */
     fun buildBye(reason: String): String {
         val builder = StringBuilder(80)
@@ -425,6 +466,7 @@ object TrackingProtocol {
         fps: Float,
         device: String,
         seq: Long,
+        sessionId: Long? = null,
     ): String {
         val builder = StringBuilder(192)
         builder.jsonBool("running", running, first = true)
@@ -435,6 +477,8 @@ object TrackingProtocol {
         builder.jsonString("protocol", PROTOCOL)
         builder.jsonLong("version", VERSION.toLong())
         builder.jsonLong("seq", seq)
+        // §7.6：sessionId 可选（rawTrackV1 会话边界诊断）；缺省不出现，老输出逐字节不变
+        if (sessionId != null) builder.jsonLong("sessionId", sessionId)
         builder.append('}')
         return builder.toString()
     }
@@ -578,6 +622,15 @@ object TrackingProtocol {
     fun parseType(message: String): String? = parseStringField(message, "type")
 
     /**
+     * 解析 startStream 的 rawMode（rawTrackV1 §2.3）："rawTrackV1" / "legacy"；
+     * 缺失或未知值由调用方按 legacy 处理（协议宽容解析，绝不抛异常）。
+     */
+    fun parseRawMode(message: String): String? = parseStringField(message, "rawMode")
+
+    /** 解析控制消息的 requestId（§6.2，可选；带上时 ack 必须原样回显）。 */
+    fun parseRequestId(message: String): String? = parseStringField(message, "requestId")
+
+    /**
      * 解析客户端 hello 里的 `features` 字符串数组（协议 §4.5），返回能力标记集合。
      *
      * 纯函数、不依赖 Android API，可在 JVM 单测里直接验证。宽容解析（协议要求
@@ -639,6 +692,21 @@ object TrackingProtocol {
          */
         CLIENT_HELLO,
 
+        /**
+         * startStream（rawTrackV1 §6.2）：开始推流。rawMode = "rawTrackV1"（需已协商）或
+         * "legacy"（缺省同 legacy）；幂等 —— 同参数重复调用直接回同结果 ack。
+         */
+        START_STREAM,
+
+        /** stopStream（§6.2）：停止推流（不关 WS），清该连接发送缓冲；未在推流也回 ack ok。 */
+        STOP_STREAM,
+
+        /**
+         * resetTracking（§6.2）：重置感知层状态（多路并行排队 / FrameReorderBuffer /
+         * 检测跟踪状态 / frameId 会话序），ack 携带新 sessionId；与校准无关。
+         */
+        RESET_TRACKING,
+
         /** 未知 type / 未知 command / 畸形 JSON：静默忽略（向前兼容，不抛异常）。 */
         IGNORED,
     }
@@ -658,6 +726,9 @@ object TrackingProtocol {
                 ClientMessage.IGNORED
             }
             "hello" -> ClientMessage.CLIENT_HELLO
+            "startStream" -> ClientMessage.START_STREAM
+            "stopStream" -> ClientMessage.STOP_STREAM
+            "resetTracking" -> ClientMessage.RESET_TRACKING
             else -> ClientMessage.IGNORED
         }
     }
