@@ -262,8 +262,10 @@ resetTimeline 语义。
   是照 Kotlin 源码逐条抄的**第二份独立转录**，不是 Kotlin 运行输出 —— 它能抓抄写/分支/
   阈值类笔误（win-postproc 的 golden 评测即以此抓到 3 处真问题），**不能**证明与 Kotlin
   逐位一致。该缺口由 task-5 / task-7 用**真·Kotlin 输出**对拍补齐：消费
-  tools/evals/golden-export/ 跨端数据集（12 场景 × 40 帧 + manifest + verify.mjs + SHA-256
-  哈希表），JVM 端跑 Kotlin 原实现导出期望值后逐帧比对。
+  tools/evals/golden-export/ 跨端数据集（**对拍集**：12 场景 × 40 帧 + manifest +
+  verify.mjs + SHA-256 哈希表），JVM 端跑 Kotlin 原实现导出期望值后逐帧比对。
+  注意覆盖范围不同：golden **主层自测**是 **14 场景**（对拍集之外多 faceLost / browUp，
+  各 30-120 帧）；「12」是对拍集的场景数，不是主层全集，验收时勿混用。
 
 ### 7.4 合成 fixture（CI 必跑，不依赖真机）
 
@@ -295,6 +297,10 @@ resetTimeline 语义。
 **容差口径（Lead 终裁，golden-export 口径表同此）**：跨端 Kotlin↔JS 比对基线
 **abs 1e-4 / rel 1e-4**（503f549）；JS↔JS（双转录自检）沿用 abs 1e-5 / rel 1e-4。
 逐层阈值（上表 0.01/0.5°/0.5 等）是**语义层**验收线，两套并存、同时满足才算过。
+**口径演进注记（防翻 commit 误读）**：rel 值由 Lead **终裁 1e-4**；golden-export meta 一度写成
+rel 1e-3，系 win-postproc **误填**（未裁决项被写成裁决项），503f549 更正 —— **裁决本身
+从未改过**。golden-export 的帧数据 55d1b55→503f549 **一个数没变**，变的只有 meta 与
+SHA-256，哈希一律以 503f549 的 README 哈希表为准。
 
 - **状态机额外断言**：blink 6 态序列、眯眼锁值进入/退出、双眼同步触发时机必须**逐帧一致**
   （状态是离散的，不适用数值容差）。
